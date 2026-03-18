@@ -52,7 +52,6 @@ def write_multiline_csv(rows):
     return sio.getvalue()
 
 
-def main(input_file, output_path, threads=4, dry_run=False):
     counter = 1_000_000
     response_index = {}  # WARC-Record-ID -> filename (without .zip)
 
@@ -66,6 +65,7 @@ def main(input_file, output_path, threads=4, dry_run=False):
     metadata_multi = []
     jsonl_entries = []
 
+def main(input_file, output_path, dry_run=False):
     file_size = Path(input_file).stat().st_size
 
     if dry_run:
@@ -199,7 +199,6 @@ def cli():
     parser = argparse.ArgumentParser(description='Convert a gzipped WARC file into a zip-of-zips archive.')
     parser.add_argument('input_file', help='Path to a .warc.gz file')
     parser.add_argument('--output', default=None, help='Output zip path (default: replace .warc.gz with .zip)')
-    parser.add_argument('--threads', type=int, default=4, help='Number of threads (default: 4)')
     parser.add_argument('--dry-run', action='store_true', help='Skip processing, just print summary')
     args = parser.parse_args()
 
@@ -214,7 +213,7 @@ def cli():
             name = name + '.zip'
         output_path = input_path.parent / name
 
-    main(str(input_path), str(output_path), threads=args.threads, dry_run=args.dry_run)
+    main(str(input_path), str(output_path), dry_run=args.dry_run)
 
 
 if __name__ == '__main__':
