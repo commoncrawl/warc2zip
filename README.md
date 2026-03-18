@@ -2,9 +2,12 @@
 
 Convert gzipped WARC files into zip archives. Each response record's payload is stored as a file with a proper extension (derived from Content-Type), alongside CSV and JSONL metadata.
 
+> [!WARNING]
+> **Work in progress**
+
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - [warcio](https://github.com/webrecorder/warcio)
 - [tqdm](https://github.com/tqdm/tqdm)
 
@@ -32,7 +35,6 @@ warc2zip <path/to/file.warc.gz>
 |------|-------------|---------|
 | `input_file` | Path to a `.warc.gz` file (positional, required) | |
 | `--output` | Path to the output zip file | Replace `.warc.gz` with `.zip` |
-| `--threads` | Number of worker threads | 4 |
 | `--dry-run` | Print summary without creating output | |
 
 ### Examples
