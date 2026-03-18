@@ -57,7 +57,7 @@ warc2zip archive.warc.gz --output result.zip
 FOO.zip
   1000000.html              # one per response record, extension from Content-Type
   1000001.pdf
-  1000002.bin               # fallback for unknown mime-types
+  1000002                   # fallback for unknown mime-types
   ...
   manifest.jsonl            # one JSON line per response (mime-type, status, URI, etc.)
   response_warc_headers.csv # filename, header_name, header_value
