@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e .
+
+      - name: Smoke test
+        run: |
+          source .venv/bin/activate
+          python -c "import warc2zip"
+          warc2zip --help
+
+      # Ruff linting/formatting — uncomment when ready to enforce in CI
+      # - name: Lint
+      #   run: |
+      #     source .venv/bin/activate
+      #     uv pip install ruff
+      #     ruff check warc2zip.py
+      #     ruff format --check warc2zip.py
