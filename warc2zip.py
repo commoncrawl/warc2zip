@@ -4,6 +4,7 @@ import io
 import json
 import mimetypes
 import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from tqdm import tqdm
@@ -17,6 +18,23 @@ MIME_EXTENSION_OVERRIDES = {
 }
 
 
+@dataclass
+class RecordGroup:
+    payload_filename: str = ''
+    payload_size: int = 0
+    response_mime_type: str | None = None
+    response_warc_headers: list[tuple[str, str]] = field(default_factory=list)
+    response_http_headers: list[tuple[str, str]] = field(default_factory=list)
+    response_target_uri: str = ''
+    response_date: str = ''
+    response_record_id: str = ''
+    http_status_code: str = ''
+    content_type_header: str = ''
+    response_order: int = -1
+    requests: list[list[tuple[str, str]]] = field(default_factory=list)
+    metadata_entries: list[tuple[list[tuple[str, str]], str]] = field(default_factory=list)
+
+
 def detect_mime_type(record):
     if record.http_headers:
         ct = record.http_headers.get_header('Content-Type')
@@ -28,7 +46,7 @@ def detect_mime_type(record):
 def mime_to_extension(mime_type):
     if mime_type in MIME_EXTENSION_OVERRIDES:
         return MIME_EXTENSION_OVERRIDES[mime_type]
-    return mimetypes.guess_extension(mime_type) or '.bin'
+    return mimetypes.guess_extension(mime_type) or ''
 
 
 def write_denormalized_csv(rows):
@@ -52,18 +70,60 @@ def write_multiline_csv(rows):
     return sio.getvalue()
 
 
-    counter = 1_000_000
-    response_index = {}  # WARC-Record-ID -> filename (without .zip)
+def build_group_metadata(group):
+    """Build CSV rows and JSONL entry for a RecordGroup whose payload is already in the zip."""
+    payload_filename = group.payload_filename
 
-    response_warc_rows = []       # denormalized: (filename, name, value)
-    response_warc_multi = []      # multiline: (filename, [(name, value), ...])
-    response_http_rows = []
-    response_http_multi = []
+    # Response WARC headers
+    response_warc_rows = [(payload_filename, n, v) for n, v in group.response_warc_headers]
+    response_warc_multi = (payload_filename, group.response_warc_headers)
+
+    # Response HTTP headers
+    response_http_rows = [(payload_filename, n, v) for n, v in group.response_http_headers]
+    response_http_multi = (payload_filename, group.response_http_headers)
+
+    # Request WARC headers (all requests use the response's payload_filename)
     request_warc_rows = []
-    request_warc_multi = []
+    request_warc_multi_entries = []
+    for req_pairs in group.requests:
+        for n, v in req_pairs:
+            request_warc_rows.append((payload_filename, n, v))
+        request_warc_multi_entries.append((payload_filename, req_pairs))
+
+    # Metadata entries (all use the response's payload_filename)
     metadata_rows = []
-    metadata_multi = []
-    jsonl_entries = []
+    metadata_multi_entries = []
+    for meta_pairs, body_text in group.metadata_entries:
+        for n, v in meta_pairs:
+            metadata_rows.append((payload_filename, n, v))
+        metadata_rows.append((payload_filename, '_body', body_text))
+        all_pairs = meta_pairs + [('_body', body_text)]
+        metadata_multi_entries.append((payload_filename, all_pairs))
+
+    # JSONL manifest entry
+    jsonl_entry = {
+        'filename': payload_filename,
+        'warc_record_id': group.response_record_id,
+        'warc_target_uri': group.response_target_uri,
+        'warc_date': group.response_date,
+        'http_status_code': group.http_status_code,
+        'detected_mime_type': group.response_mime_type or 'application/octet-stream',
+        'content_type_header': group.content_type_header,
+        'payload_size': group.payload_size,
+    }
+
+    return {
+        'response_warc_rows': response_warc_rows,
+        'response_warc_multi': response_warc_multi,
+        'response_http_rows': response_http_rows,
+        'response_http_multi': response_http_multi,
+        'request_warc_rows': request_warc_rows,
+        'request_warc_multi': request_warc_multi_entries,
+        'metadata_rows': metadata_rows,
+        'metadata_multi': metadata_multi_entries,
+        'jsonl_entry': jsonl_entry,
+    }
+
 
 def main(input_file, output_path, dry_run=False):
     file_size = Path(input_file).stat().st_size
@@ -91,90 +151,96 @@ def main(input_file, output_path, dry_run=False):
         print(f"[dry-run] Detected mime-types: {sorted(sample_mimes)}")
         return
 
+    groups = {}  # WARC-Record-ID -> RecordGroup
+    order_counter = 0
+    counter = 1_000_000
+
     with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as outer_zip:
+        # Pass 1: Read WARC, write payloads immediately, buffer only headers
         with open(input_file, 'rb') as stream:
-            pbar = tqdm(total=file_size, unit='B', unit_scale=True, desc='Converting')
+            pbar = tqdm(total=file_size, unit='B', unit_scale=True, desc='Reading WARC')
             for record in ArchiveIterator(stream):
                 rec_type = record.rec_type
 
                 if rec_type == 'response':
-                    payload = record.content_stream().read()
-                    filename = str(counter)
                     record_id = record.rec_headers.get_header('WARC-Record-ID')
-                    response_index[record_id] = filename
+                    target_uri = record.rec_headers.get_header('WARC-Target-URI')
 
-                    mime = detect_mime_type(record)
-                    ext = mime_to_extension(mime)
-
-                    outer_zip.writestr(f'{filename}{ext}', payload)
-
-                    # WARC headers
-                    warc_pairs = []
-                    for name, value in record.rec_headers.headers:
-                        response_warc_rows.append((filename, name, value))
-                        warc_pairs.append((name, value))
-                    response_warc_multi.append((filename, warc_pairs))
-
-                    # HTTP headers
-                    http_pairs = []
+                    # target URI maps to request record_id
+                    group = groups.setdefault(target_uri, RecordGroup())
+                    payload = record.content_stream().read()
+                    group.response_mime_type = detect_mime_type(record)
+                    ext = mime_to_extension(group.response_mime_type)
+                    payload_filename = f'{counter}{ext}'
+                    outer_zip.writestr(payload_filename, payload)
+                    group.payload_filename = payload_filename
+                    group.payload_size = len(payload)
+                    group.response_record_id = record_id
+                    group.response_target_uri = target_uri
+                    group.response_date = record.rec_headers.get_header('WARC-Date') or ''
+                    group.response_warc_headers = list(record.rec_headers.headers)
                     if record.http_headers:
-                        for name, value in record.http_headers.headers:
-                            response_http_rows.append((filename, name, value))
-                            http_pairs.append((name, value))
-                    response_http_multi.append((filename, http_pairs))
-
-                    # Manifest entry
-                    ct_header = ''
-                    if record.http_headers:
-                        ct_header = record.http_headers.get_header('Content-Type') or ''
-                    http_status = ''
-                    if record.http_headers:
-                        http_status = str(record.http_headers.get_statuscode() or '')
-                    jsonl_entries.append({
-                        'filename': filename,
-                        'warc_record_id': record_id,
-                        'warc_target_uri': record.rec_headers.get_header('WARC-Target-URI') or '',
-                        'warc_date': record.rec_headers.get_header('WARC-Date') or '',
-                        'http_status_code': http_status,
-                        'detected_mime_type': mime,
-                        'content_type_header': ct_header,
-                        'payload_size': len(payload),
-                    })
-
+                        group.response_http_headers = list(record.http_headers.headers)
+                        group.content_type_header = record.http_headers.get_header('Content-Type') or ''
+                        group.http_status_code = str(record.http_headers.get_statuscode() or '')
+                    group.response_order = order_counter
+                    order_counter += 1
                     counter += 1
 
                 elif rec_type == 'request':
                     record.content_stream().read()
-                    concurrent_to = record.rec_headers.get_header('WARC-Concurrent-To')
-                    filename = response_index.get(concurrent_to, '')
-
-                    warc_pairs = []
-                    for name, value in record.rec_headers.headers:
-                        request_warc_rows.append((filename, name, value))
-                        warc_pairs.append((name, value))
-                    request_warc_multi.append((filename, warc_pairs))
+                    target_uri = record.rec_headers.get_header('WARC-Target-URI')
+                    if target_uri:
+                        group = groups.setdefault(target_uri, RecordGroup())
+                        group.requests.append(list(record.rec_headers.headers))
 
                 elif rec_type == 'metadata':
                     body = record.content_stream().read()
-                    concurrent_to = record.rec_headers.get_header('WARC-Concurrent-To')
-                    filename = response_index.get(concurrent_to, '')
-
-                    warc_pairs = []
-                    for name, value in record.rec_headers.headers:
-                        metadata_rows.append((filename, name, value))
-                        warc_pairs.append((name, value))
-                    # Add body as a special row
-                    body_text = body.decode('utf-8', errors='replace')
-                    metadata_rows.append((filename, '_body', body_text))
-                    warc_pairs.append(('_body', body_text))
-                    metadata_multi.append((filename, warc_pairs))
+                    target_uri = record.rec_headers.get_header('WARC-Target-URI')
+                    if target_uri:
+                        group = groups.setdefault(target_uri, RecordGroup())
+                        body_text = body.decode('utf-8', errors='replace')
+                        group.metadata_entries.append((list(record.rec_headers.headers), body_text))
 
                 else:
-                    # warcinfo and others: consume stream, skip
                     record.content_stream().read()
 
                 pbar.update(stream.tell() - pbar.n)
             pbar.close()
+
+        # Warn about orphan records (request/metadata without a matching response)
+        orphan_count = sum(1 for g in groups.values() if not g.payload_filename)
+        if orphan_count:
+            print(f"Warning: {orphan_count} orphan group(s) without a response record, skipped")
+
+        # Pass 2: Build metadata from buffered headers (payloads already in zip)
+        sorted_groups = sorted(
+            (g for g in groups.values() if g.payload_filename),
+            key=lambda g: g.response_order,
+        )
+
+        response_warc_rows = []
+        response_warc_multi = []
+        response_http_rows = []
+        response_http_multi = []
+        request_warc_rows = []
+        request_warc_multi = []
+        metadata_rows = []
+        metadata_multi = []
+        jsonl_entries = []
+
+        for group in sorted_groups:
+            result = build_group_metadata(group)
+
+            response_warc_rows.extend(result['response_warc_rows'])
+            response_warc_multi.append(result['response_warc_multi'])
+            response_http_rows.extend(result['response_http_rows'])
+            response_http_multi.append(result['response_http_multi'])
+            request_warc_rows.extend(result['request_warc_rows'])
+            request_warc_multi.extend(result['request_warc_multi'])
+            metadata_rows.extend(result['metadata_rows'])
+            metadata_multi.extend(result['metadata_multi'])
+            jsonl_entries.append(result['jsonl_entry'])
 
         # Write manifest.jsonl
         jsonl_content = '\n'.join(json.dumps(entry) for entry in jsonl_entries)
