@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "warc2zip"
+version = "0.1.0"
+description = "Convert gzipped WARC files into zip-of-zips archives"
+requires-python = ">=3.8"
+dependencies = [
+    "tqdm>=4.67.3",
+    "warcio",
+]
+
+[project.scripts]
+warc2zip = "warc2zip:cli"
