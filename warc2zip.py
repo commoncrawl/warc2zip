@@ -31,6 +31,7 @@ class RecordGroup:
     http_status_code: str = ""
     content_type_header: str = ""
     response_order: int = -1
+    concurrent_to: str = ""  # WARC-Concurrent-To from the response record (points to request)
     requests: list[list[tuple[str, str]]] = field(default_factory=list)
     metadata_entries: list[tuple[list[tuple[str, str]], str]] = field(default_factory=list)
 
@@ -151,7 +152,8 @@ def main(input_file, output_path, dry_run=False):
         print(f"[dry-run] Detected mime-types: {sorted(sample_mimes)}")
         return
 
-    groups = {}  # WARC-Record-ID -> RecordGroup
+    groups = {}           # response WARC-Record-ID -> RecordGroup
+    pending_requests = {} # request WARC-Record-ID -> list of header tuples
     order_counter = 0
     counter = 1_000_000
 
@@ -166,8 +168,8 @@ def main(input_file, output_path, dry_run=False):
                     record_id = record.rec_headers.get_header("WARC-Record-ID")
                     target_uri = record.rec_headers.get_header("WARC-Target-URI")
 
-                    # target URI maps to request record_id
-                    group = groups.setdefault(target_uri, RecordGroup())
+                    group = groups.setdefault(record_id, RecordGroup())
+                    group.concurrent_to = record.rec_headers.get_header("WARC-Concurrent-To") or ""
                     payload = record.content_stream().read()
                     group.response_mime_type = detect_mime_type(record)
                     ext = mime_to_extension(group.response_mime_type)
@@ -176,7 +178,7 @@ def main(input_file, output_path, dry_run=False):
                     group.payload_filename = payload_filename
                     group.payload_size = len(payload)
                     group.response_record_id = record_id
-                    group.response_target_uri = target_uri
+                    group.response_target_uri = target_uri or ""
                     group.response_date = record.rec_headers.get_header("WARC-Date") or ""
                     group.response_warc_headers = list(record.rec_headers.headers)
                     if record.http_headers:
@@ -189,24 +191,27 @@ def main(input_file, output_path, dry_run=False):
 
                 elif rec_type == "request":
                     record.content_stream().read()
-                    target_uri = record.rec_headers.get_header("WARC-Target-URI")
-                    if target_uri:
-                        group = groups.setdefault(target_uri, RecordGroup())
-                        group.requests.append(list(record.rec_headers.headers))
+                    request_record_id = record.rec_headers.get_header("WARC-Record-ID")
+                    pending_requests.setdefault(request_record_id, []).append(list(record.rec_headers.headers))
 
                 elif rec_type == "metadata":
                     body = record.content_stream().read()
-                    target_uri = record.rec_headers.get_header("WARC-Target-URI")
-                    if target_uri:
-                        group = groups.setdefault(target_uri, RecordGroup())
-                        body_text = body.decode("utf-8", errors="replace")
-                        group.metadata_entries.append((list(record.rec_headers.headers), body_text))
+                    concurrent_to = record.rec_headers.get_header("WARC-Concurrent-To")
+
+                    group = groups.setdefault(concurrent_to, RecordGroup())
+                    body_text = body.decode("utf-8", errors="replace")
+                    group.metadata_entries.append((list(record.rec_headers.headers), body_text))
 
                 else:
                     record.content_stream().read()
 
                 pbar.update(stream.tell() - pbar.n)
             pbar.close()
+
+        # Link pending requests to their response groups via WARC-Concurrent-To
+        for group in groups.values():
+            if group.concurrent_to and group.concurrent_to in pending_requests:
+                group.requests.extend(pending_requests[group.concurrent_to])
 
         # Warn about orphan records (request/metadata without a matching response)
         orphan_count = sum(1 for g in groups.values() if not g.payload_filename)
