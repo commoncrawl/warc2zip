@@ -3,12 +3,16 @@ import csv
 import io
 import json
 import mimetypes
+import posixpath
+import secrets
 import zipfile
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
+from warcio.utils import fsspec_open
 
 
 MIME_EXTENSION_OVERRIDES = {
@@ -71,6 +75,38 @@ def write_multiline_csv(rows):
     return sio.getvalue()
 
 
+def get_file_size(input_file):
+    """Get file size, handling both local paths and remote URIs."""
+    try:
+        return Path(input_file).stat().st_size
+    except (OSError, ValueError):
+        return None
+
+
+def build_root_dir_name(crawl_name):
+    """Build a unique root directory name from a crawl name.
+
+    Format: {crawl_name}_{YYYYMMDDTHHMMSS}_{4-char hex suffix}
+    The suffix doesn't affect sort order since it comes after the timestamp.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    suffix = secrets.token_hex(2)
+    return f"{crawl_name}_{timestamp}_{suffix}"
+
+
+def extract_crawl_name(warc_filename):
+    """Extract a clean crawl name from a WARC-Filename header value.
+
+    Strips path and extensions like .warc.gz to get a usable directory name.
+    """
+    name = posixpath.basename(warc_filename)
+    if name.endswith(".warc.gz"):
+        name = name[:-len(".warc.gz")]
+    elif name.endswith(".warc"):
+        name = name[:-len(".warc")]
+    return name
+
+
 def build_group_metadata(group):
     """Build CSV rows and JSONL entry for a RecordGroup whose payload is already in the zip."""
     payload_filename = group.payload_filename
@@ -127,14 +163,14 @@ def build_group_metadata(group):
 
 
 def main(input_file, output_path, dry_run=False):
-    file_size = Path(input_file).stat().st_size
+    file_size = get_file_size(input_file)
 
     if dry_run:
         response_count = 0
         sample_uris = []
         sample_mimes = set()
 
-        with open(input_file, "rb") as stream:
+        with fsspec_open(input_file, "rb") as stream:
             with tqdm(total=file_size, unit="B", unit_scale=True, desc="Scanning") as pbar:
                 for record in ArchiveIterator(stream):
                     record.content_stream().read()
@@ -156,13 +192,32 @@ def main(input_file, output_path, dry_run=False):
     pending_requests = {} # request WARC-Record-ID -> list of header tuples
     order_counter = 0
     counter = 1_000_000
+    root_dir = None       # resolved from first warcinfo record
 
+    # Fallback crawl name from input filename
+    input_basename = posixpath.basename(input_file.rstrip("/"))
+    fallback_crawl_name = extract_crawl_name(input_basename) if input_basename else "unknown"
+
+    # response -> Record id  <-> metadata -
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as outer_zip:
         # Pass 1: Read WARC, write payloads immediately, buffer only headers
-        with open(input_file, "rb") as stream:
+        with fsspec_open(input_file, "rb") as stream:
             pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
             for record in ArchiveIterator(stream):
                 rec_type = record.rec_type
+
+                if rec_type == "warcinfo":
+                    record.content_stream().read()
+                    if root_dir is None:
+                        warc_filename = record.rec_headers.get_header("WARC-Filename") or ""
+                        crawl_name = extract_crawl_name(warc_filename) if warc_filename else fallback_crawl_name
+                        root_dir = build_root_dir_name(crawl_name)
+                    pbar.update(stream.tell() - pbar.n)
+                    continue
+
+                # Resolve root_dir before first payload write if no warcinfo appeared
+                if root_dir is None:
+                    root_dir = build_root_dir_name(fallback_crawl_name)
 
                 if rec_type == "response":
                     record_id = record.rec_headers.get_header("WARC-Record-ID")
@@ -174,7 +229,7 @@ def main(input_file, output_path, dry_run=False):
                     group.response_mime_type = detect_mime_type(record)
                     ext = mime_to_extension(group.response_mime_type)
                     payload_filename = f"{counter}{ext}"
-                    outer_zip.writestr(payload_filename, payload)
+                    outer_zip.writestr(f"{root_dir}/{payload_filename}", payload)
                     group.payload_filename = payload_filename
                     group.payload_size = len(payload)
                     group.response_record_id = record_id
@@ -249,19 +304,19 @@ def main(input_file, output_path, dry_run=False):
 
         # Write manifest.jsonl
         jsonl_content = "\n".join(json.dumps(entry) for entry in jsonl_entries)
-        outer_zip.writestr("manifest.jsonl", jsonl_content)
+        outer_zip.writestr(f"{root_dir}/manifest.jsonl", jsonl_content)
 
         # Write denormalized CSVs
-        outer_zip.writestr("response_warc_headers.csv", write_denormalized_csv(response_warc_rows))
-        outer_zip.writestr("response_http_headers.csv", write_denormalized_csv(response_http_rows))
-        outer_zip.writestr("request_warc_headers.csv", write_denormalized_csv(request_warc_rows))
-        outer_zip.writestr("metadata.csv", write_denormalized_csv(metadata_rows))
+        outer_zip.writestr(f"{root_dir}/response_warc_headers.csv", write_denormalized_csv(response_warc_rows))
+        outer_zip.writestr(f"{root_dir}/response_http_headers.csv", write_denormalized_csv(response_http_rows))
+        outer_zip.writestr(f"{root_dir}/request_warc_headers.csv", write_denormalized_csv(request_warc_rows))
+        outer_zip.writestr(f"{root_dir}/metadata.csv", write_denormalized_csv(metadata_rows))
 
         # Write multiline CSVs
-        outer_zip.writestr("response_warc_headers_multi.csv", write_multiline_csv(response_warc_multi))
-        outer_zip.writestr("response_http_headers_multi.csv", write_multiline_csv(response_http_multi))
-        outer_zip.writestr("request_warc_headers_multi.csv", write_multiline_csv(request_warc_multi))
-        outer_zip.writestr("metadata_multi.csv", write_multiline_csv(metadata_multi))
+        outer_zip.writestr(f"{root_dir}/response_warc_headers_multi.csv", write_multiline_csv(response_warc_multi))
+        outer_zip.writestr(f"{root_dir}/response_http_headers_multi.csv", write_multiline_csv(response_http_multi))
+        outer_zip.writestr(f"{root_dir}/request_warc_headers_multi.csv", write_multiline_csv(request_warc_multi))
+        outer_zip.writestr(f"{root_dir}/metadata_multi.csv", write_multiline_csv(metadata_multi))
 
     print(f"Created {output_path} with {counter - 1_000_000} response records")
 
@@ -273,18 +328,19 @@ def cli():
     parser.add_argument("--dry-run", action="store_true", help="Skip processing, just print summary")
     args = parser.parse_args()
 
-    input_path = Path(args.input_file)
+    input_file = args.input_file
     if args.output:
         output_path = Path(args.output)
     else:
-        name = input_path.name
+        # Extract basename from local path or remote URI
+        name = posixpath.basename(input_file.rstrip("/"))
         if name.endswith(".warc.gz"):
             name = name[: -len(".warc.gz")] + ".zip"
         else:
             name = name + ".zip"
-        output_path = input_path.parent / name
+        output_path = Path(name)
 
-    main(str(input_path), str(output_path), dry_run=args.dry_run)
+    main(input_file, str(output_path), dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
