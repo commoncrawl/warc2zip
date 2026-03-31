@@ -101,9 +101,9 @@ def extract_crawl_name(warc_filename):
     """
     name = posixpath.basename(warc_filename)
     if name.endswith(".warc.gz"):
-        name = name[:-len(".warc.gz")]
+        name = name[: -len(".warc.gz")]
     elif name.endswith(".warc"):
-        name = name[:-len(".warc")]
+        name = name[: -len(".warc")]
     return name
 
 
@@ -188,11 +188,11 @@ def main(input_file, output_path, dry_run=False):
         print(f"[dry-run] Detected mime-types: {sorted(sample_mimes)}")
         return
 
-    groups = {}           # response WARC-Record-ID -> RecordGroup
-    pending_requests = {} # request WARC-Record-ID -> list of header tuples
+    groups = {}  # response WARC-Record-ID -> RecordGroup
+    pending_requests = {}  # request WARC-Record-ID -> list of header tuples
     order_counter = 0
     counter = 1_000_000
-    root_dir = None       # resolved from first warcinfo record
+    root_dir = None  # resolved from first warcinfo record
 
     # Fallback crawl name from input filename
     input_basename = posixpath.basename(input_file.rstrip("/"))
