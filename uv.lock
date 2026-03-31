@@ -850,16 +850,20 @@ dev = [
 requires-dist = [
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "tqdm", specifier = ">=4.67.3" },
-    { name = "warcio", extras = ["s3"], git = "https://github.com/webrecorder/warcio.git?rev=master" },
+    { name = "warcio", extras = ["s3"], specifier = "==1.8.0" },
 ]
 provides-extras = ["dev"]
 
 [[package]]
 name = "warcio"
-version = "1.7.5"
-source = { git = "https://github.com/webrecorder/warcio.git?rev=master#26a2c1eba523cfdc6e48f3d7b4c3a32d28752523" }
+version = "1.8.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "six" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a9/37/6e6ada763a61c7099fa327b5572c1fc51bbf0a57accbccbc37ae83cbfe3c/warcio-1.8.0.tar.gz", hash = "sha256:f1f19ac2678b30309c62d310f286b5c3216bbc0542229b96fe89e1906dca4a6b", size = 65657, upload-time = "2026-03-30T22:04:07.868Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ad/5f/2b0e838c4d68981b6ba555cc28fbc5835ee92a20327226cb13225542cd6e/warcio-1.8.0-py2.py3-none-any.whl", hash = "sha256:3e34315554e7198f65d8c607c3b188edff866e6517f146b39413133823d7f6bd", size = 41507, upload-time = "2026-03-30T22:04:06.521Z" },
 ]
 
 [package.optional-dependencies]

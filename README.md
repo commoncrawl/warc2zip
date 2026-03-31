@@ -8,7 +8,7 @@ Convert gzipped WARC files into zip archives. Each response record's payload is 
 ## Requirements
 
 - Python 3.10+
-- [warcio](https://github.com/webrecorder/warcio) ≥ 1.7.5 (with S3/HTTP support via fsspec)
+- [warcio](https://github.com/webrecorder/warcio) ≥ 1.8.0
 - [tqdm](https://github.com/tqdm/tqdm)
 
 ## Installation
