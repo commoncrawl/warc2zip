@@ -51,7 +51,7 @@ def detect_mime_type(record):
 def mime_to_extension(mime_type):
     if mime_type in MIME_EXTENSION_OVERRIDES:
         return MIME_EXTENSION_OVERRIDES[mime_type]
-    return mimetypes.guess_extension(mime_type) or ""
+    return mimetypes.guess_extension(mime_type) or ".unk"
 
 
 def write_denormalized_csv(rows):
