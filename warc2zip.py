@@ -73,7 +73,9 @@ def write_multiline_csv(rows):
     writer = csv.writer(sio, quoting=csv.QUOTE_ALL)
     writer.writerow(["filename", "headers"])
     for filename, header_pairs in rows:
-        headers_str = "\n".join(f"{str.lower(name.replace('-', '_'))}: {value}" for name, value in header_pairs)
+        headers_str = "\n".join(
+            f"{name.replace('-', '_').lower()}: {value}" for name, value in header_pairs
+        )
         writer.writerow([filename, headers_str])
     return sio.getvalue()
 
