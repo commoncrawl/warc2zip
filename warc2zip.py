@@ -194,7 +194,7 @@ def main(input_file, output_path, dry_run=False, limit=None):
                             limit_reached = True
                     pbar.update(stream.tell() - pbar.n)
 
-        print(f"[dry-run] {response_count} response records found")
+        print(f"[dry-run] {response_count} capture records found")
         print(f"[dry-run] Sample URIs: {sample_uris}")
         print(f"[dry-run] Detected mime-types: {sorted(sample_mimes)}")
         return
@@ -339,7 +339,7 @@ def main(input_file, output_path, dry_run=False, limit=None):
         outer_zip.writestr(f"{root_dir}/metadata_multi.csv", write_multiline_csv(metadata_multi))
 
     print(
-        f"Created {output_path} with {counter - 1_000_000} response records, "
+        f"Created {output_path} with {counter - 1_000_000} capture records, "
         f"with their full set of associated request/metadata records"
     )
 
@@ -351,7 +351,7 @@ def cli():
     parser.add_argument("--dry-run", action="store_true", help="Skip processing, just print summary")
     parser.add_argument(
         "--limit",
-        help="Limit to N response records, with their full set of associated request/metadata records",
+        help="Limit to N capture records, with their full set of associated request/metadata records",
         type=int,
         default=None,
     )
