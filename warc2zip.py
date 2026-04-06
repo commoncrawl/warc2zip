@@ -83,14 +83,15 @@ def get_file_size(input_file):
         return None
 
 
-def build_root_dir_name(crawl_name):
+def build_root_dir_name(crawl_name, partial=False):
     """Build a unique root directory name from a crawl name.
 
     Format: {crawl_name}_{YYYYMMDDTHHMMSS}_{4-char hex suffix}
     The suffix doesn't affect sort order since it comes after the timestamp.
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    suffix = secrets.token_hex(2)
+    suffix = secrets.token_hex(2) if not partial else secrets.token_hex(2) + "_partial"
+
     return f"{crawl_name}_{timestamp}_{suffix}"
 
 
@@ -222,13 +223,13 @@ def main(input_file, output_path, dry_run=False, limit=None):
                     if root_dir is None:
                         warc_filename = record.rec_headers.get_header("WARC-Filename") or ""
                         crawl_name = extract_crawl_name(warc_filename) if warc_filename else fallback_crawl_name
-                        root_dir = build_root_dir_name(crawl_name)
+                        root_dir = build_root_dir_name(crawl_name, limit is not None)
                     pbar.update(stream.tell() - pbar.n)
                     continue
 
                 # Resolve root_dir before first payload write if no warcinfo appeared
                 if root_dir is None:
-                    root_dir = build_root_dir_name(fallback_crawl_name)
+                    root_dir = build_root_dir_name(fallback_crawl_name, limit is not None)
 
                 if rec_type == "response":
                     record_id = record.rec_headers.get_header("WARC-Record-ID")
