@@ -70,7 +70,7 @@ def write_multiline_csv(rows):
     writer = csv.writer(sio)
     writer.writerow(["filename", "headers"])
     for filename, header_pairs in rows:
-        headers_str = "\n".join(f"{name}: {value}" for name, value in header_pairs)
+        headers_str = "\n".join(f"{str.lower(name)}: {value}" for name, value in header_pairs)
         writer.writerow([filename, headers_str])
     return sio.getvalue()
 
@@ -112,11 +112,11 @@ def build_group_metadata(group):
     payload_filename = group.payload_filename
 
     # Response WARC headers
-    response_warc_rows = [(payload_filename, n, v) for n, v in group.response_warc_headers]
+    response_warc_rows = [(payload_filename, str.lower(n), v) for n, v in group.response_warc_headers]
     response_warc_multi = (payload_filename, group.response_warc_headers)
 
     # Response HTTP headers
-    response_http_rows = [(payload_filename, n, v) for n, v in group.response_http_headers]
+    response_http_rows = [(payload_filename, str.lower(n), v) for n, v in group.response_http_headers]
     response_http_multi = (payload_filename, group.response_http_headers)
 
     # Request WARC headers (all requests use the response's payload_filename)
@@ -124,7 +124,7 @@ def build_group_metadata(group):
     request_warc_multi_entries = []
     for req_pairs in group.requests:
         for n, v in req_pairs:
-            request_warc_rows.append((payload_filename, n, v))
+            request_warc_rows.append((payload_filename, str.lower(n), v))
         request_warc_multi_entries.append((payload_filename, req_pairs))
 
     # Metadata entries (all use the response's payload_filename)
@@ -132,7 +132,7 @@ def build_group_metadata(group):
     metadata_multi_entries = []
     for meta_pairs, body_text in group.metadata_entries:
         for n, v in meta_pairs:
-            metadata_rows.append((payload_filename, n, v))
+            metadata_rows.append((payload_filename, str.lower(n), v))
         metadata_rows.append((payload_filename, "_body", body_text))
         all_pairs = meta_pairs + [("_body", body_text)]
         metadata_multi_entries.append((payload_filename, all_pairs))
