@@ -60,7 +60,10 @@ def write_denormalized_csv(rows):
     writer = csv.writer(sio, quoting=csv.QUOTE_ALL)
     writer.writerow(["filename", "header_name", "header_value"])
     for row in rows:
-        writer.writerow(row)
+        filename, header_name, header_value = row
+        header_name = header_name.strip().lower().replace("-", "_")
+
+        writer.writerow((filename, header_name, header_value))
     return sio.getvalue()
 
 
@@ -70,7 +73,7 @@ def write_multiline_csv(rows):
     writer = csv.writer(sio, quoting=csv.QUOTE_ALL)
     writer.writerow(["filename", "headers"])
     for filename, header_pairs in rows:
-        headers_str = "\n".join(f"{str.lower(name)}: {value}" for name, value in header_pairs)
+        headers_str = "\n".join(f"{str.lower(name.replace("-", "_"))}: {value}" for name, value in header_pairs)
         writer.writerow([filename, headers_str])
     return sio.getvalue()
 
@@ -125,7 +128,7 @@ def build_group_metadata(group):
     request_warc_multi_entries = []
     for req_pairs in group.requests:
         for n, v in req_pairs:
-            request_warc_rows.append((payload_filename, str.lower(n), v))
+            request_warc_rows.append((payload_filename, str.lower(n.replace("-", "_")), v))
         request_warc_multi_entries.append((payload_filename, req_pairs))
 
     # Metadata entries (all use the response's payload_filename)
@@ -133,7 +136,7 @@ def build_group_metadata(group):
     metadata_multi_entries = []
     for meta_pairs, body_text in group.metadata_entries:
         for n, v in meta_pairs:
-            metadata_rows.append((payload_filename, str.lower(n), v))
+            metadata_rows.append((payload_filename, str.lower(n.replace("-", "_")), v))
         metadata_rows.append((payload_filename, "_body", body_text))
         all_pairs = meta_pairs + [("_body", body_text)]
         metadata_multi_entries.append((payload_filename, all_pairs))
