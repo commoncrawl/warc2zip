@@ -850,20 +850,20 @@ dev = [
 requires-dist = [
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "tqdm", specifier = ">=4.67.3" },
-    { name = "warcio", extras = ["s3"], specifier = "==1.8.0" },
+    { name = "warcio", extras = ["s3"], specifier = "==1.8.1" },
 ]
 provides-extras = ["dev"]
 
 [[package]]
 name = "warcio"
-version = "1.8.0"
+version = "1.8.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "six" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a9/37/6e6ada763a61c7099fa327b5572c1fc51bbf0a57accbccbc37ae83cbfe3c/warcio-1.8.0.tar.gz", hash = "sha256:f1f19ac2678b30309c62d310f286b5c3216bbc0542229b96fe89e1906dca4a6b", size = 65657, upload-time = "2026-03-30T22:04:07.868Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/20/78/df7e1c40a3751ea966be84eb6645270831e511f9932740b5251ace028cfa/warcio-1.8.1.tar.gz", hash = "sha256:76f71b22159ca3c043521e10ee8a2478d167672ad1d137c7c15e40b0d5c73ccd", size = 65772, upload-time = "2026-03-31T16:10:32.196Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ad/5f/2b0e838c4d68981b6ba555cc28fbc5835ee92a20327226cb13225542cd6e/warcio-1.8.0-py2.py3-none-any.whl", hash = "sha256:3e34315554e7198f65d8c607c3b188edff866e6517f146b39413133823d7f6bd", size = 41507, upload-time = "2026-03-30T22:04:06.521Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/be/d92c0899bd52c7f82fc0f8caa8fb3c624e6d1006ee208c710060cda216c2/warcio-1.8.1-py2.py3-none-any.whl", hash = "sha256:82345c5914d36cb5e0513210dbf759e3db348bf8d0f7762996ccce3a5ce6e87b", size = 41578, upload-time = "2026-03-31T16:10:31.059Z" },
 ]
 
 [package.optional-dependencies]
