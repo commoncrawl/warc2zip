@@ -162,17 +162,20 @@ def build_group_metadata(group):
     }
 
 
-def main(input_file, output_path, dry_run=False):
+def main(input_file, output_path, dry_run=False, limit=None):
     file_size = get_file_size(input_file)
 
     if dry_run:
         response_count = 0
         sample_uris = []
         sample_mimes = set()
+        limit_reached = False
 
         with fsspec_open(input_file, "rb") as stream:
             with tqdm(total=file_size, unit="B", unit_scale=True, desc="Scanning") as pbar:
                 for record in ArchiveIterator(stream):
+                    if limit_reached and record.rec_type == "response":
+                        break
                     record.content_stream().read()
                     if record.rec_type == "response":
                         response_count += 1
@@ -181,6 +184,8 @@ def main(input_file, output_path, dry_run=False):
                         if len(sample_uris) < 5:
                             sample_uris.append(uri)
                         sample_mimes.add(mime)
+                        if limit is not None and response_count >= limit:
+                            limit_reached = True
                     pbar.update(stream.tell() - pbar.n)
 
         print(f"[dry-run] {response_count} response records found")
@@ -198,6 +203,9 @@ def main(input_file, output_path, dry_run=False):
     input_basename = posixpath.basename(input_file.rstrip("/"))
     fallback_crawl_name = extract_crawl_name(input_basename) if input_basename else "unknown"
 
+    response_count = 0
+    limit_reached = False
+
     # response -> Record id  <-> metadata -
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as outer_zip:
         # Pass 1: Read WARC, write payloads immediately, buffer only headers
@@ -205,6 +213,9 @@ def main(input_file, output_path, dry_run=False):
             pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
             for record in ArchiveIterator(stream):
                 rec_type = record.rec_type
+
+                if limit_reached and rec_type == "response":
+                    break
 
                 if rec_type == "warcinfo":
                     record.content_stream().read()
@@ -243,6 +254,9 @@ def main(input_file, output_path, dry_run=False):
                     group.response_order = order_counter
                     order_counter += 1
                     counter += 1
+                    response_count += 1
+                    if limit is not None and response_count >= limit:
+                        limit_reached = True
 
                 elif rec_type == "request":
                     record.content_stream().read()
@@ -318,7 +332,10 @@ def main(input_file, output_path, dry_run=False):
         outer_zip.writestr(f"{root_dir}/request_warc_headers_multi.csv", write_multiline_csv(request_warc_multi))
         outer_zip.writestr(f"{root_dir}/metadata_multi.csv", write_multiline_csv(metadata_multi))
 
-    print(f"Created {output_path} with {counter - 1_000_000} response records")
+    print(
+        f"Created {output_path} with {counter - 1_000_000} response records, "
+        f"with their full set of associated request/metadata records"
+    )
 
 
 def cli():
@@ -326,6 +343,12 @@ def cli():
     parser.add_argument("input_file", help="Path to a .warc.gz file")
     parser.add_argument("--output", default=None, help="Output zip path (default: replace .warc.gz with .zip)")
     parser.add_argument("--dry-run", action="store_true", help="Skip processing, just print summary")
+    parser.add_argument(
+        "--limit",
+        help="Limit to N response records, with their full set of associated request/metadata records",
+        type=int,
+        default=None,
+    )
     args = parser.parse_args()
 
     input_file = args.input_file
@@ -340,7 +363,7 @@ def cli():
             name = name + ".zip"
         output_path = Path(name)
 
-    main(input_file, str(output_path), dry_run=args.dry_run)
+    main(input_file, str(output_path), dry_run=args.dry_run, limit=args.limit)
 
 
 if __name__ == "__main__":
