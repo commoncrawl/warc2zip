@@ -33,12 +33,12 @@ warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 
 ### Options
 
-| Flag          | Description                                                   | Default                                 |
-|---------------|---------------------------------------------------------------|-----------------------------------------|
-| `input_file`  | Path or URI to a `.warc.gz` file (positional, required)       |                                         |
-| `--output`    | Path to the output zip file                                   | Replace `.warc.gz` with `.zip`          |
-| `--dry-run`   | Print summary without creating output                         |                                         |
-| `--limit <N>` | Limit the number of captures to be included in the output zip | No limits, will process all the records |
+| Flag          | Description                                                                            | Default                                 |
+|---------------|----------------------------------------------------------------------------------------|-----------------------------------------|
+| `input_file`  | Path or URI to a `.warc.gz` file (positional, required)                                |                                         |
+| `--output`    | Path to the output zip file                                                            | Replace `.warc.gz` with `.zip`          |
+| `--dry-run`   | Print summary without creating output                                                  |                                         |
+| `--limit <N>` | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
 
 ### Examples
 
@@ -58,6 +58,12 @@ Process a remote WARC file from S3:
 
 ```bash
 warc2zip s3://bucket/path/archive.warc.gz --output local-result.zip
+```
+
+Sample the first 10 capture records (response + associated request/metadata) — useful for quickly inspecting a large remote WARC without streaming the whole file:
+
+```bash
+warc2zip s3://bucket/path/archive.warc.gz --limit 10 --output sample.zip
 ```
 
 ## Output Structure
@@ -113,15 +119,15 @@ One row per header per file:
 
 ### response_warc_headers_multi.csv (multiline)
 
-One row per file, all headers in a single multiline string:
+One row per file, all headers in a single multiline string. Header names are normalized to lowercase with `-` replaced by `_`:
 
 ```csv
 "filename","headers"
-"1000000.html","WARC-Type: response
-WARC-Date: 2025-12-15T00:58:13Z
-WARC-Target-URI: https://example.com/page
-WARC-Record-ID: <urn:uuid:12345678-abcd-...>
-Content-Length: 34521"
+"1000000.html","warc_type: response
+warc_date: 2025-12-15T00:58:13Z
+warc_target_uri: https://example.com/page
+warc_record_id: <urn:uuid:12345678-abcd-...>
+content_length: 34521"
 ```
 
 ### response_http_headers.csv (denormalized)
