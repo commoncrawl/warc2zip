@@ -57,7 +57,7 @@ def mime_to_extension(mime_type):
 def write_denormalized_csv(rows):
     """Write denormalized CSV: filename, header_name, header_value (multiple rows per file)."""
     sio = io.StringIO()
-    writer = csv.writer(sio)
+    writer = csv.writer(sio, quoting=csv.QUOTE_ALL)
     writer.writerow(["filename", "header_name", "header_value"])
     for row in rows:
         writer.writerow(row)
@@ -67,7 +67,7 @@ def write_denormalized_csv(rows):
 def write_multiline_csv(rows):
     """Write multiline CSV: filename, headers (one row per file, headers as multiline string)."""
     sio = io.StringIO()
-    writer = csv.writer(sio)
+    writer = csv.writer(sio, quoting=csv.QUOTE_ALL)
     writer.writerow(["filename", "headers"])
     for filename, header_pairs in rows:
         headers_str = "\n".join(f"{str.lower(name)}: {value}" for name, value in header_pairs)
