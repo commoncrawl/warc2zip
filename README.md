@@ -5,11 +5,6 @@ Convert gzipped WARC files into zip archives. Each response record's payload is 
 > [!WARNING]
 > **Work in progress**
 
-## Requirements
-
-- Python 3.10+
-- [warcio](https://github.com/webrecorder/warcio) ≥ 1.8.0
-- [tqdm](https://github.com/tqdm/tqdm)
 
 ## Installation
 
@@ -38,11 +33,12 @@ warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 
 ### Options
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `input_file` | Path or URI to a `.warc.gz` file (positional, required) | |
-| `--output` | Path to the output zip file | Replace `.warc.gz` with `.zip` |
-| `--dry-run` | Print summary without creating output | |
+| Flag          | Description                                                   | Default                                 |
+|---------------|---------------------------------------------------------------|-----------------------------------------|
+| `input_file`  | Path or URI to a `.warc.gz` file (positional, required)       |                                         |
+| `--output`    | Path to the output zip file                                   | Replace `.warc.gz` with `.zip`          |
+| `--dry-run`   | Print summary without creating output                         |                                         |
+| `--limit <N>` | Limit the number of captures to be included in the output zip | No limits, will process all the records |
 
 ### Examples
 
@@ -107,12 +103,12 @@ One JSON line per response record:
 One row per header per file:
 
 ```csv
-filename,header_name,header_value
-1000000.html,WARC-Type,response
-1000000.html,WARC-Date,2025-12-15T00:58:13Z
-1000000.html,WARC-Target-URI,https://example.com/page
-1000000.html,WARC-Record-ID,"<urn:uuid:12345678-abcd-...>"
-1000000.html,Content-Length,34521
+"filename","header_name","header_value"
+"1000000.html","warc_type","response"
+"1000000.html","warc_date","2025-12-15T00:58:13Z"
+"1000000.html","warc_target_uri","https://example.com/page"
+"1000000.html","warc_record_id","<urn:uuid:12345678-abcd-...>"
+"1000000.html","Content-Length","34521"
 ```
 
 ### response_warc_headers_multi.csv (multiline)
@@ -120,8 +116,8 @@ filename,header_name,header_value
 One row per file, all headers in a single multiline string:
 
 ```csv
-filename,headers
-1000000.html,"WARC-Type: response
+"filename","headers"
+"1000000.html","WARC-Type: response
 WARC-Date: 2025-12-15T00:58:13Z
 WARC-Target-URI: https://example.com/page
 WARC-Record-ID: <urn:uuid:12345678-abcd-...>
@@ -131,21 +127,21 @@ Content-Length: 34521"
 ### response_http_headers.csv (denormalized)
 
 ```csv
-filename,header_name,header_value
-1000000.html,Content-Type,text/html; charset=UTF-8
-1000000.html,Content-Length,34521
-1000000.html,Server,nginx/1.18.0
-1000000.html,Date,"Mon, 15 Dec 2025 00:58:13 GMT"
+"filename","header_name","header_value"
+"1000000.html","content_type","text/html; charset=UTF-8"
+"1000000.html","content_length","34521"
+"1000000.html","server","nginx/1.18.0"
+"1000000.html","Date,"Mon, 15 Dec 2025 00:58:13 GMT"
 ```
 
 ### request_warc_headers.csv (denormalized)
 
 ```csv
-filename,header_name,header_value
-1000000.html,WARC-Type,request
-1000000.html,WARC-Date,2025-12-15T00:58:13Z
-1000000.html,WARC-Target-URI,https://example.com/page
-1000000.html,WARC-Record-ID,"<urn:uuid:abcdef01-2345-...>"
+"filename","header_name","header_value"
+"1000000.html","warc_type","request"
+"1000000.html","warc_date","2025-12-15T00:58:13Z"
+"1000000.html","warc_target_uri","https://example.com/page"
+"1000000.html","warc_record_id","<urn:uuid:abcdef01-2345-...>"
 ```
 
 ### metadata.csv (denormalized)
@@ -153,10 +149,10 @@ filename,header_name,header_value
 Includes a `_body` pseudo-header with the metadata record body:
 
 ```csv
-filename,header_name,header_value
-1000000.html,WARC-Type,metadata
-1000000.html,WARC-Date,2025-12-15T00:58:13Z
-1000000.html,WARC-Concurrent-To,"<urn:uuid:12345678-abcd-...>"
-1000000.html,_body,"fetchTimeMs: 245
+"filename","header_name","header_value"
+"1000000.html","warc_type","metadata"
+"1000000.html","warc_date","2025-12-15T00:58:13Z"
+"1000000.html","warc_concurrent_to","<urn:uuid:12345678-abcd-...>"
+"1000000.html","_body,"fetchTimeMs: 245
 charset-detected: UTF-8"
 ```
