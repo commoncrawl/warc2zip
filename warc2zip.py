@@ -9,6 +9,7 @@ import zipfile
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
@@ -35,8 +36,13 @@ class RecordGroup:
     http_status_code: str = ""
     content_type_header: str = ""
     response_order: int = -1
+    http_status_line: str = ""  # Full HTTP status line, e.g. "HTTP/1.1 200 OK"
+    response_domain: str = ""  # Domain from WARC-Target-URI, e.g. "example.com"
     concurrent_to: str = ""  # WARC-Concurrent-To from the response record (points to request)
     requests: list[list[tuple[str, str]]] = field(default_factory=list)
+    request_http_headers: list[list[tuple[str, str]]] = field(default_factory=list)
+    request_http_lines: list[str] = field(default_factory=list)  # e.g. "GET /path HTTP/1.1"
+    request_bodies: list[bytes] = field(default_factory=list)
     metadata_entries: list[tuple[list[tuple[str, str]], str]] = field(default_factory=list)
 
 
@@ -168,7 +174,57 @@ def build_group_metadata(group):
     }
 
 
-def main(input_file, output_path, dry_run=False, limit=None):
+def write_sidecar_files(zip_file, root_dir, group):
+    """Write per-file sidecar metadata for a single capture (sidecar format only)."""
+    base = f"{root_dir}/{group.response_domain}/{group.payload_filename}"
+
+    # Response WARC headers
+    zip_file.writestr(
+        f"{base}.response.warc",
+        "\n".join(f"{n}: {v}" for n, v in group.response_warc_headers),
+    )
+
+    # Response HTTP headers (with status line)
+    if group.response_http_headers:
+        lines = []
+        if group.http_status_line:
+            lines.append(group.http_status_line)
+        lines.extend(f"{n}: {v}" for n, v in group.response_http_headers)
+        zip_file.writestr(f"{base}.response.http", "\n".join(lines))
+
+    # Request sidecars (merged if multiple request records)
+    if group.requests:
+        warc_parts = []
+        http_parts = []
+        body_parts = []
+        for i, warc_hdrs in enumerate(group.requests):
+            warc_parts.append("\n".join(f"{n}: {v}" for n, v in warc_hdrs))
+            if i < len(group.request_http_headers):
+                http_lines = []
+                if i < len(group.request_http_lines) and group.request_http_lines[i]:
+                    http_lines.append(group.request_http_lines[i])
+                http_lines.extend(f"{n}: {v}" for n, v in group.request_http_headers[i])
+                http_parts.append("\n".join(http_lines))
+            if i < len(group.request_bodies):
+                body_parts.append(group.request_bodies[i])
+        zip_file.writestr(f"{base}.request.warc", "\n\n".join(warc_parts))
+        if http_parts:
+            zip_file.writestr(f"{base}.request.http", "\n\n".join(http_parts))
+        if any(body_parts):
+            zip_file.writestr(f"{base}.request.json", b"\n\n".join(body_parts))
+
+    # Metadata sidecars (merged if multiple metadata records)
+    if group.metadata_entries:
+        warc_parts = []
+        body_parts = []
+        for meta_headers, body_text in group.metadata_entries:
+            warc_parts.append("\n".join(f"{n}: {v}" for n, v in meta_headers))
+            body_parts.append(body_text)
+        zip_file.writestr(f"{base}.metadata.warc", "\n\n".join(warc_parts))
+        zip_file.writestr(f"{base}.metadata.warc-fields", "\n\n".join(body_parts))
+
+
+def main(input_file, output_path, dry_run=False, limit=None, output_format="flat"):
     file_size = get_file_size(input_file)
 
     if dry_run:
@@ -246,7 +302,17 @@ def main(input_file, output_path, dry_run=False, limit=None):
                     group.response_mime_type = detect_mime_type(record)
                     ext = mime_to_extension(group.response_mime_type)
                     payload_filename = f"{counter}{ext}"
-                    outer_zip.writestr(f"{root_dir}/{payload_filename}", payload)
+
+                    # Extract domain for sidecar format directory grouping
+                    domain = urlparse(target_uri).netloc if target_uri else "unknown"
+                    group.response_domain = domain or "unknown"
+
+                    if output_format == "sidecar":
+                        zip_path = f"{root_dir}/{group.response_domain}/{payload_filename}"
+                    else:
+                        zip_path = f"{root_dir}/{payload_filename}"
+                    outer_zip.writestr(zip_path, payload)
+
                     group.payload_filename = payload_filename
                     group.payload_size = len(payload)
                     group.response_record_id = record_id
@@ -257,6 +323,7 @@ def main(input_file, output_path, dry_run=False, limit=None):
                         group.response_http_headers = list(record.http_headers.headers)
                         group.content_type_header = record.http_headers.get_header("Content-Type") or ""
                         group.http_status_code = str(record.http_headers.get_statuscode() or "")
+                        group.http_status_line = f"{record.http_headers.protocol} {record.http_headers.statusline}"
                     group.response_order = order_counter
                     order_counter += 1
                     counter += 1
@@ -265,9 +332,15 @@ def main(input_file, output_path, dry_run=False, limit=None):
                         limit_reached = True
 
                 elif rec_type == "request":
-                    record.content_stream().read()
+                    body = record.content_stream().read()
                     request_record_id = record.rec_headers.get_header("WARC-Record-ID")
-                    pending_requests.setdefault(request_record_id, []).append(list(record.rec_headers.headers))
+                    req_entry = {
+                        "warc_headers": list(record.rec_headers.headers),
+                        "http_headers": list(record.http_headers.headers) if record.http_headers else [],
+                        "http_request_line": f"{record.http_headers.protocol} {record.http_headers.statusline}" if record.http_headers else "",
+                        "body": body,
+                    }
+                    pending_requests.setdefault(request_record_id, []).append(req_entry)
 
                 elif rec_type == "metadata":
                     body = record.content_stream().read()
@@ -286,7 +359,11 @@ def main(input_file, output_path, dry_run=False, limit=None):
         # Link pending requests to their response groups via WARC-Concurrent-To
         for group in groups.values():
             if group.concurrent_to and group.concurrent_to in pending_requests:
-                group.requests.extend(pending_requests[group.concurrent_to])
+                for req in pending_requests[group.concurrent_to]:
+                    group.requests.append(req["warc_headers"])
+                    group.request_http_headers.append(req["http_headers"])
+                    group.request_http_lines.append(req["http_request_line"])
+                    group.request_bodies.append(req["body"])
 
         # Warn about orphan records (request/metadata without a matching response)
         orphan_count = sum(1 for g in groups.values() if not g.payload_filename)
@@ -310,6 +387,9 @@ def main(input_file, output_path, dry_run=False, limit=None):
         jsonl_entries = []
 
         for group in sorted_groups:
+            if output_format == "sidecar":
+                write_sidecar_files(outer_zip, root_dir, group)
+
             result = build_group_metadata(group)
 
             response_warc_rows.extend(result["response_warc_rows"])
@@ -355,6 +435,12 @@ def cli():
         type=int,
         default=None,
     )
+    parser.add_argument(
+        "--format",
+        choices=["flat", "sidecar"],
+        default="flat",
+        help="Output format: 'flat' (counter-named files + global CSVs) or 'sidecar' (domain dirs + per-file metadata)",
+    )
     args = parser.parse_args()
 
     input_file = args.input_file
@@ -369,7 +455,7 @@ def cli():
             name = name + ".zip"
         output_path = Path(name)
 
-    main(input_file, str(output_path), dry_run=args.dry_run, limit=args.limit)
+    main(input_file, str(output_path), dry_run=args.dry_run, limit=args.limit, output_format=args.format)
 
 
 if __name__ == "__main__":

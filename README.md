@@ -33,12 +33,13 @@ warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 
 ### Options
 
-| Flag          | Description                                                                            | Default                                 |
-|---------------|----------------------------------------------------------------------------------------|-----------------------------------------|
-| `input_file`  | Path or URI to a `.warc.gz` file (positional, required)                                |                                         |
-| `--output`    | Path to the output zip file                                                            | Replace `.warc.gz` with `.zip`          |
-| `--dry-run`   | Print summary without creating output                                                  |                                         |
-| `--limit <N>` | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
+| Flag                    | Description                                                                            | Default                                 |
+|-------------------------|----------------------------------------------------------------------------------------|-----------------------------------------|
+| `input_file`            | Path or URI to a `.warc.gz` file (positional, required)                                |                                         |
+| `--output`              | Path to the output zip file                                                            | Replace `.warc.gz` with `.zip`          |
+| `--dry-run`             | Print summary without creating output                                                  |                                         |
+| `--limit <N>`           | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
+| `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                          | `flat`                                  |
 
 ### Examples
 
@@ -66,16 +67,26 @@ Sample the first 10 capture records (response + associated request/metadata) —
 warc2zip s3://bucket/path/archive.warc.gz --limit 10 --output sample.zip
 ```
 
-## Output Structure
+Extract with sidecar format (per-file metadata, grouped by domain):
 
-All files are placed under a unique root directory inside the zip to prevent collisions when extracting multiple archives into the same folder. The directory name is derived from the WARC-Filename header (in the `warcinfo` record), the current timestamp, and a random suffix:
+```bash
+warc2zip archive.warc.gz --format sidecar --output result.zip
+```
+
+## Output Formats
+
+All files are placed under a unique root directory inside the zip to prevent collisions when extracting multiple archives into the same folder. The directory name is derived from the WARC-Filename header (in the `warcinfo` record), the current timestamp, and a random suffix: `{crawl_name}_{YYYYMMDDTHHMMSS}_{hex}`.
+
+### Flat format (`--format flat`, default)
+
+Counter-named payload files with global CSV/JSONL metadata. Optimized for bulk analysis.
 
 ```
 FOO.zip
   CC-MAIN-20251215005813-20251215035813-00995_20260330T143022_a1b2/
     1000000.html              # one per response record, extension from Content-Type
     1000001.pdf
-    1000002                   # fallback for unknown mime-types
+    1000002.unk               # fallback for unknown mime-types
     ...
     manifest.jsonl            # one JSON line per response (mime-type, status, URI, etc.)
     response_warc_headers.csv # filename, header_name, header_value
@@ -88,10 +99,39 @@ FOO.zip
     metadata_multi.csv
 ```
 
-- **Root directory**: `{crawl_name}_{YYYYMMDDTHHMMSS}_{hex}` — crawl name from `WARC-Filename`, UTC timestamp, 4-char random hex suffix. Sorting by name groups by crawl and orders by time.
 - **Payload files**: raw response bodies named `{counter}.{ext}`, where the extension is derived from the HTTP Content-Type header via `mimetypes.guess_extension()` (with overrides for common types like `text/html` → `.html`)
 - **Denormalized CSVs** (`*_headers.csv`, `metadata.csv`): multiple rows per file — columns: `filename, header_name, header_value`
 - **Multiline CSVs** (`*_multi.csv`): one row per file — columns: `filename, headers` (headers as a multiline string)
+
+### Sidecar format (`--format sidecar`)
+
+Captures grouped by domain (from `WARC-Target-URI`), with per-file metadata sidecars alongside each payload. Optimized for browsing individual captures. Global CSVs and manifest.jsonl are still generated.
+
+```
+FOO.zip
+  CC-MAIN-20251215005813-20251215035813-00995_20260330T143022_a1b2/
+    example.com/
+      1000000.html                       # response payload
+      1000000.html.request.warc          # request WARC headers
+      1000000.html.request.http          # request HTTP headers (with request line)
+      1000000.html.request.json          # request HTTP body (often empty for GET)
+      1000000.html.response.warc         # response WARC headers
+      1000000.html.response.http         # response HTTP headers (with status line)
+      1000000.html.metadata.warc         # metadata WARC headers
+      1000000.html.metadata.warc-fields  # metadata body (application/warc-fields)
+    other.org/
+      1000001.pdf
+      1000001.pdf.response.warc
+      1000001.pdf.response.http
+      ...
+    manifest.jsonl
+    response_warc_headers.csv
+    ...
+```
+
+- **Domain directories**: extracted from `WARC-Target-URI` (e.g. `https://example.com/page` → `example.com/`). Captures without a target URI go under `unknown/`.
+- **Sidecar files**: named by appending a suffix to the payload filename. Headers are written in raw `Name: value` format (not normalized). Multiple metadata records for the same capture are merged, separated by blank lines.
+- **Missing records are skipped**: if a capture has no request or metadata record, the corresponding sidecar files are simply not created.
 
 ## Metadata Examples
 
