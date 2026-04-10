@@ -4,7 +4,9 @@ import sys
 import time
 from pathlib import Path
 
+import cdx_toolkit
 import duckdb
+from tqdm import tqdm
 
 
 def get_urls(input_columnar_index, query):
@@ -70,14 +72,14 @@ def get_crawls_coordinates(input_host_index, url_rows):
     crawl_coordinates = []
 
     df = url_rows.fetchdf()
-    for _, row in df.iterrows():
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Looking up coordinates"):
         host = row["url_host_name"]
         tld = row["url_host_tld"]
         domain = row["url_host_registered_domain"]
 
         sq2 = f"""
             SELECT
-              url, warc_filename, warc_record_offset, warc_record_length
+              url, surt_host_name, warc_filename, warc_record_offset, warc_record_length
             FROM ccindex
             WHERE subset = 'warc'
               AND url_host_tld = '{tld}' -- help the query optimizer
@@ -97,57 +99,50 @@ def get_crawls_coordinates(input_host_index, url_rows):
     return crawl_coordinates
 
 
-def main(host_index, columnar_index):
-    # df = pd.read_parquet("EOT-2020-with-ranks-v5.parquet")
-    #
-    # print(df["is_us_federal"] == True).sum())
-    # df[df["is_us_federal"] == True].head(1)
-    #
-    # rows_is_us_federal = duckdb.sql(sq2)
-    # query_is_us_federal = '''
-    #      SELECT DISTINCT url_host_name, url_host_tld, url_host_registered_domain
-    #      FROM ccindex
-    #      WHERE is_us_federal = True;
-    #      '''
+def fetch_warc_records(crawl_coordinates):
+    """Fetch WARC records from Common Crawl by coordinates and write to a WARC file."""
+    warcinfo = {
+        "software": "build_custom_warc",
+        "isPartOf": "WARC2ZIP-COMMONCRAWL",
+        "description": "warc extraction",
+        "format": "WARC file version 1.1",
+    }
+    writer = cdx_toolkit.warc.get_writer("WARC2ZIP", "COMMONCRAWL", warcinfo, warc_version="1.0")
+
+    for coord_df in tqdm(crawl_coordinates, desc="Fetching WARC records"):
+        for _, row in coord_df.iterrows():
+            capture = {
+                "url": row["url"],
+                "filename": row["warc_filename"],
+                "offset": int(row["warc_record_offset"]),
+                "length": int(row["warc_record_length"]),
+            }
+
+            try:
+                record = cdx_toolkit.warc.fetch_warc_record(capture, "https://data.commoncrawl.org")
+                writer.write_record(record)
+                print(f"  Wrote record from {row['url']}")
+            except Exception as e:
+                print(f"  Failed to fetch {row['url']}: {e}", file=sys.stderr)
+
+    writer.close()
+    print(f"Wrote {len(crawl_coordinates)} records")
+
+
+def main(host_index, columnar_index, limit=None):
+    limit_clause = f"LIMIT {limit}" if limit else ""
+    query_is_us_federal = f"""
+         SELECT DISTINCT url_host_name, url_host_tld, url_host_registered_domain
+         FROM ccindex
+         WHERE is_us_federal = True
+         {limit_clause};
+         """
 
     rows_urls = get_urls(columnar_index, query_is_us_federal)
 
     crawl_coordinates = get_crawls_coordinates(host_index, rows_urls)
 
-    # cdx = cdx_toolkit.CDXFetcher(source='ia')
-    #
-    # warcinfo = {
-    #     'software': 'pypi_cdx_toolkit iter-and-warc example',
-    #     'isPartOf': 'WARC2ZIP-COMMONCRAWL',
-    #     'description': 'warc extraction',
-    #     'format': 'WARC file version 1.1',
-    # }
-    #
-    # writer = cdx_toolkit.warc.get_writer('WARC2ZIP', 'COMMONCRAWL', warcinfo, warc_version='1.0')
-    #
-    # df = rows_is_us_federal.fetchdf()
-    # for _, row in df.iterrows():
-    #     url_host_name = row['url_host_name']
-    #     url_pattern = f'{url_host_name}/*'
-    #     print(f"Pattern {url_pattern}")
-    #
-    #     for obj in cdx.iter(url_pattern, limit=1, filter=['status:200'], crawl="CC-MAIN-2026-12"):
-    #         url = obj['url']
-    #         timestamp = obj['timestamp']
-    #
-    #         print('Extracting url', url, 'timestamp', timestamp)
-    #
-    #         try:
-    #             record = obj.fetch_warc_record()
-    #         except RuntimeError:
-    #             print(' skipping capture for RuntimeError 404: %s %s', url, timestamp)
-    #             continue
-    #         writer.write_record(record)
-    #
-    #         print(' wrote', url)
-    #         break  # move to next host after first successful write
-    #
-    # writer.close()
+    fetch_warc_records(crawl_coordinates)
 
 
 if __name__ == "__main__":
@@ -162,6 +157,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--columnar-index", type=str, metavar="FILE", help="Path to columnar index parquet file", required=True
     )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Maximum number of URLs to process"
+    )
     args = parser.parse_args()
 
-    main(args.host_index, args.columnar_index)
+    main(args.host_index, args.columnar_index, limit=args.limit)
