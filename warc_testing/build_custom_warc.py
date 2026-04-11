@@ -44,7 +44,7 @@ def get_urls(input_columnar_index, query):
     return rows
 
 
-def get_crawls_coordinates(input_host_index, url_rows):
+def get_crawls_coordinates(input_host_index, url_rows, homepage=False):
     ## Get offset, lenght and filename of each url in the host index
 
     files = [str(f) for f in Path(os.path.expanduser(f"{input_host_index}")).rglob("*.parquet")]
@@ -77,6 +77,10 @@ def get_crawls_coordinates(input_host_index, url_rows):
         tld = row["url_host_tld"]
         domain = row["url_host_registered_domain"]
 
+        # Filter out DNS pseudo-URLs (`dns:hostname`) that share the same host columns
+        # as real HTTP captures. When `homepage=True`, also restrict to the root path.
+        homepage_clause = "AND url_path = '/'" if homepage else ""
+
         sq2 = f"""
             SELECT
               url, surt_host_name, warc_filename, warc_record_offset, warc_record_length
@@ -85,14 +89,16 @@ def get_crawls_coordinates(input_host_index, url_rows):
               AND url_host_tld = '{tld}' -- help the query optimizer
               AND url_host_registered_domain = '{domain}' -- ditto
               AND url_host_name = '{host}'
-            LIMIT 1;
+              AND url_scheme IN ('http', 'https')
+              {homepage_clause}
+            ;
             """
 
         result = duckdb.sql(sq2).fetchdf()
         if not result.empty:
             result.insert(0, "url_host_name", host)
             crawl_coordinates.append(result)
-            print(f"  Found coordinates for {host}")
+            print(f"  Found {len(result)} capture(s) for {host}")
         else:
             print(f"  No WARC records found for {host}")
 
@@ -129,7 +135,7 @@ def fetch_warc_records(crawl_coordinates):
     print(f"Wrote {len(crawl_coordinates)} records")
 
 
-def main(host_index, columnar_index, limit=None):
+def main(host_index, columnar_index, limit=None, homepage=False):
     limit_clause = f"LIMIT {limit}" if limit else ""
     query_is_us_federal = f"""
          SELECT DISTINCT url_host_name, url_host_tld, url_host_registered_domain
@@ -140,7 +146,7 @@ def main(host_index, columnar_index, limit=None):
 
     rows_urls = get_urls(columnar_index, query_is_us_federal)
 
-    crawl_coordinates = get_crawls_coordinates(host_index, rows_urls)
+    crawl_coordinates = get_crawls_coordinates(host_index, rows_urls, homepage=homepage)
 
     fetch_warc_records(crawl_coordinates)
 
@@ -158,8 +164,11 @@ if __name__ == "__main__":
         "--columnar-index", type=str, metavar="FILE", help="Path to columnar index parquet file", required=True
     )
     parser.add_argument(
-        "--limit", type=int, default=None, help="Maximum number of URLs to process"
+        "--limit", type=int, default=None, help="Maximum number of hosts to process"
+    )
+    parser.add_argument(
+        "--homepage", action="store_true", help="Fetch only the homepage (url_path = '/') of each host"
     )
     args = parser.parse_args()
 
-    main(args.host_index, args.columnar_index, limit=args.limit)
+    main(args.host_index, args.columnar_index, limit=args.limit, homepage=args.homepage)
