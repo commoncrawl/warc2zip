@@ -83,24 +83,21 @@ def get_crawls_coordinates(input_host_index, url_rows, homepage=False):
 
         sq2 = f"""
             SELECT
-              url, surt_host_name, warc_filename, warc_record_offset, warc_record_length
+              url, url_host_name, warc_filename, warc_record_offset, warc_record_length, crawl, warc_segment
             FROM ccindex
             WHERE subset = 'warc'
               AND url_host_tld = '{tld}' -- help the query optimizer
               AND url_host_registered_domain = '{domain}' -- ditto
               AND url_host_name = '{host}'
-              AND url_scheme IN ('http', 'https')
+              AND url LIKE 'http%'
               {homepage_clause}
             ;
             """
 
         result = duckdb.sql(sq2).fetchdf()
         if not result.empty:
-            result.insert(0, "url_host_name", host)
+            # result.insert(0, "url_host_name", host)
             crawl_coordinates.append(result)
-            print(f"  Found {len(result)} capture(s) for {host}")
-        else:
-            print(f"  No WARC records found for {host}")
 
     return crawl_coordinates
 
@@ -125,7 +122,7 @@ def fetch_warc_records(crawl_coordinates):
             }
 
             try:
-                record = cdx_toolkit.warc.fetch_warc_record(capture, "https://data.commoncrawl.org")
+                record = cdx_toolkit.warc.fetch_warc_record(capture, "https://eotarchive.s3.amazonaws.com/")
                 writer.write_record(record)
                 print(f"  Wrote record from {row['url']}")
             except Exception as e:
@@ -146,6 +143,7 @@ def main(host_index, columnar_index, limit=None, homepage=False):
 
     rows_urls = get_urls(columnar_index, query_is_us_federal)
 
+    print(f"Fetched {len(rows_urls)} urls")
     crawl_coordinates = get_crawls_coordinates(host_index, rows_urls, homepage=homepage)
 
     fetch_warc_records(crawl_coordinates)
