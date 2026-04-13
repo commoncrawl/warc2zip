@@ -30,15 +30,6 @@ def get_urls(input_columnar_index, query):
     duckdb.sql("SET enable_progress_bar = true;")
     duckdb.sql("SET http_retries = 100;")
 
-    # sq2 = f'''
-    # select url_host_name
-    # from ccindex
-    # where is_us_federal = True;
-    # '''
-    #
-    # rows_is_us_federal = duckdb.sql(sq2)
-    # df = rows_is_us_federal.fetchdf()
-
     rows = duckdb.sql(query)
 
     return rows
@@ -81,6 +72,8 @@ def get_crawls_coordinates(input_host_index, url_rows, homepage=False):
         # as real HTTP captures. When `homepage=True`, also restrict to the root path.
         homepage_clause = "AND url_path = '/'" if homepage else ""
 
+        eot_http_clause = "AND url LIKE 'http%'"
+
         sq2 = f"""
             SELECT
               url, url_host_name, warc_filename, warc_record_offset, warc_record_length, crawl, warc_segment
@@ -88,11 +81,21 @@ def get_crawls_coordinates(input_host_index, url_rows, homepage=False):
             WHERE subset = 'warc'
               AND url_host_tld = '{tld}' -- help the query optimizer
               AND url_host_registered_domain = '{domain}' -- ditto
-              AND url_host_name = '{host}'
-              AND url LIKE 'http%'
+              AND url_host_name = '{host}'              
               {homepage_clause}
             ;
             """
+
+        # sq2 = f"""
+        #     SELECT
+        #       url, url_host_name, warc_filename, warc_record_offset, warc_record_length, crawl, warc_segment
+        #     FROM ccindex
+        #     WHERE subset = 'warc'
+        #       AND url_host_tld = '{tld}' -- help the query optimizer
+        #       AND url_host_registered_domain = '{domain}' -- ditto
+        #       AND url_host_name = '{host}'
+        #       ;
+        #     """
 
         result = duckdb.sql(sq2).fetchdf()
         if not result.empty:
@@ -122,13 +125,13 @@ def fetch_warc_records(crawl_coordinates):
             }
 
             try:
-                record = cdx_toolkit.warc.fetch_warc_record(capture, "https://eotarchive.s3.amazonaws.com/")
+                # record = cdx_toolkit.warc.fetch_warc_record(capture, "https://eotarchive.s3.amazonaws.com/")
+                record = cdx_toolkit.warc.fetch_warc_record(capture, "https://data.commoncrawl.org/")
                 writer.write_record(record)
                 print(f"  Wrote record from {row['url']}")
             except Exception as e:
                 print(f"  Failed to fetch {row['url']}: {e}", file=sys.stderr)
 
-    writer.close()
     print(f"Wrote {len(crawl_coordinates)} records")
 
 
@@ -141,10 +144,10 @@ def main(host_index, columnar_index, limit=None, homepage=False):
          {limit_clause};
          """
 
-    rows_urls = get_urls(columnar_index, query_is_us_federal)
+    rows_urls = get_urls(host_index, query_is_us_federal)
 
     print(f"Fetched {len(rows_urls)} urls")
-    crawl_coordinates = get_crawls_coordinates(host_index, rows_urls, homepage=homepage)
+    crawl_coordinates = get_crawls_coordinates(columnar_index, rows_urls, homepage=homepage)
 
     fetch_warc_records(crawl_coordinates)
 
@@ -152,14 +155,18 @@ def main(host_index, columnar_index, limit=None, homepage=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch WARC records from Common Crawl using host/columnar indexes")
     parser.add_argument(
-        "--host-index",
+        "--columnar-index",
         type=str,
         metavar="DIRECTORY",
-        help="Path to directory containing host-level index parquet files",
+        help="Path to directory containing the columnar index parquet files",
         required=True,
     )
     parser.add_argument(
-        "--columnar-index", type=str, metavar="FILE", help="Path to columnar index parquet file", required=True
+        "--host-index",
+        type=str,
+        metavar="FILE",
+        help="Path to host-level index parquet file",
+        required=True
     )
     parser.add_argument(
         "--limit", type=int, default=None, help="Maximum number of hosts to process"
