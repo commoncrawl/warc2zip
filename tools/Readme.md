@@ -5,11 +5,11 @@ Build custom WARC files from Common Crawl indexes.
 ## Pipeline
 
 ```mermaid
-flowchart LR
+flowchart TD
     Q["SQL Query\n(e.g. is_us_federal = True)"]
-    CI["Columnar Index\n(parquet)"]
+    CI["Host Index\n(parquet)"]
     U["URLs\n(host_name, tld,\nregistered_domain)"]
-    HI["Host Index\n(parquet directory)"]
+    HI["Columnar Index\n(parquet directory)"]
     WC["WARC Coordinates\n(filename, offset,\nlength, surt)"]
     CDX["CDX Server Fetch\n(cdx_toolkit)"]
     W["WARC File\n(output)"]
