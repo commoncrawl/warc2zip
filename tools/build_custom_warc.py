@@ -2,11 +2,14 @@ import argparse
 import os
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 import cdx_toolkit
 import duckdb
+import pandas as pd
 from tqdm import tqdm
+from warcio.archiveiterator import ArchiveIterator
 
 
 def get_urls(input_columnar_index, query):
@@ -105,8 +108,8 @@ def get_crawls_coordinates(input_host_index, url_rows, homepage=False):
     return crawl_coordinates
 
 
-def fetch_warc_records(crawl_coordinates):
-    """Fetch WARC records from Common Crawl by coordinates and write to a WARC file."""
+def fetch_warc_records(crawl_coordinates, prefix="https://data.commoncrawl.org"):
+    """Fetch WARC records by streaming each source WARC file once and URL-matching."""
     warcinfo = {
         "software": "build_custom_warc",
         "isPartOf": "WARC2ZIP-COMMONCRAWL",
@@ -115,29 +118,40 @@ def fetch_warc_records(crawl_coordinates):
     }
     writer = cdx_toolkit.warc.get_writer("WARC2ZIP", "COMMONCRAWL", warcinfo, warc_version="1.0")
 
-    nb_written_captures = 0
-    for coord_df in tqdm(crawl_coordinates, desc="Fetching WARC records"):
-        for _, row in coord_df.iterrows():
-            capture = {
-                "url": row["url"],
-                "filename": row["warc_filename"],
-                "offset": int(row["warc_record_offset"]),
-                "length": int(row["warc_record_length"]),
-            }
+    if not crawl_coordinates:
+        return 0
 
-            try:
-                # record = cdx_toolkit.warc.fetch_warc_record(capture, "https://eotarchive.s3.amazonaws.com/")
-                record = cdx_toolkit.warc.fetch_warc_record(capture, "https://data.commoncrawl.org/")
-                writer.write_record(record)
-                nb_written_captures += 1
-                # print(f"  Wrote record from {row['url']}")
-            except Exception as e:
-                print(f"  Failed to fetch {row['url']}: {e}", file=sys.stderr)
+    all_coords = pd.concat(crawl_coordinates, ignore_index=True)
+    all_coords = all_coords.sort_values(["warc_filename", "warc_record_offset"])
+    grouped = all_coords.groupby("warc_filename", sort=False)
+
+    nb_written_captures = 0
+    prefix = prefix.rstrip("/")
+
+    for filename, group in tqdm(grouped, desc="Fetching WARC files"):
+        remaining = set(group["url"].tolist())
+        url = f"{prefix}/{filename}"
+
+        try:
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                for record in ArchiveIterator(resp):
+                    if not remaining:
+                        break
+                    rec_url = record.rec_headers.get_header("WARC-Target-URI")
+                    if rec_url in remaining:
+                        writer.write_record(record)
+                        remaining.discard(rec_url)
+                        nb_written_captures += 1
+        except Exception as e:
+            print(f"  Failed on {filename}: {e}", file=sys.stderr)
+
+        if remaining:
+            print(f"  {len(remaining)} URL(s) not found in {filename}", file=sys.stderr)
 
     return nb_written_captures
 
 
-def main(host_index, columnar_index, limit=None, homepage=False):
+def main(host_index, columnar_index, limit=None, homepage=False, warc_prefix="https://data.commoncrawl.org"):
     limit_clause = f"LIMIT {limit}" if limit else ""
     query_is_us_federal = f"""
          SELECT DISTINCT url_host_name, url_host_tld, url_host_registered_domain
@@ -153,7 +167,7 @@ def main(host_index, columnar_index, limit=None, homepage=False):
 
     print(f"Collected {len(crawl_coordinates)} captures.")
 
-    nb_written_captures = fetch_warc_records(crawl_coordinates)
+    nb_written_captures = fetch_warc_records(crawl_coordinates, prefix=warc_prefix)
 
     print(f"Wrote {nb_written_captures}/{len(crawl_coordinates)} captures from {len(rows_urls)} urls.")
 
@@ -180,6 +194,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--homepage", action="store_true", help="Fetch only the homepage (url_path = '/') of each host"
     )
+    parser.add_argument(
+        "--warc-prefix",
+        type=str,
+        default="https://data.commoncrawl.org",
+        help="Base URL prefix for WARC files (default: %(default)s)",
+    )
     args = parser.parse_args()
 
-    main(args.host_index, args.columnar_index, limit=args.limit, homepage=args.homepage)
+    main(
+        args.host_index,
+        args.columnar_index,
+        limit=args.limit,
+        homepage=args.homepage,
+        warc_prefix=args.warc_prefix,
+    )
