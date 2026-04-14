@@ -115,6 +115,7 @@ def fetch_warc_records(crawl_coordinates):
     }
     writer = cdx_toolkit.warc.get_writer("WARC2ZIP", "COMMONCRAWL", warcinfo, warc_version="1.0")
 
+    nb_written_captures = 0
     for coord_df in tqdm(crawl_coordinates, desc="Fetching WARC records"):
         for _, row in coord_df.iterrows():
             capture = {
@@ -128,11 +129,12 @@ def fetch_warc_records(crawl_coordinates):
                 # record = cdx_toolkit.warc.fetch_warc_record(capture, "https://eotarchive.s3.amazonaws.com/")
                 record = cdx_toolkit.warc.fetch_warc_record(capture, "https://data.commoncrawl.org/")
                 writer.write_record(record)
-                print(f"  Wrote record from {row['url']}")
+                nb_written_captures += 1
+                # print(f"  Wrote record from {row['url']}")
             except Exception as e:
                 print(f"  Failed to fetch {row['url']}: {e}", file=sys.stderr)
 
-    print(f"Wrote {len(crawl_coordinates)} records")
+    return nb_written_captures
 
 
 def main(host_index, columnar_index, limit=None, homepage=False):
@@ -149,7 +151,11 @@ def main(host_index, columnar_index, limit=None, homepage=False):
     print(f"Fetched {len(rows_urls)} urls")
     crawl_coordinates = get_crawls_coordinates(columnar_index, rows_urls, homepage=homepage)
 
-    fetch_warc_records(crawl_coordinates)
+    print(f"Collected {len(crawl_coordinates)} captures.")
+
+    nb_written_captures = fetch_warc_records(crawl_coordinates)
+
+    print(f"Wrote {nb_written_captures}/{len(crawl_coordinates)} captures from {len(rows_urls)} urls.")
 
 
 if __name__ == "__main__":
