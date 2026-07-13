@@ -44,18 +44,26 @@ def confirm(prompt):
         return False
 
 
-def build_sql(host_index, columnar_index, limit=None, homepage=False):
+def build_sql(host_index, columnar_index, limit=None, homepage=False, stream=False):
     """Build the single-pass JOIN that maps US-federal hosts to their WARC coordinates.
 
     The EOT host index only tells us *which* hosts are US-federal; the exact
     warc_filename/offset/length live in the Common Crawl columnar index. We semi-join
-    the ~29k filtered hosts against the columnar index in one streaming pass (rather
-    than one query per host) and emit the three coordinate columns.
+    the ~29k filtered hosts against the columnar index in one pass (rather than one
+    query per host) and emit the three coordinate columns.
+
+    stream=False (default): DISTINCT + ORDER BY give deduplicated, sorted output — but
+    both are *blocking*, so the CSV is written only after the whole scan completes.
+    stream=True: drop both so matched rows stream to the CSV as the scan runs (live
+    progress works), at the cost of unsorted output that may contain rare duplicates.
     """
     limit_clause = f"LIMIT {limit}" if limit else ""
     # DNS/crawldiagnostics pseudo-records are excluded by `subset = 'warc'`; --homepage
     # further restricts to each host's root path.
     homepage_clause = "AND ci.url_path = '/'" if homepage else ""
+
+    distinct = "" if stream else "DISTINCT"
+    order_by = "" if stream else "ORDER BY ci.warc_filename, ci.warc_record_offset"
 
     return f"""
         WITH hosts AS (
@@ -64,13 +72,13 @@ def build_sql(host_index, columnar_index, limit=None, homepage=False):
             WHERE is_us_federal = True
             {limit_clause}
         )
-        SELECT DISTINCT ci.warc_filename, ci.warc_record_offset, ci.warc_record_length
+        SELECT {distinct} ci.warc_filename, ci.warc_record_offset, ci.warc_record_length
         FROM read_parquet('{columnar_index}', hive_partitioning = true) ci
         JOIN hosts h
           USING (url_host_name, url_host_tld, url_host_registered_domain)
         WHERE ci.subset = 'warc'
         {homepage_clause}
-        ORDER BY ci.warc_filename, ci.warc_record_offset
+        {order_by}
     """
 
 
@@ -132,7 +140,7 @@ def count_hosts(host_index, limit=None):
 
 
 def main(host_index, columnar_index, output, limit=None, homepage=False, profile=None,
-         progress_interval=15, assume_yes=False):
+         progress_interval=15, assume_yes=False, stream=False):
     duckdb.sql("SET enable_progress_bar = true;")
     duckdb.sql("SET http_retries = 100;")
 
@@ -151,15 +159,18 @@ def main(host_index, columnar_index, output, limit=None, homepage=False, profile
             log.info("Aborted by user.")
             return
 
-    inner = build_sql(host_index, columnar_index, limit=limit, homepage=homepage)
+    inner = build_sql(host_index, columnar_index, limit=limit, homepage=homepage, stream=stream)
+    if not stream:
+        log.info("Deduped+sorted output: CSV is written after the scan finishes "
+                 "(watch DuckDB's progress bar for scan %). Use --stream for progressive output.")
 
     # `/dev/stdout` keeps everything inside DuckDB (no pandas/numpy) for both sinks.
     destination = "/dev/stdout" if output in (None, "-") else output
     copy_sql = f"COPY ({inner}) TO '{destination}' (FORMAT CSV, HEADER);"
 
-    # Live coordinate count by tailing the growing CSV — only meaningful for a real file.
+    # Live coordinate count by tailing the growing CSV — only meaningful when streaming to a file.
     monitor, stop_event = None, threading.Event()
-    if progress_interval > 0 and destination != "/dev/stdout":
+    if stream and progress_interval > 0 and destination != "/dev/stdout":
         monitor = threading.Thread(
             target=tail_progress, args=(destination, stop_event, progress_interval), daemon=True
         )
@@ -224,11 +235,20 @@ if __name__ == "__main__":
         help="AWS profile name for S3 access to the columnar index (default: default credential chain)",
     )
     parser.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "Write coordinates progressively as the scan runs (enables the live counter). "
+            "Drops DISTINCT + ORDER BY, so output is unsorted and may contain rare duplicates. "
+            "Default: deduplicated + sorted, written after the scan completes."
+        ),
+    )
+    parser.add_argument(
         "--progress-interval",
         type=int,
         default=15,
         metavar="SECONDS",
-        help="Log a running coordinate count every N seconds when writing to a file; 0 disables (default: 15)",
+        help="With --stream, log a running coordinate count every N seconds; 0 disables (default: 15)",
     )
     parser.add_argument(
         "-y",
@@ -260,4 +280,5 @@ if __name__ == "__main__":
         profile=args.profile,
         progress_interval=args.progress_interval,
         assume_yes=args.yes,
+        stream=args.stream,
     )
