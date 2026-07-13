@@ -83,7 +83,20 @@ We prepared some smaller (~1Gb or less) and interesting WARC files for testing: 
 You can download them from the [Huggingface dataset](https://huggingface.co/datasets/commoncrawl/warc2zip-examples).
 
 Details: 
-- Homepages extracted from CC-MAIN-2026-21 [homepages_CC-MAIN-2026-21.warc.gz](https://huggingface.co/datasets/commoncrawl/warc2zip-examples/blob/main/homepages_CC-MAIN-2026-21.warc.gz)
+- Example WARC from CC-MAIN-2026-25 with 500 records (response, request and metadata) [CC-MAIN-2026-30-500_records.warc.gz](https://huggingface.co/datasets/commoncrawl/warc2zip-examples/blob/main/CC-MAIN-2026-30-500_records.warc.gz)
+  ```
+  isPartOf: CC-MAIN-2026-25
+  publisher: Common Crawl
+  description: Wide crawl of the web for June 2026
+  operator: Common Crawl Admin (info@commoncrawl.org)
+  hostname: ip-10-67-67-233
+  software: Apache Nutch 1.21 (modified, https://github.com/commoncrawl/nutch/)
+  robots: checked via crawler-commons 1.7-SNAPSHOT (https://github.com/crawler-commons/crawler-commons)
+  format: WARC File Format 1.1
+  conformsTo: https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.1/
+  ```
+
+- Homepages extracted from CC-MAIN-2026-21 [homepages_CC-MAIN-2026-21.warc.gz](https://huggingface.co/datasets/commoncrawl/warc2zip-examples/blob/main/homepages_CC-MAIN-2026-21.warc.gz) (*)
   ```
   software: pypi_cdx_toolkit/0.9.40.dev89+g53a7ef76c
   isPartOf: CC-MAIN-2026-21
@@ -92,7 +105,7 @@ Details:
   creator: Common Crawl Foundation <https://commoncrawl.org>
   operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
   ```
-- URLs of federal institutions, as part of the [End Of Term Archive](https://eotarchive.org/) project: [is_us_federal_CC-MAIN-2025-13.warc.gz](https://huggingface.co/datasets/commoncrawl/warc2zip-examples/blob/main/is_us_federal_CC-MAIN-2025-13.warc.gz)
+- URLs of federal institutions, as part of the [End Of Term Archive](https://eotarchive.org/) project: [is_us_federal_CC-MAIN-2025-13.warc.gz](https://huggingface.co/datasets/commoncrawl/warc2zip-examples/blob/main/is_us_federal_CC-MAIN-2025-13.warc.gz) (*)
   ```
   software: pypi_cdx_toolkit/0.9.40.dev91+ga04800ea0
   isPartOf: CC-MAIN-2025-13
@@ -102,6 +115,7 @@ Details:
   operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
   ```
 
+(*) These WARC files are repackaged using the HOST and URL index and contains only response captures.
 
 ## Output Formats
 
