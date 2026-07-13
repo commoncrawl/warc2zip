@@ -3,10 +3,14 @@
 Convert gzipped WARC files into zip archives. Each response record's payload is stored as a file with a proper extension (derived from Content-Type), alongside CSV and JSONL metadata.
 
 > [!WARNING]
-> **Work in progress**
+> **Feedback are welcome**: this project is in early development. Feel free to open an issue or submit 
+> a pull request if you have suggestions, bug reports, or feature requests. See [WARC examples](#example-warc-for-testing) for testing below.
 
 
 ## Installation
+
+> [!TIP]
+> We recommend you to use a virtual environment (e.g. `uv` or `conda`) to avoid conflicts with other Python packages.
 
 ```bash
 pip install .
@@ -33,13 +37,13 @@ warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 
 ### Options
 
-| Flag                    | Description                                                                            | Default                                 |
-|-------------------------|----------------------------------------------------------------------------------------|-----------------------------------------|
-| `input_file`            | Path or URI to a `.warc.gz` file (positional, required)                                |                                         |
-| `--output`              | Path to the output zip file                                                            | Replace `.warc.gz` with `.zip`          |
-| `--dry-run`             | Print summary without creating output                                                  |                                         |
-| `--limit <N>`           | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
-| `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                          | `flat`                                  |
+| Flag                      | Description                                                                            | Default                                 |
+|---------------------------|----------------------------------------------------------------------------------------|-----------------------------------------|
+| `input_file`              | Path or URI to a `.warc.gz` file (positional, required)                                |                                         |
+| `--output`                | Path to the output zip file                                                            | Replace `.warc.gz` with `.zip`          |
+| `--dry-run`               | Print summary without creating output                                                  |                                         |
+| `--limit <N>`             | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
+| `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
 
 ### Examples
 
@@ -72,6 +76,32 @@ Extract with sidecar format (per-file metadata, grouped by domain):
 ```bash
 warc2zip archive.warc.gz --format sidecar --output result.zip
 ```
+
+## WARC examples for testing
+
+We prepared some smaller (~1Gb or less) and interesting WARC files for testing: US Federal government websites, homepages, etc. 
+You can download them from the [Huggingface dataset](https://huggingface.co/datasets/commoncrawl/warc2zip-examples).
+
+Details: 
+- Homepages extracted from CC-MAIN-2026-21 [homepages_CC-MAIN-2026-21.warc.gz](https://huggingface.co/datasets/commoncrawl/warc2zip-examples/blob/main/homepages_CC-MAIN-2026-21.warc.gz)
+  ```
+  software: pypi_cdx_toolkit/0.9.40.dev89+g53a7ef76c
+  isPartOf: CC-MAIN-2026-21
+  description: Repackage of CC-MAIN-2026-21 containing only response records of homepages
+  format: WARC file version 1.0
+  creator: Common Crawl Foundation <https://commoncrawl.org>
+  operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
+  ```
+- URLs of federal institutions, as part of the [End Of Term Archive](https://eotarchive.org/) project: [is_us_federal_CC-MAIN-2025-13.warc.gz](https://huggingface.co/datasets/commoncrawl/warc2zip-examples/blob/main/is_us_federal_CC-MAIN-2025-13.warc.gz)
+  ```
+  software: pypi_cdx_toolkit/0.9.40.dev91+ga04800ea0
+  isPartOf: CC-MAIN-2025-13
+  description: Repackage of CC-MAIN-2025-13 containing only response records of US federal government hosts
+  format: WARC file version 1.0
+  creator: Common Crawl Foundation <https://commoncrawl.org>
+  operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
+  ```
+
 
 ## Output Formats
 
