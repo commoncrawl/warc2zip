@@ -229,6 +229,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
 
     if dry_run:
         response_count = 0
+        request_count = 0
+        metadata_count = 0
         sample_uris = []
         sample_mimes = set()
         limit_reached = False
@@ -248,9 +250,13 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         sample_mimes.add(mime)
                         if limit is not None and response_count >= limit:
                             limit_reached = True
+                    elif record.rec_type == "request":
+                        request_count += 1
+                    elif record.rec_type == "metadata":
+                        metadata_count += 1
                     pbar.update(stream.tell() - pbar.n)
 
-        print(f"[dry-run] {response_count} capture records found")
+        print(f"[dry-run] {response_count} responses, {request_count} requests, {metadata_count} metadata records")
         print(f"[dry-run] Sample URIs: {sample_uris}")
         print(f"[dry-run] Detected mime-types: {sorted(sample_mimes)}")
         return
@@ -266,6 +272,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     fallback_crawl_name = extract_crawl_name(input_basename) if input_basename else "unknown"
 
     response_count = 0
+    request_count = 0
+    metadata_count = 0
     limit_reached = False
 
     # response -> Record id  <-> metadata -
@@ -332,6 +340,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         limit_reached = True
 
                 elif rec_type == "request":
+                    request_count += 1
                     body = record.content_stream().read()
                     request_record_id = record.rec_headers.get_header("WARC-Record-ID")
                     req_entry = {
@@ -343,6 +352,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     pending_requests.setdefault(request_record_id, []).append(req_entry)
 
                 elif rec_type == "metadata":
+                    metadata_count += 1
                     body = record.content_stream().read()
                     concurrent_to = record.rec_headers.get_header("WARC-Concurrent-To")
 
@@ -419,8 +429,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         outer_zip.writestr(f"{root_dir}/metadata_multi.csv", write_multiline_csv(metadata_multi))
 
     print(
-        f"Created {output_path} with {counter - 1_000_000} capture records, "
-        f"with their full set of associated request/metadata records"
+        f"Created {output_path}: {response_count} responses, "
+        f"{request_count} requests, {metadata_count} metadata records"
     )
 
 
