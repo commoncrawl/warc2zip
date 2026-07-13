@@ -80,10 +80,10 @@ warc2zip archive.warc.gz --format sidecar --output result.zip
 ## WARC examples for testing
 
 We prepared some smaller (~1Gb or less) and interesting WARC files for testing: US Federal government websites, homepages, etc. 
-You can download them from the [Huggingface dataset](https://huggingface.co/datasets/commoncrawl/warc2zip-examples).
+You can download them from the [Huggingface bucket](https://huggingface.co/buckets/commoncrawl/warc2zip-examples).
 
 Details: 
-- Example WARC from CC-MAIN-2026-25 with 500 records (response, request and metadata) [CC-MAIN-2026-30-500_records.warc.gz](https://huggingface.co/datasets/commoncrawl/warc2zip-examples/blob/main/CC-MAIN-2026-30-500_records.warc.gz)
+- Example WARC from CC-MAIN-2026-25 with 500 records (response, request and metadata) [CC-MAIN-2026-30-500_records.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true)
   ```
   isPartOf: CC-MAIN-2026-25
   publisher: Common Crawl
@@ -96,7 +96,7 @@ Details:
   conformsTo: https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.1/
   ```
 
-- Homepages extracted from CC-MAIN-2026-21 [homepages_CC-MAIN-2026-21.warc.gz](https://huggingface.co/datasets/commoncrawl/warc2zip-examples/blob/main/homepages_CC-MAIN-2026-21.warc.gz) (*)
+- Homepages extracted from CC-MAIN-2026-21 [homepages_CC-MAIN-2026-21.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true) (*)
   ```
   software: pypi_cdx_toolkit/0.9.40.dev89+g53a7ef76c
   isPartOf: CC-MAIN-2026-21
@@ -105,7 +105,7 @@ Details:
   creator: Common Crawl Foundation <https://commoncrawl.org>
   operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
   ```
-- URLs of federal institutions, as part of the [End Of Term Archive](https://eotarchive.org/) project: [is_us_federal_CC-MAIN-2025-13.warc.gz](https://huggingface.co/datasets/commoncrawl/warc2zip-examples/blob/main/is_us_federal_CC-MAIN-2025-13.warc.gz) (*)
+- URLs of federal institutions, as part of the [End Of Term Archive](https://eotarchive.org/) project: [is_us_federal_CC-MAIN-2025-13.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true) (*)
   ```
   software: pypi_cdx_toolkit/0.9.40.dev91+ga04800ea0
   isPartOf: CC-MAIN-2025-13
