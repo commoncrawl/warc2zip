@@ -5,6 +5,7 @@ import json
 import mimetypes
 import posixpath
 import secrets
+import sys
 import zipfile
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -21,6 +22,9 @@ MIME_EXTENSION_OVERRIDES = {
     "text/plain": ".txt",
     "image/jpeg": ".jpg",
 }
+
+REMOTE_SCHEMES = {"s3", "http", "https", "gs", "gcs", "az", "abfs", "ftp"}
+REMOTE_DRY_RUN_MAX = 100  # hard cap on records scanned by --dry-run on remote inputs
 
 
 @dataclass
@@ -228,6 +232,14 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     file_size = get_file_size(input_file)
 
     if dry_run:
+        scheme = urlparse(input_file).scheme
+        if scheme in REMOTE_SCHEMES and (limit is None or limit > REMOTE_DRY_RUN_MAX):
+            limit = REMOTE_DRY_RUN_MAX
+            print(
+                f"Warning: --dry-run on a remote file is limited to a maximum of {REMOTE_DRY_RUN_MAX} records.",
+                file=sys.stderr,
+            )
+
         response_count = 0
         request_count = 0
         metadata_count = 0
@@ -256,7 +268,11 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         metadata_count += 1
                     pbar.update(stream.tell() - pbar.n)
 
-        print(f"[dry-run] {response_count} responses, {request_count} requests, {metadata_count} metadata records")
+        limit_note = f" (stopped at --limit {limit})" if limit_reached else ""
+        print(
+            f"[dry-run] {response_count} responses, {request_count} requests, "
+            f"{metadata_count} metadata records{limit_note}"
+        )
         print(f"[dry-run] Sample URIs: {sample_uris}")
         print(f"[dry-run] Detected mime-types: {sorted(sample_mimes)}")
         return
