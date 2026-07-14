@@ -79,9 +79,7 @@ def write_multiline_csv(rows):
     writer = csv.writer(sio, quoting=csv.QUOTE_ALL)
     writer.writerow(["filename", "headers"])
     for filename, header_pairs in rows:
-        headers_str = "\n".join(
-            f"{name.replace('-', '_').lower()}: {value}" for name, value in header_pairs
-        )
+        headers_str = "\n".join(f"{name.replace('-', '_').lower()}: {value}" for name, value in header_pairs)
         writer.writerow([filename, headers_str])
     return sio.getvalue()
 
@@ -224,8 +222,10 @@ def write_sidecar_files(zip_file, root_dir, group):
         zip_file.writestr(f"{base}.metadata.warc-fields", "\n\n".join(body_parts))
 
 
-def main(input_file, output_path, dry_run=False, limit=None, output_format="flat"):
+def main(input_file, output_path, dry_run=False, limit=None, output_format="flat", profile=None):
     file_size = get_file_size(input_file)
+    # profile only makes sense for S3; other fsspec filesystems reject the kwarg
+    open_kwargs = {"profile": profile} if profile and urlparse(input_file).scheme == "s3" else {}
 
     if dry_run:
         response_count = 0
@@ -235,7 +235,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         sample_mimes = set()
         limit_reached = False
 
-        with fsspec_open(input_file, "rb") as stream:
+        with fsspec_open(input_file, "rb", **open_kwargs) as stream:
             with tqdm(total=file_size, unit="B", unit_scale=True, desc="Scanning") as pbar:
                 for record in ArchiveIterator(stream):
                     if limit_reached and record.rec_type == "response":
@@ -279,7 +279,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     # response -> Record id  <-> metadata -
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as outer_zip:
         # Pass 1: Read WARC, write payloads immediately, buffer only headers
-        with fsspec_open(input_file, "rb") as stream:
+        with fsspec_open(input_file, "rb", **open_kwargs) as stream:
             pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
             for record in ArchiveIterator(stream):
                 rec_type = record.rec_type
@@ -346,7 +346,9 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     req_entry = {
                         "warc_headers": list(record.rec_headers.headers),
                         "http_headers": list(record.http_headers.headers) if record.http_headers else [],
-                        "http_request_line": f"{record.http_headers.protocol} {record.http_headers.statusline}" if record.http_headers else "",
+                        "http_request_line": f"{record.http_headers.protocol} {record.http_headers.statusline}"
+                        if record.http_headers
+                        else "",
                         "body": body,
                     }
                     pending_requests.setdefault(request_record_id, []).append(req_entry)
@@ -451,7 +453,15 @@ def cli():
         default="flat",
         help="Output format: 'flat' (counter-named files + global CSVs) or 'sidecar' (domain dirs + per-file metadata)",
     )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="AWS profile to use for S3 access (only valid for s3:// inputs)",
+    )
     args = parser.parse_args()
+
+    if args.profile and urlparse(args.input_file).scheme != "s3":
+        parser.error("--profile is only valid for s3:// inputs")
 
     input_file = args.input_file
     if args.output:
@@ -465,7 +475,14 @@ def cli():
             name = name + ".zip"
         output_path = Path(name)
 
-    main(input_file, str(output_path), dry_run=args.dry_run, limit=args.limit, output_format=args.format)
+    main(
+        input_file,
+        str(output_path),
+        dry_run=args.dry_run,
+        limit=args.limit,
+        output_format=args.format,
+        profile=args.profile,
+    )
 
 
 if __name__ == "__main__":
