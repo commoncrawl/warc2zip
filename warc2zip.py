@@ -16,15 +16,13 @@ from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
 from warcio.utils import fsspec_open
 
-
 MIME_EXTENSION_OVERRIDES = {
     "text/html": ".html",
     "text/plain": ".txt",
     "image/jpeg": ".jpg",
 }
 
-REMOTE_SCHEMES = {"s3", "http", "https", "gs", "gcs", "az", "abfs", "ftp"}
-REMOTE_DRY_RUN_MAX = 100  # hard cap on records scanned by --dry-run on remote inputs
+DRY_RUN_MAX = 10  # hard cap on capture records scanned by --dry-run
 
 
 @dataclass
@@ -232,11 +230,11 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     file_size = get_file_size(input_file)
 
     if dry_run:
-        scheme = urlparse(input_file).scheme
-        if scheme in REMOTE_SCHEMES and (limit is None or limit > REMOTE_DRY_RUN_MAX):
-            limit = REMOTE_DRY_RUN_MAX
+        capped = limit is None or limit > DRY_RUN_MAX
+        if capped:
+            limit = DRY_RUN_MAX
             print(
-                f"Warning: --dry-run on a remote file is limited to a maximum of {REMOTE_DRY_RUN_MAX} records.",
+                f"Warning: --dry-run scans at most {DRY_RUN_MAX} capture records.",
                 file=sys.stderr,
             )
 
@@ -268,7 +266,12 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         metadata_count += 1
                     pbar.update(stream.tell() - pbar.n)
 
-        limit_note = f" (stopped at --limit {limit})" if limit_reached else ""
+        if not limit_reached:
+            limit_note = ""
+        elif capped:
+            limit_note = f" (stopped at the --dry-run cap of {limit})"
+        else:
+            limit_note = f" (stopped at --limit {limit})"
         print(
             f"[dry-run] {response_count} responses, {request_count} requests, "
             f"{metadata_count} metadata records{limit_note}"
@@ -454,7 +457,8 @@ def cli():
     parser = argparse.ArgumentParser(description="Convert a gzipped WARC file into a zip-of-zips archive.")
     parser.add_argument("input_file", help="Path to a .warc.gz file")
     parser.add_argument("--output", default=None, help="Output zip path (default: replace .warc.gz with .zip)")
-    parser.add_argument("--dry-run", action="store_true", help="Skip processing, just print summary")
+    parser.add_argument("--dry-run", action="store_true",
+                        help=f"Skip processing, just print summary. Scans at most {DRY_RUN_MAX} capture records.")
     parser.add_argument(
         "--limit",
         help="Limit to N capture records, with their full set of associated request/metadata records",
