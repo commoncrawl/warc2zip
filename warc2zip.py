@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import mimetypes
+import os
 import posixpath
 import secrets
 import zipfile
@@ -14,6 +15,16 @@ from urllib.parse import urlparse
 from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
 from warcio.utils import fsspec_open
+
+try:
+    from botocore.exceptions import LoginTokenLoadError, MissingDependencyException
+except ImportError:  # botocore only arrives transitively, via warcio[s3]
+
+    class MissingDependencyException(Exception):
+        """Placeholder so the handler in cli() stays valid when botocore is absent."""
+
+    class LoginTokenLoadError(Exception):
+        """Placeholder so the handler in cli() stays valid when botocore is absent."""
 
 
 MIME_EXTENSION_OVERRIDES = {
@@ -436,6 +447,40 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     )
 
 
+def format_login_provider_error(input_file, profile, error):
+    """Explain a credential failure caused by the `aws login` provider, which needs awscrt.
+
+    `aws login` is a standard AWS credential provider, but Boto3/botocore is the one SDK that
+    requires CRT for it (it signs the token refresh with an elliptic-curve key from awscrt).
+    warc2zip depends on botocore[crt], so reaching this means the environment is incomplete --
+    typically an install into the wrong virtualenv, or one predating that dependency.
+    """
+    profile_name = profile or os.environ.get("AWS_PROFILE") or "default"
+    lines = [
+        (
+            f"Error: AWS profile '{profile_name}' uses the `aws login` credential provider, "
+            "which requires awscrt."
+        ),
+        "",
+        "warc2zip depends on botocore[crt], so awscrt should already be present. This environment",
+        "is missing it. Check that warc2zip is installed into the virtualenv you are running,",
+        "then reinstall it (or `pip install \"botocore[crt]\"` directly).",
+        "",
+        "Alternatively, use a credential source that does not need CRT:",
+        "",
+        "  * a profile with SSO or access key / secret:  warc2zip <input> --profile <name>",
+        "  * environment credentials:                    export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...",
+    ]
+
+    # data.commoncrawl.org mirrors s3://commoncrawl over HTTPS, with no credentials at all
+    parsed = urlparse(input_file)
+    if parsed.scheme == "s3" and parsed.netloc == "commoncrawl":
+        lines.append(f"  * fetch over HTTPS instead:                   https://data.commoncrawl.org{parsed.path}")
+
+    lines += ["", f"Underlying error: {error}"]
+    return "\n".join(lines)
+
+
 def cli():
     parser = argparse.ArgumentParser(description="Convert a gzipped WARC file into a zip-of-zips archive.")
     parser.add_argument("input_file", help="Path to a .warc.gz file")
@@ -475,14 +520,22 @@ def cli():
             name = name + ".zip"
         output_path = Path(name)
 
-    main(
-        input_file,
-        str(output_path),
-        dry_run=args.dry_run,
-        limit=args.limit,
-        output_format=args.format,
-        profile=args.profile,
-    )
+    try:
+        main(
+            input_file,
+            str(output_path),
+            dry_run=args.dry_run,
+            limit=args.limit,
+            output_format=args.format,
+            profile=args.profile,
+        )
+    except MissingDependencyException as e:
+        print(format_login_provider_error(input_file, args.profile, e), file=sys.stderr)
+        sys.exit(1)
+    except LoginTokenLoadError as e:
+        # Expired or absent `aws login` session; botocore's message already says to reauthenticate
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

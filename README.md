@@ -20,6 +20,8 @@ pip install .
 
 By default, pip will install remote access tools, namely `fsspec` configured to talk to https and s3 remote files.
 
+`botocore[crt]` is also installed, so AWS `aws login` profiles work out of the box (see [Caveats](#caveats)).
+
 ## Usage
 
 ```bash
@@ -33,7 +35,7 @@ warc2zip s3://commoncrawl/crawl-data/.../CC-MAIN-....warc.gz
 warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 ```
 
-S3 access uses your local AWS configuration (static keys, SSO, and `aws login` profiles all work; `awscrt` is bundled). To pick a specific profile from your AWS config, pass `--profile <name>`:
+S3 access uses your local AWS configuration. Access key/secret, SSO, environment credentials, and `aws login` profiles all work (see [Caveats](#caveats) for why `botocore[crt]` is bundled). To pick a specific profile from your AWS config, pass `--profile <name>`:
 
 ```bash
 warc2zip s3://commoncrawl/crawl-data/.../CC-MAIN-....warc.gz --profile myprofile
@@ -51,6 +53,19 @@ warc2zip s3://commoncrawl/crawl-data/.../CC-MAIN-....warc.gz --profile myprofile
 | `--limit <N>`             | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
 | `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
 | `--profile <name>`        | AWS profile for S3 access (s3:// inputs only)                                          | Default AWS credential chain            |
+
+### Caveats
+
+#### Why `botocore[crt]` is a dependency
+
+warc2zip depends on `botocore[crt]`, which pulls in `awscrt`. This is needed for the [`aws login` credential provider](https://docs.aws.amazon.com/sdkref/latest/guide/feature-login-credentials.html) — profiles carrying a `login_session` key in `~/.aws/config`. Without it, those profiles fail with:
+
+```
+botocore.exceptions.MissingDependencyException: Missing Dependency: Using the login credential
+provider requires an additional dependency. You will need to pip install "botocore[crt]" ...
+```
+
+Since AWS [recommends `aws login` over long-term access keys](https://aws.amazon.com/blogs/security/simplified-developer-access-to-aws-with-aws-login/), warc2zip includes CRT so those profiles work out of the box. If you see the error above, your environment is missing `awscrt` — check that warc2zip is installed in the virtualenv you are actually running, then reinstall.
 
 ### Small Examples
 
