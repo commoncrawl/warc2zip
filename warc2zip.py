@@ -4,7 +4,9 @@ import io
 import json
 import mimetypes
 import posixpath
+import re
 import secrets
+import sys
 import zipfile
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -60,30 +62,77 @@ def mime_to_extension(mime_type):
     return mimetypes.guess_extension(mime_type) or ".unk"
 
 
-def write_denormalized_csv(rows):
-    """Write denormalized CSV: filename, header_name, header_value (multiple rows per file)."""
+# Every C0 control except TAB, plus DEL. TAB is harmless inside a quoted field and occurs
+# legitimately in header values; NUL and CR/LF are not — see sanitize_csv_value().
+CSV_CONTROL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+# The dialect is pinned field-by-field rather than inherited from csv.excel's class attributes,
+# so a mutated global dialect can't silently change how values are quoted. No escapechar on
+# purpose: QUOTE_ALL + doublequote covers every case, and setting one would double every
+# backslash in a value (including the \xNN sequences sanitize_csv_value emits).
+CSV_DIALECT = {
+    "delimiter": ",",
+    "quotechar": '"',
+    "doublequote": True,
+    "lineterminator": "\r\n",
+    "quoting": csv.QUOTE_ALL,
+}
+
+
+def sanitize_csv_value(value):
+    r"""Make control characters visible so CSV output stays reader-parseable.
+
+    Header values off the wire can carry a NUL (seen in CC-MAIN-2026-21: `connection: close\x00`)
+    or, via obs-fold, an embedded CR/LF. A single NUL makes csv.reader reject the whole file;
+    rendering these as `\xNN` keeps rows single-line and the file parseable, without discarding
+    the evidence that the byte was there.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    return CSV_CONTROL_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", value)
+
+
+def write_denormalized_csv(rows, label="csv"):
+    """Write denormalized CSV: filename, header_name, header_value (multiple rows per file).
+
+    Returns (content, skipped) — a row that still fails to write is reported and skipped rather
+    than aborting a conversion that has already streamed the whole WARC.
+    """
     sio = io.StringIO()
-    writer = csv.writer(sio, quoting=csv.QUOTE_ALL)
+    writer = csv.writer(sio, **CSV_DIALECT)
     writer.writerow(["filename", "header_name", "header_value"])
+    skipped = 0
     for row in rows:
         filename, header_name, header_value = row
         header_name = header_name.strip().lower().replace("-", "_")
 
-        writer.writerow((filename, header_name, header_value))
-    return sio.getvalue()
+        try:
+            writer.writerow((filename, header_name, sanitize_csv_value(header_value)))
+        except (csv.Error, UnicodeError) as e:
+            skipped += 1
+            print(f"warning: {label}: skipped header {header_name!r} of {filename}: {e}", file=sys.stderr)
+    return sio.getvalue(), skipped
 
 
-def write_multiline_csv(rows):
-    """Write multiline CSV: filename, headers (one row per file, headers as multiline string)."""
+def write_multiline_csv(rows, label="csv"):
+    """Write multiline CSV: filename, headers (one row per file, headers as multiline string).
+
+    Returns (content, skipped) — see write_denormalized_csv().
+    """
     sio = io.StringIO()
-    writer = csv.writer(sio, quoting=csv.QUOTE_ALL)
+    writer = csv.writer(sio, **CSV_DIALECT)
     writer.writerow(["filename", "headers"])
+    skipped = 0
     for filename, header_pairs in rows:
         headers_str = "\n".join(
-            f"{name.replace('-', '_').lower()}: {value}" for name, value in header_pairs
+            f"{name.replace('-', '_').lower()}: {sanitize_csv_value(value)}" for name, value in header_pairs
         )
-        writer.writerow([filename, headers_str])
-    return sio.getvalue()
+        try:
+            writer.writerow([filename, headers_str])
+        except (csv.Error, UnicodeError) as e:
+            skipped += 1
+            print(f"warning: {label}: skipped headers of {filename}: {e}", file=sys.stderr)
+    return sio.getvalue(), skipped
 
 
 def get_file_size(input_file):
@@ -417,21 +466,36 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         outer_zip.writestr(f"{root_dir}/manifest.jsonl", jsonl_content)
 
         # Write denormalized CSVs
-        outer_zip.writestr(f"{root_dir}/response_warc_headers.csv", write_denormalized_csv(response_warc_rows))
-        outer_zip.writestr(f"{root_dir}/response_http_headers.csv", write_denormalized_csv(response_http_rows))
-        outer_zip.writestr(f"{root_dir}/request_warc_headers.csv", write_denormalized_csv(request_warc_rows))
-        outer_zip.writestr(f"{root_dir}/metadata.csv", write_denormalized_csv(metadata_rows))
+        skipped = 0
+        for name, rows in (
+            ("response_warc_headers", response_warc_rows),
+            ("response_http_headers", response_http_rows),
+            ("request_warc_headers", request_warc_rows),
+            ("metadata", metadata_rows),
+        ):
+            content, n = write_denormalized_csv(rows, label=f"{name}.csv")
+            outer_zip.writestr(f"{root_dir}/{name}.csv", content)
+            skipped += n
 
         # Write multiline CSVs
-        outer_zip.writestr(f"{root_dir}/response_warc_headers_multi.csv", write_multiline_csv(response_warc_multi))
-        outer_zip.writestr(f"{root_dir}/response_http_headers_multi.csv", write_multiline_csv(response_http_multi))
-        outer_zip.writestr(f"{root_dir}/request_warc_headers_multi.csv", write_multiline_csv(request_warc_multi))
-        outer_zip.writestr(f"{root_dir}/metadata_multi.csv", write_multiline_csv(metadata_multi))
+        for name, rows in (
+            ("response_warc_headers_multi", response_warc_multi),
+            ("response_http_headers_multi", response_http_multi),
+            ("request_warc_headers_multi", request_warc_multi),
+            ("metadata_multi", metadata_multi),
+        ):
+            content, n = write_multiline_csv(rows, label=f"{name}.csv")
+            outer_zip.writestr(f"{root_dir}/{name}.csv", content)
+            skipped += n
 
     print(
         f"Created {output_path}: {response_count} responses, "
         f"{request_count} requests, {metadata_count} metadata records"
     )
+    if skipped:
+        print(f"warning: {skipped} CSV row(s) could not be written (see warnings above)", file=sys.stderr)
+
+    return skipped
 
 
 def cli():
@@ -465,8 +529,10 @@ def cli():
             name = name + ".zip"
         output_path = Path(name)
 
-    main(input_file, str(output_path), dry_run=args.dry_run, limit=args.limit, output_format=args.format)
+    skipped = main(input_file, str(output_path), dry_run=args.dry_run, limit=args.limit, output_format=args.format)
+
+    return 1 if skipped else 0
 
 
 if __name__ == "__main__":
-    cli()
+    sys.exit(cli())
