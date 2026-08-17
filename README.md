@@ -1,11 +1,13 @@
 # warc2zip
 
-Convert gzipped WARC files into zip archives. Each response record's payload is stored as a file with a proper extension (derived from Content-Type), alongside CSV and JSONL metadata.
+warc2zip converts WARC web archive files into zip archives, while preserving 100% of the metadata.
+
+Each response record's payload is stored as a individual file with a proper extension, derived from its Content-Type.
+Metadata from the request, response, and metadata records are  written to CSV (spreadsheet) files.
 
 > [!WARNING]
-> **Feedback are welcome**: this project is in early development. Feel free to open an issue or submit 
+> **Feedback is welcome**: this project is in early development. Feel free to open an issue or submit
 > a pull request if you have suggestions, bug reports, or feature requests. See [WARC examples](#example-warc-for-testing) for testing below.
-
 
 ## Installation
 
@@ -16,11 +18,7 @@ Convert gzipped WARC files into zip archives. Each response record's payload is 
 pip install .
 ```
 
-For development:
-
-```bash
-pip install -e .
-```
+By default, pip will install remote access tools, namely `fsspec` configured to talk to https and s3 remote files.
 
 ## Usage
 
@@ -35,6 +33,8 @@ warc2zip s3://commoncrawl/crawl-data/.../CC-MAIN-....warc.gz
 warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 ```
 
+**Note**: `s3://commoncrawl` does **not** allow anonymous access — requests must be signed with credentials from any AWS account. To fetch Common Crawl data without an AWS account, use the HTTPS endpoint (`https://data.commoncrawl.org/...`) instead.
+
 ### Options
 
 | Flag                      | Description                                                                            | Default                                 |
@@ -45,7 +45,7 @@ warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 | `--limit <N>`             | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
 | `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
 
-### Examples
+### Small Examples
 
 Preview records without writing anything:
 
@@ -77,49 +77,13 @@ Extract with sidecar format (per-file metadata, grouped by domain):
 warc2zip archive.warc.gz --format sidecar --output result.zip
 ```
 
-## WARC examples for testing
-
-We prepared some smaller (~1Gb or less) and interesting WARC files for testing: US Federal government websites, homepages, etc. 
-You can download them from the [Huggingface bucket](https://huggingface.co/buckets/commoncrawl/warc2zip-examples).
-
-Details: 
-- Example WARC from CC-MAIN-2026-25 with 500 records (response, request and metadata) [CC-MAIN-2026-30-500_records.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true)
-  ```
-  isPartOf: CC-MAIN-2026-25
-  publisher: Common Crawl
-  description: Wide crawl of the web for June 2026
-  operator: Common Crawl Admin (info@commoncrawl.org)
-  hostname: ip-10-67-67-233
-  software: Apache Nutch 1.21 (modified, https://github.com/commoncrawl/nutch/)
-  robots: checked via crawler-commons 1.7-SNAPSHOT (https://github.com/crawler-commons/crawler-commons)
-  format: WARC File Format 1.1
-  conformsTo: https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.1/
-  ```
-
-- Homepages extracted from CC-MAIN-2026-21 [homepages_CC-MAIN-2026-21.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true) (*)
-  ```
-  software: pypi_cdx_toolkit/0.9.40.dev89+g53a7ef76c
-  isPartOf: CC-MAIN-2026-21
-  description: Repackage of CC-MAIN-2026-21 containing only response records of homepages
-  format: WARC file version 1.0
-  creator: Common Crawl Foundation <https://commoncrawl.org>
-  operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
-  ```
-- URLs of federal institutions, as part of the [End Of Term Archive](https://eotarchive.org/) project: [is_us_federal_CC-MAIN-2025-13.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true) (*)
-  ```
-  software: pypi_cdx_toolkit/0.9.40.dev91+ga04800ea0
-  isPartOf: CC-MAIN-2025-13
-  description: Repackage of CC-MAIN-2025-13 containing only response records of US federal government hosts
-  format: WARC file version 1.0
-  creator: Common Crawl Foundation <https://commoncrawl.org>
-  operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
-  ```
-
-(*) These WARC files are repackaged using the HOST and URL index and contains only response captures.
-
 ## Output Formats
 
 All files are placed under a unique root directory inside the zip to prevent collisions when extracting multiple archives into the same folder. The directory name is derived from the WARC-Filename header (in the `warcinfo` record), the current timestamp, and a random suffix: `{crawl_name}_{YYYYMMDDTHHMMSS}_{hex}`.
+
+This testing release of the software supports 2 output formats: flat and sidecar.
+Flat puts the metadata into a small number of large files, and sidecar instead
+creates a lot of metadata files, one for each payload.
 
 ### Flat format (`--format flat`, default)
 
@@ -246,3 +210,60 @@ Includes a `_body` pseudo-header with the metadata record body:
 "1000000.html","_body,"fetchTimeMs: 245
 charset-detected: UTF-8"
 ```
+
+## WARC examples for testing
+
+We prepared some smaller (~1GBytes or less) and interesting WARC files for testing: US Federal government websites, homepages, etc.
+These files are in a [Huggingface bucket](https://huggingface.co/buckets/commoncrawl/warc2zip-examples) and the `warc2zip` commands
+below read directly from that bucket. These examples are `--format flat` ... you can also try `--format sidecar`
+
+Details:
+
+- Example WARC from CC-MAIN-2026-25 with 500 records (response, request and metadata, 13 MBytes) [CC-MAIN-2026-30-500_records.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true)
+
+  - make the zip
+```
+  warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true' --format flat
+```
+  - here is the warcinfo
+
+```
+  isPartOf: CC-MAIN-2026-25
+  publisher: Common Crawl
+  description: Wide crawl of the web for June 2026
+  operator: Common Crawl Admin (info@commoncrawl.org)
+  hostname: ip-10-67-67-233
+  software: Apache Nutch 1.21 (modified, https://github.com/commoncrawl/nutch/)
+  robots: checked via crawler-commons 1.7-SNAPSHOT (https://github.com/crawler-commons/crawler-commons)
+  format: WARC File Format 1.1
+  conformsTo: https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.1/
+  ```
+
+- Homepages extracted from CC-MAIN-2026-21 (response records only, 1 GByte) [homepages_CC-MAIN-2026-21.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true)
+  - make the zip, note the limit
+```
+warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true' --format flat --limit 1000
+```
+  - here is the warcinfo
+```
+  software: pypi_cdx_toolkit/0.9.40.dev89+g53a7ef76c
+  isPartOf: CC-MAIN-2026-21
+  description: Repackage of CC-MAIN-2026-21 containing only response records of homepages
+  format: WARC file version 1.0
+  creator: Common Crawl Foundation <https://commoncrawl.org>
+  operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
+  ```
+- URLs of federal institutions (response records only, 1/2 GByte), as part of the [End Of Term Archive](https://eotarchive.org/) project: [is_us_federal_CC-MAIN-2025-13.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true)
+  - make the zip, note the limit
+  ```
+warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true' --format flat --limit 1000
+  ```
+  - here is the warcinfo
+  ```
+  software: pypi_cdx_toolkit/0.9.40.dev91+ga04800ea0
+  isPartOf: CC-MAIN-2025-13
+  description: Repackage of CC-MAIN-2025-13 containing only response records of US federal government hosts
+  format: WARC file version 1.0
+  creator: Common Crawl Foundation <https://commoncrawl.org>
+  operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
+  ```
