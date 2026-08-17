@@ -6,9 +6,10 @@ import mimetypes
 import os
 import posixpath
 import secrets
+import sys
 import zipfile
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -16,12 +17,20 @@ from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
 from warcio.utils import fsspec_open
 
+# botocore only arrives transitively, via warcio[s3], and LoginTokenLoadError is newer than
+# MissingDependencyException -- import them separately so a botocore predating the `aws login`
+# provider still gets the MissingDependencyException handler rather than silently losing both.
 try:
-    from botocore.exceptions import LoginTokenLoadError, MissingDependencyException
-except ImportError:  # botocore only arrives transitively, via warcio[s3]
+    from botocore.exceptions import MissingDependencyException
+except ImportError:
 
     class MissingDependencyException(Exception):
         """Placeholder so the handler in cli() stays valid when botocore is absent."""
+
+
+try:
+    from botocore.exceptions import LoginTokenLoadError
+except ImportError:
 
     class LoginTokenLoadError(Exception):
         """Placeholder so the handler in cli() stays valid when botocore is absent."""
@@ -448,34 +457,50 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
 
 
 def format_login_provider_error(input_file, profile, error):
-    """Explain a credential failure caused by the `aws login` provider, which needs awscrt.
+    """Explain a botocore MissingDependencyException, which for warc2zip almost always means awscrt.
 
     `aws login` is a standard AWS credential provider, but Boto3/botocore is the one SDK that
     requires CRT for it (it signs the token refresh with an elliptic-curve key from awscrt).
     warc2zip depends on botocore[crt], so reaching this means the environment is incomplete --
     typically an install into the wrong virtualenv, or one predating that dependency.
+
+    botocore raises MissingDependencyException from several places besides the login provider
+    (checksums, sigv4a, endpoint rules), so only claim the login provider when the underlying
+    message actually says so. Every case still points at the same fix: install botocore[crt].
     """
+    is_login_failure = "login" in str(error).lower()
     profile_name = profile or os.environ.get("AWS_PROFILE") or "default"
-    lines = [
-        (
+
+    if is_login_failure:
+        opening = (
             f"Error: AWS profile '{profile_name}' uses the `aws login` credential provider, "
             "which requires awscrt."
-        ),
+        )
+    else:
+        opening = "Error: this AWS operation requires awscrt."
+
+    lines = [
+        opening,
         "",
         "warc2zip depends on botocore[crt], so awscrt should already be present. This environment",
         "is missing it. Check that warc2zip is installed into the virtualenv you are running,",
         "then reinstall it (or `pip install \"botocore[crt]\"` directly).",
-        "",
-        "Alternatively, use a credential source that does not need CRT:",
-        "",
-        "  * a profile with SSO or access key / secret:  warc2zip <input> --profile <name>",
-        "  * environment credentials:                    export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...",
     ]
 
-    # data.commoncrawl.org mirrors s3://commoncrawl over HTTPS, with no credentials at all
-    parsed = urlparse(input_file)
-    if parsed.scheme == "s3" and parsed.netloc == "commoncrawl":
-        lines.append(f"  * fetch over HTTPS instead:                   https://data.commoncrawl.org{parsed.path}")
+    # Switching credential sources only helps when it was the login provider that needed CRT
+    if is_login_failure:
+        lines += [
+            "",
+            "Alternatively, use a credential source that does not need CRT:",
+            "",
+            "  * a profile with SSO or access key / secret:  warc2zip <input> --profile <name>",
+            "  * environment credentials:                    export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...",
+        ]
+
+        # data.commoncrawl.org mirrors s3://commoncrawl over HTTPS, with no credentials at all
+        parsed = urlparse(input_file)
+        if parsed.scheme == "s3" and parsed.netloc == "commoncrawl":
+            lines.append(f"  * fetch over HTTPS instead:                   https://data.commoncrawl.org{parsed.path}")
 
     lines += ["", f"Underlying error: {error}"]
     return "\n".join(lines)

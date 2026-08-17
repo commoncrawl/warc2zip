@@ -22,6 +22,12 @@ By default, pip will install remote access tools, namely `fsspec` configured to 
 
 `botocore[crt]` is also installed, so AWS `aws login` profiles work out of the box (see [Caveats](#caveats)).
 
+For development, install in editable mode with the linter:
+
+```bash
+pip install -e ".[dev]"
+```
+
 ## Usage
 
 ```bash
@@ -49,7 +55,7 @@ warc2zip s3://commoncrawl/crawl-data/.../CC-MAIN-....warc.gz --profile myprofile
 |---------------------------|----------------------------------------------------------------------------------------|-----------------------------------------|
 | `input_file`              | Path or URI to a `.warc.gz` file (positional, required)                                |                                         |
 | `--output`                | Path to the output zip file                                                            | Replace `.warc.gz` with `.zip`          |
-| `--dry-run`               | Print summary without creating output. On remote inputs the scan is limited to a maximum of 100 records (to avoid streaming the whole file); local files are scanned fully unless `--limit` is set |                                         |
+| `--dry-run`               | Print summary without creating output. The scan still streams the whole file (counting requires reading the sequential gzip stream), so pair it with `--limit` on large remote inputs |                                         |
 | `--limit <N>`             | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
 | `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
 | `--profile <name>`        | AWS profile for S3 access (s3:// inputs only)                                          | Default AWS credential chain            |
