@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["ruff"]
+dev = ["ruff", "pytest>=8.0"]
 
 [project.scripts]
 warc2zip = "warc2zip:cli"
