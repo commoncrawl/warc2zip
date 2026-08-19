@@ -135,6 +135,129 @@ def write_multiline_csv(rows, label="csv"):
     return sio.getvalue(), skipped
 
 
+# A warc-fields name is an HTTP token (RFC 9110 5.6.2). Checking the charset, not just the
+# presence of a colon, is what stops a one-line JSON body ({"just": "json"}) from being read as a
+# field named '{"just"' — a real risk, since some producers put JSON in a metadata record.
+WARC_FIELD_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
+
+
+def parse_warc_fields(text):
+    r"""Parse an application/warc-fields body into (name, value) pairs.
+
+    Returns None when the body doesn't look like warc-fields, so callers keep the raw block
+    instead of mangling something that was never a field list (a JSON blob, free text).
+    Only the first ':' splits a line: CC emits fields like
+    `http-header-user-agent: Mozilla/5.0 (X11; Linux)` whose value carries its own colons.
+    Duplicate names are kept as separate pairs, the way repeated WARC headers already are.
+    """
+    pairs = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line.strip():
+            continue
+        if line[0] in " \t":
+            # obs-fold continuation of the previous field
+            if not pairs:
+                return None
+            name, value = pairs[-1]
+            pairs[-1] = (name, f"{value} {line.strip()}")
+            continue
+        name, sep, value = line.partition(":")
+        if not sep or not WARC_FIELD_NAME_RE.match(name.strip()):
+            return None
+        pairs.append((name.strip(), value.strip()))
+    return pairs or None
+
+
+def flatten_body_rows(body_text, prefix="_body"):
+    """Shallow-flatten a warc-fields body into ("_body.<field>", value) pairs.
+
+    One level only: a field whose value is JSON (CC's languages-cld2) stays a single opaque
+    value, because the list nested inside it doesn't flatten into columns usefully. Names are
+    normalized here rather than left to the writers, since write_denormalized_csv() and
+    write_multiline_csv() normalize slightly differently. A body that isn't warc-fields falls
+    back to one raw row, so nothing is lost.
+    """
+    pairs = parse_warc_fields(body_text)
+    if pairs is None:
+        return [(prefix, body_text)]
+    return [(f"{prefix}.{n.strip().lower().replace('-', '_')}", v) for n, v in pairs]
+
+
+def request_line_pairs(line):
+    """Split an HTTP request line into request_method / request_target pseudo-header pairs.
+
+    Expects "GET /path HTTP/1.1". A leading HTTP/x token is skipped rather than trusted, so a
+    line assembled protocol-first can't turn into a row claiming the method is "HTTP/1.1".
+    """
+    parts = line.split()
+    if parts and parts[0].upper().startswith("HTTP/"):
+        parts = parts[1:]
+    if len(parts) >= 2:
+        return [("request_method", parts[0]), ("request_target", parts[1])]
+    return []
+
+
+MANIFEST_COLUMNS = (
+    "filename",
+    "warc_record_id",
+    "warc_target_uri",
+    "warc_date",
+    "http_status_code",
+    "detected_mime_type",
+    "content_type_header",
+    "payload_size",
+)
+
+
+def write_manifest_csv(entries, label="manifest.csv"):
+    """Write the wide CSV mirror of manifest.jsonl: one row per capture, one column per key.
+
+    Fed from the same entry dicts as the JSONL so the two files cannot drift.
+    Returns (content, skipped) - see write_denormalized_csv().
+    """
+    sio = io.StringIO()
+    writer = csv.writer(sio, **CSV_DIALECT)
+    writer.writerow(list(MANIFEST_COLUMNS))
+    skipped = 0
+    for entry in entries:
+        try:
+            writer.writerow([sanitize_csv_value(entry.get(column, "")) for column in MANIFEST_COLUMNS])
+        except (csv.Error, UnicodeError) as e:
+            skipped += 1
+            print(f"warning: {label}: skipped entry {entry.get('filename')!r}: {e}", file=sys.stderr)
+    return sio.getvalue(), skipped
+
+
+def build_warcinfo_rows(warcinfos):
+    """Build denormalized and multiline CSV rows for the warcinfo record(s).
+
+    warcinfo is crawl-level and belongs to no payload file, so the filename column carries a
+    synthetic key: "warcinfo", then "warcinfo.1" etc. for the extra records a concatenated
+    WARC brings along.
+    """
+    rows = []
+    multi = []
+    for i, (headers, body_text) in enumerate(warcinfos):
+        key = "warcinfo" if i == 0 else f"warcinfo.{i}"
+        for n, v in headers:
+            rows.append((key, str.lower(n.replace("-", "_")), v))
+        rows.extend((key, n, v) for n, v in flatten_body_rows(body_text))
+        multi.append((key, list(headers) + [("_body", body_text)]))
+    return rows, multi
+
+
+def write_warcinfo_files(zip_file, root_dir, warcinfos):
+    """Write the raw warcinfo record(s): WARC headers and warc-fields body, wire bytes preserved."""
+    zip_file.writestr(
+        f"{root_dir}/warcinfo.warc",
+        "\n\n".join("\n".join(f"{n}: {v}" for n, v in headers) for headers, _ in warcinfos),
+    )
+    zip_file.writestr(
+        f"{root_dir}/warcinfo.warc-fields",
+        "\n\n".join(body for _, body in warcinfos),
+    )
+
+
 def get_file_size(input_file):
     """Get file size, handling both local paths and remote URIs."""
     try:
@@ -176,25 +299,43 @@ def build_group_metadata(group):
     response_warc_rows = [(payload_filename, str.lower(n), v) for n, v in group.response_warc_headers]
     response_warc_multi = (payload_filename, group.response_warc_headers)
 
-    # Response HTTP headers
-    response_http_rows = [(payload_filename, str.lower(n), v) for n, v in group.response_http_headers]
-    response_http_multi = (payload_filename, group.response_http_headers)
+    # Response HTTP headers, led by a synthetic status_code row so the status is greppable.
+    # Deliberately not the status line: CC's WARCs claim HTTP/1.1 even for h2 captures. The true
+    # protocol is already in response_warc_headers.csv as warc_protocol rows.
+    status_pairs = [("status_code", group.http_status_code)] if group.http_status_code else []
+    response_http_pairs = status_pairs + group.response_http_headers
+    response_http_rows = [(payload_filename, str.lower(n), v) for n, v in response_http_pairs]
+    response_http_multi = (payload_filename, response_http_pairs)
 
-    # Request WARC headers (all requests use the response's payload_filename)
+    # Request WARC and HTTP headers (all requests use the response's payload_filename).
+    # The HTTP side used to reach sidecar files only, so flat format lost it entirely.
     request_warc_rows = []
     request_warc_multi_entries = []
-    for req_pairs in group.requests:
+    request_http_rows = []
+    request_http_multi_entries = []
+    for i, req_pairs in enumerate(group.requests):
         for n, v in req_pairs:
             request_warc_rows.append((payload_filename, str.lower(n.replace("-", "_")), v))
         request_warc_multi_entries.append((payload_filename, req_pairs))
 
-    # Metadata entries (all use the response's payload_filename)
+        http_pairs = group.request_http_headers[i] if i < len(group.request_http_headers) else []
+        request_line = group.request_http_lines[i] if i < len(group.request_http_lines) else ""
+        http_pairs = request_line_pairs(request_line) + http_pairs
+        if http_pairs:
+            for n, v in http_pairs:
+                request_http_rows.append((payload_filename, str.lower(n.replace("-", "_")), v))
+            request_http_multi_entries.append((payload_filename, http_pairs))
+
+    # Metadata entries (all use the response's payload_filename). The denormalized CSV gets the
+    # warc-fields body shallow-flattened so each field can be grepped; the multiline CSV keeps the
+    # raw block, so flat-format output still reproduces the wire bytes despite having no
+    # .metadata.warc-fields sidecar.
     metadata_rows = []
     metadata_multi_entries = []
     for meta_pairs, body_text in group.metadata_entries:
         for n, v in meta_pairs:
             metadata_rows.append((payload_filename, str.lower(n.replace("-", "_")), v))
-        metadata_rows.append((payload_filename, "_body", body_text))
+        metadata_rows.extend((payload_filename, n, v) for n, v in flatten_body_rows(body_text))
         all_pairs = meta_pairs + [("_body", body_text)]
         metadata_multi_entries.append((payload_filename, all_pairs))
 
@@ -217,6 +358,8 @@ def build_group_metadata(group):
         "response_http_multi": response_http_multi,
         "request_warc_rows": request_warc_rows,
         "request_warc_multi": request_warc_multi_entries,
+        "request_http_rows": request_http_rows,
+        "request_http_multi": request_http_multi_entries,
         "metadata_rows": metadata_rows,
         "metadata_multi": metadata_multi_entries,
         "jsonl_entry": jsonl_entry,
@@ -273,7 +416,7 @@ def write_sidecar_files(zip_file, root_dir, group):
         zip_file.writestr(f"{base}.metadata.warc-fields", "\n\n".join(body_parts))
 
 
-def main(input_file, output_path, dry_run=False, limit=None, output_format="flat"):
+def main(input_file, output_path, dry_run=False, limit=None, output_format="flat", metadata_only=False):
     file_size = get_file_size(input_file)
 
     if dry_run:
@@ -315,6 +458,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     order_counter = 0
     counter = 1_000_000
     root_dir = None  # resolved from first warcinfo record
+    warcinfos = []  # list[(warc_header_pairs, body_text)] - crawl-level provenance
 
     # Fallback crawl name from input filename
     input_basename = posixpath.basename(input_file.rstrip("/"))
@@ -337,7 +481,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     break
 
                 if rec_type == "warcinfo":
-                    record.content_stream().read()
+                    body_text = record.content_stream().read().decode("utf-8", errors="replace")
+                    warcinfos.append((list(record.rec_headers.headers), body_text))
                     if root_dir is None:
                         warc_filename = record.rec_headers.get_header("WARC-Filename") or ""
                         crawl_name = extract_crawl_name(warc_filename) if warc_filename else fallback_crawl_name
@@ -368,7 +513,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         zip_path = f"{root_dir}/{group.response_domain}/{payload_filename}"
                     else:
                         zip_path = f"{root_dir}/{payload_filename}"
-                    outer_zip.writestr(zip_path, payload)
+                    if not metadata_only:
+                        outer_zip.writestr(zip_path, payload)
 
                     group.payload_filename = payload_filename
                     group.payload_size = len(payload)
@@ -395,7 +541,11 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     req_entry = {
                         "warc_headers": list(record.rec_headers.headers),
                         "http_headers": list(record.http_headers.headers) if record.http_headers else [],
-                        "http_request_line": f"{record.http_headers.protocol} {record.http_headers.statusline}" if record.http_headers else "",
+                        # warcio's parser splits a request line as protocol="GET",
+                        # statusline="/path HTTP/1.1" — recompose it to get "GET /path HTTP/1.1".
+                        "http_request_line": f"{record.http_headers.protocol} {record.http_headers.statusline}"
+                        if record.http_headers
+                        else "",
                         "body": body,
                     }
                     pending_requests.setdefault(request_record_id, []).append(req_entry)
@@ -441,6 +591,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         response_http_multi = []
         request_warc_rows = []
         request_warc_multi = []
+        request_http_rows = []
+        request_http_multi = []
         metadata_rows = []
         metadata_multi = []
         jsonl_entries = []
@@ -457,21 +609,33 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             response_http_multi.append(result["response_http_multi"])
             request_warc_rows.extend(result["request_warc_rows"])
             request_warc_multi.extend(result["request_warc_multi"])
+            request_http_rows.extend(result["request_http_rows"])
+            request_http_multi.extend(result["request_http_multi"])
             metadata_rows.extend(result["metadata_rows"])
             metadata_multi.extend(result["metadata_multi"])
             jsonl_entries.append(result["jsonl_entry"])
 
-        # Write manifest.jsonl
+        # Write the warcinfo record(s): raw wire bytes plus greppable CSVs
+        warcinfo_rows = []
+        warcinfo_multi = []
+        if warcinfos:
+            write_warcinfo_files(outer_zip, root_dir, warcinfos)
+            warcinfo_rows, warcinfo_multi = build_warcinfo_rows(warcinfos)
+
+        # Write manifest.jsonl and its wide CSV mirror, both from the same entries
         jsonl_content = "\n".join(json.dumps(entry) for entry in jsonl_entries)
         outer_zip.writestr(f"{root_dir}/manifest.jsonl", jsonl_content)
+        manifest_content, skipped = write_manifest_csv(jsonl_entries)
+        outer_zip.writestr(f"{root_dir}/manifest.csv", manifest_content)
 
         # Write denormalized CSVs
-        skipped = 0
         for name, rows in (
             ("response_warc_headers", response_warc_rows),
             ("response_http_headers", response_http_rows),
             ("request_warc_headers", request_warc_rows),
+            ("request_http_headers", request_http_rows),
             ("metadata", metadata_rows),
+            ("warcinfo", warcinfo_rows),
         ):
             content, n = write_denormalized_csv(rows, label=f"{name}.csv")
             outer_zip.writestr(f"{root_dir}/{name}.csv", content)
@@ -482,7 +646,9 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             ("response_warc_headers_multi", response_warc_multi),
             ("response_http_headers_multi", response_http_multi),
             ("request_warc_headers_multi", request_warc_multi),
+            ("request_http_headers_multi", request_http_multi),
             ("metadata_multi", metadata_multi),
+            ("warcinfo_multi", warcinfo_multi),
         ):
             content, n = write_multiline_csv(rows, label=f"{name}.csv")
             outer_zip.writestr(f"{root_dir}/{name}.csv", content)
@@ -491,6 +657,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     print(
         f"Created {output_path}: {response_count} responses, "
         f"{request_count} requests, {metadata_count} metadata records"
+        + (" (metadata only, no payloads written)" if metadata_only else "")
     )
     if skipped:
         print(f"warning: {skipped} CSV row(s) could not be written (see warnings above)", file=sys.stderr)
@@ -502,7 +669,14 @@ def cli():
     parser = argparse.ArgumentParser(description="Convert a gzipped WARC file into a zip-of-zips archive.")
     parser.add_argument("input_file", help="Path to a .warc.gz file")
     parser.add_argument("--output", default=None, help="Output zip path (default: replace .warc.gz with .zip)")
-    parser.add_argument("--dry-run", action="store_true", help="Skip processing, just print summary")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Skip processing, just print summary")
+    mode.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Write every CSV, manifest and sidecar but no payload files. The WARC is still "
+        "streamed in full, so this saves output size, not transfer (use --limit for that).",
+    )
     parser.add_argument(
         "--limit",
         help="Limit to N capture records, with their full set of associated request/metadata records",
@@ -529,7 +703,14 @@ def cli():
             name = name + ".zip"
         output_path = Path(name)
 
-    skipped = main(input_file, str(output_path), dry_run=args.dry_run, limit=args.limit, output_format=args.format)
+    skipped = main(
+        input_file,
+        str(output_path),
+        dry_run=args.dry_run,
+        limit=args.limit,
+        output_format=args.format,
+        metadata_only=args.metadata_only,
+    )
 
     return 1 if skipped else 0
 
