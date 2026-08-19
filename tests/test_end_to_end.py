@@ -11,6 +11,7 @@ import re
 import zipfile
 
 import pytest
+from warcio.archiveiterator import ArchiveIterator
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 
@@ -307,3 +308,82 @@ def test_metadata_only_drops_payloads_and_changes_nothing_else(warc_path, tmp_pa
     assert metadata_members == set(meta_members)
     for name in metadata_members:
         assert full_members[name] == meta_members[name], name
+
+
+def test_manifest_offsets_locate_the_record_inside_the_warc(warc_path, tmp_path):
+    """The whole point of offset+length: reading those bytes must yield that exact record.
+
+    Each record is its own gzip member, so the slice is a standalone WARC — which is what makes
+    an HTTP range request against the original WARC work.
+    """
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        name = next(n for n in zf.namelist() if n.endswith("manifest.jsonl"))
+        entries = [json.loads(line) for line in zf.read(name).decode("utf-8").splitlines()]
+
+    raw = warc_path.read_bytes()
+    assert len(entries) == len(CAPTURES)
+    for entry in entries:
+        offset, length = entry["warc_record_offset"], entry["warc_record_length"]
+        assert isinstance(offset, int) and isinstance(length, int) and length > 0
+
+        record = next(iter(ArchiveIterator(io.BytesIO(raw[offset : offset + length]))))
+
+        assert record.rec_type == "response"
+        assert record.rec_headers.get_header("WARC-Record-ID") == entry["warc_record_id"]
+        assert record.rec_headers.get_header("WARC-Target-URI") == entry["warc_target_uri"]
+
+
+def test_manifest_names_the_source_warc(warc_path, tmp_path):
+    """A CSV-only consumer needs the filename on every row to re-fetch without the zip's context."""
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        rows = read_rows(zf, "manifest.csv")
+        warcinfo = read_rows(zf, "warcinfo.csv")
+
+    column = MANIFEST_COLUMNS.index("warc_filename")
+    assert {row[column] for row in rows} == {"test.warc.gz"}
+    # ...and warcinfo.csv records where the file was actually read from
+    assert ["warcinfo", "_source_uri", str(warc_path)] in warcinfo
+
+
+def test_every_record_type_carries_its_location(warc_path, tmp_path):
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        for suffix in ("response_warc_headers.csv", "request_warc_headers.csv", "metadata.csv", "warcinfo.csv"):
+            names = {name for _, name, _ in read_rows(zf, suffix)}
+            assert {"warc_record_offset", "warc_record_length"} <= names, suffix
+
+
+def test_source_uri_is_recorded_even_without_a_warcinfo_record(tmp_path):
+    """A WARC with no warcinfo still has to say where it came from."""
+    path = tmp_path / "no-warcinfo.warc.gz"
+    with open(path, "wb") as fh:
+        writer = WARCWriter(fh, gzip=True)
+        payload = b"<html>bare</html>"
+        writer.write_record(
+            writer.create_warc_record(
+                "https://bare.example.com/",
+                "response",
+                payload=io.BytesIO(payload),
+                length=len(payload),
+                http_headers=StatusAndHeaders("200 OK", [("Content-Type", "text/html")], protocol="HTTP/1.1"),
+            )
+        )
+
+    out = tmp_path / "flat.zip"
+    main(str(path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        warcinfo = read_rows(zf, "warcinfo.csv")
+        rows = read_rows(zf, "manifest.csv")
+
+    assert ["warcinfo", "_source_uri", str(path)] in warcinfo
+    # WARC-Filename is unavailable, so the input's own basename stands in
+    assert {row[MANIFEST_COLUMNS.index("warc_filename")] for row in rows} == {"no-warcinfo.warc.gz"}

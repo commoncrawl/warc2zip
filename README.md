@@ -266,9 +266,11 @@ The metadata record's `application/warc-fields` body is shallow-flattened: one r
 The wide mirror of `manifest.jsonl` — one row per response, one column per key:
 
 ```csv
-"filename","warc_record_id","warc_target_uri","warc_date","http_status_code","detected_mime_type","content_type_header","payload_size"
-"1000000.html","<urn:uuid:12345678-abcd-...>","https://example.com/page","2025-12-15T00:58:13Z","200","text/html","text/html; charset=UTF-8","34521"
+"filename","warc_record_id","warc_target_uri","warc_date","http_status_code","detected_mime_type","content_type_header","payload_size","warc_filename","warc_record_offset","warc_record_length"
+"1000000.html","<urn:uuid:12345678-abcd-...>","https://example.com/page","2025-12-15T00:58:13Z","200","text/html","text/html; charset=UTF-8","34521","CC-MAIN-20251215005813-20251215035813-00995.warc.gz","1062","3585"
 ```
+
+The last three columns are the same triple a CDX index carries. Every row repeats the WARC filename on purpose: one CSV is then self-contained, and a row can be re-fetched without the zip it came from. See [Building and downloading a subset](#building-and-downloading-a-subset).
 
 ### warcinfo.csv
 
@@ -276,6 +278,9 @@ Crawl-level provenance, with the record body flattened the same way as `metadata
 
 ```csv
 "filename","header_name","header_value"
+"warcinfo","_source_uri","https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-25/segments/.../CC-MAIN-...warc.gz"
+"warcinfo","warc_record_offset","0"
+"warcinfo","warc_record_length","519"
 "warcinfo","warc_type","warcinfo"
 "warcinfo","warc_filename","CC-MAIN-20260618163205-20260618193205-00999.warc.gz"
 "warcinfo","_body.ispartof","CC-MAIN-2026-25"
@@ -285,6 +290,39 @@ Crawl-level provenance, with the record body flattened the same way as `metadata
 ```
 
 `warcinfo.warc` and `warcinfo.warc-fields` hold the same record as raw wire bytes.
+
+`_source_uri` is the input this zip was converted from — what the WARC-Filename header says the file is *called*, versus where it was actually *read from*. It is written even when the WARC carries no warcinfo record at all, so the provenance is never lost.
+
+`warc_record_offset` and `warc_record_length` are not headers off the wire; they are computed while streaming, and appear for every record type — in `manifest.csv` for responses, and as rows in `response_warc_headers.csv`, `request_warc_headers.csv`, `metadata.csv` and `warcinfo.csv`.
+
+## Building and downloading a subset
+
+The point of `warc_filename` + `warc_record_offset` + `warc_record_length` is that `manifest.csv` alone is enough to fetch any capture again. Each record is its own gzip member, so those bytes are a standalone WARC — one HTTP range request per record, no reprocessing of the source file.
+
+The intended workflow is: convert once with `--metadata-only` (a few tens of KB instead of gigabytes), filter the CSV however you like, then pull only the captures you kept.
+
+```bash
+# 1. metadata only — no payloads
+warc2zip 'https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz' --metadata-only --output meta.zip
+
+# 2. filter manifest.csv with whatever you already use — here, Chinese-language 200s
+unzip -p meta.zip '*/manifest.csv' > manifest.csv
+unzip -p meta.zip '*/metadata.csv' | grep '"_body.languages_cld2","{""reliable"":true' > langs.csv
+
+# 3. fetch each surviving row with a range request
+unzip -p meta.zip '*/warcinfo.csv' | grep '"_source_uri"'   # where to fetch from
+
+while IFS=, read -r offset length; do
+  curl -sL -r "$offset-$((offset + length - 1))" "$SOURCE_URL" >> subset.warc.gz
+done < offsets.csv
+```
+
+Concatenated gzip members are themselves a valid `.warc.gz`, so appending the fetched ranges into one file produces a WARC you can feed straight back into `warc2zip` — or into any other WARC tool.
+
+Two caveats:
+
+- `warc_filename` is what the WARC calls itself, which for Common Crawl is a bare basename, not a full path. The resolvable location is in `warcinfo.csv` as `_source_uri`, or from the CC index if you started elsewhere.
+- Offsets are positions in the **source** WARC. They stay valid under `--limit`, since limiting only stops the read early; it never rewrites offsets.
 
 ## WARC examples for testing
 

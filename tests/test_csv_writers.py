@@ -14,6 +14,7 @@ from warc2zip import (
     MANIFEST_COLUMNS,
     flatten_body_rows,
     parse_warc_fields,
+    record_location_pairs,
     request_line_pairs,
     sanitize_csv_value,
     write_denormalized_csv,
@@ -245,6 +246,9 @@ def test_manifest_csv_round_trips_a_comma_and_quote_heavy_uri():
         "detected_mime_type": "text/html",
         "content_type_header": "text/html; charset=UTF-8",
         "payload_size": 299529,
+        "warc_filename": "CC-MAIN-20260618163205-20260618193205-00999.warc.gz",
+        "warc_record_offset": 1048576,
+        "warc_record_length": 9636,
     }
 
     content, skipped = write_manifest_csv([entry])
@@ -270,3 +274,23 @@ def test_manifest_csv_tolerates_a_missing_key():
 
     assert skipped == 0
     assert parse(content)[1] == ["1000000.html"] + [""] * (len(MANIFEST_COLUMNS) - 1)
+
+
+# --- record location ---------------------------------------------------------------------
+
+
+def test_record_location_pairs_stringifies_both_numbers():
+    assert record_location_pairs(1048576, 9636) == [
+        ("warc_record_offset", "1048576"),
+        ("warc_record_length", "9636"),
+    ]
+
+
+def test_record_location_pairs_are_emitted_for_offset_zero():
+    """The first record in a WARC sits at offset 0 — a falsy value that must not be dropped."""
+    assert record_location_pairs(0, 487) == [("warc_record_offset", "0"), ("warc_record_length", "487")]
+
+
+@pytest.mark.parametrize("offset, length", [(None, 9636), (1048576, None), (None, None)])
+def test_record_location_pairs_omitted_when_unknown(offset, length):
+    assert record_location_pairs(offset, length) == []
