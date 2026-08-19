@@ -345,10 +345,11 @@ def test_manifest_names_the_source_warc(warc_path, tmp_path):
         rows = read_rows(zf, "manifest.csv")
         warcinfo = read_rows(zf, "warcinfo.csv")
 
-    column = MANIFEST_COLUMNS.index("warc_filename")
-    assert {row[column] for row in rows} == {"test.warc.gz"}
-    # ...and warcinfo.csv records where the file was actually read from
-    assert ["warcinfo", "_source_uri", str(warc_path)] in warcinfo
+    assert {row[MANIFEST_COLUMNS.index("warc_filename")] for row in rows} == {"test.warc.gz"}
+    # every row also carries where the file was actually read from, so no join is needed
+    assert {row[MANIFEST_COLUMNS.index("source_uri")] for row in rows} == {str(warc_path)}
+    # ...and warcinfo.csv records it once at crawl level
+    assert ["warcinfo", "source_uri", str(warc_path)] in warcinfo
 
 
 def test_every_record_type_carries_its_location(warc_path, tmp_path):
@@ -384,6 +385,6 @@ def test_source_uri_is_recorded_even_without_a_warcinfo_record(tmp_path):
         warcinfo = read_rows(zf, "warcinfo.csv")
         rows = read_rows(zf, "manifest.csv")
 
-    assert ["warcinfo", "_source_uri", str(path)] in warcinfo
+    assert ["warcinfo", "source_uri", str(path)] in warcinfo
     # WARC-Filename is unavailable, so the input's own basename stands in
     assert {row[MANIFEST_COLUMNS.index("warc_filename")] for row in rows} == {"no-warcinfo.warc.gz"}

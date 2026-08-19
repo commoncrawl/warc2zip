@@ -247,6 +247,7 @@ def test_manifest_csv_round_trips_a_comma_and_quote_heavy_uri():
         "content_type_header": "text/html; charset=UTF-8",
         "payload_size": 299529,
         "warc_filename": "CC-MAIN-20260618163205-20260618193205-00999.warc.gz",
+        "source_uri": "https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-25/segments/x/warc/y.warc.gz",
         "warc_record_offset": 1048576,
         "warc_record_length": 9636,
     }

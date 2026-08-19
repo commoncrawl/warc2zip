@@ -223,8 +223,10 @@ MANIFEST_COLUMNS = (
     "detected_mime_type",
     "content_type_header",
     "payload_size",
-    # Where this record came from: enough to re-fetch it without the original WARC in hand.
+    # Where this record came from: enough to re-fetch it from this row alone, with no join
+    # against warcinfo.csv and no knowledge of the zip it was extracted from.
     "warc_filename",
+    "source_uri",
     "warc_record_offset",
     "warc_record_length",
 )
@@ -271,11 +273,11 @@ def build_warcinfo_rows(warcinfos, source_uri=""):
         rows.extend((key, n, v) for n, v in flatten_body_rows(body_text))
         multi.append((key, pairs + [("_body", body_text)]))
     if source_uri:
-        rows.insert(0, ("warcinfo", "_source_uri", source_uri))
+        rows.insert(0, ("warcinfo", "source_uri", source_uri))
         if multi:
-            multi[0] = (multi[0][0], [("_source_uri", source_uri)] + multi[0][1])
+            multi[0] = (multi[0][0], [("source_uri", source_uri)] + multi[0][1])
         else:
-            multi.append(("warcinfo", [("_source_uri", source_uri)]))
+            multi.append(("warcinfo", [("source_uri", source_uri)]))
     return rows, multi
 
 
@@ -324,7 +326,7 @@ def extract_crawl_name(warc_filename):
     return name
 
 
-def build_group_metadata(group, warc_filename=""):
+def build_group_metadata(group, warc_filename="", source_uri=""):
     """Build CSV rows and JSONL entry for a RecordGroup whose payload is already in the zip."""
     payload_filename = group.payload_filename
 
@@ -389,6 +391,7 @@ def build_group_metadata(group, warc_filename=""):
         "content_type_header": group.content_type_header,
         "payload_size": group.payload_size,
         "warc_filename": warc_filename,
+        "source_uri": source_uri,
         "warc_record_offset": "" if group.response_offset is None else group.response_offset,
         "warc_record_length": "" if group.response_length is None else group.response_length,
     }
@@ -671,7 +674,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             if output_format == "sidecar":
                 write_sidecar_files(outer_zip, root_dir, group)
 
-            result = build_group_metadata(group, warc_filename)
+            result = build_group_metadata(group, warc_filename, input_file)
 
             response_warc_rows.extend(result["response_warc_rows"])
             response_warc_multi.append(result["response_warc_multi"])
