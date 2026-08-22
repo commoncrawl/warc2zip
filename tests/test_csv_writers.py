@@ -10,7 +10,17 @@ import io
 
 import pytest
 
-from warc2zip import sanitize_csv_value, write_denormalized_csv, write_multiline_csv
+from warc2zip import (
+    MANIFEST_COLUMNS,
+    flatten_body_rows,
+    parse_warc_fields,
+    record_location_pairs,
+    request_line_pairs,
+    sanitize_csv_value,
+    write_denormalized_csv,
+    write_manifest_csv,
+    write_multiline_csv,
+)
 
 # A real Cloudflare report_to value: quote-heavy JSON inside a header.
 REPORT_TO = '{"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4"}]}'
@@ -135,3 +145,153 @@ def test_bad_row_is_skipped_and_counted(capsys):
     assert len(parse(content)) == 3  # header row + the two good rows
     err = capsys.readouterr().err
     assert "bad_header" in err and "1000001.html" in err
+
+
+# --- warc-fields parsing -----------------------------------------------------------------
+
+# The shape CC actually writes into a metadata record.
+CLD2 = '{"reliable":true,"languages":[{"code":"zh","text-covered":0.87,"name":"Chinese"}]}'
+
+
+def test_warc_fields_parses_crlf_and_lf_alike():
+    assert parse_warc_fields("a: 1\r\nb: 2\r\n") == [("a", "1"), ("b", "2")]
+    assert parse_warc_fields("a: 1\nb: 2\n") == [("a", "1"), ("b", "2")]
+
+
+def test_warc_fields_skips_blank_lines():
+    assert parse_warc_fields("a: 1\n\n\nb: 2\n") == [("a", "1"), ("b", "2")]
+
+
+def test_warc_fields_splits_on_the_first_colon_only():
+    """CC's http-header-user-agent carries colons inside its value."""
+    body = "http-header-user-agent: Mozilla/5.0 (X11; Linux) time: 12:30\r\n"
+    assert parse_warc_fields(body) == [("http-header-user-agent", "Mozilla/5.0 (X11; Linux) time: 12:30")]
+
+
+def test_warc_fields_joins_obs_fold_continuations():
+    assert parse_warc_fields("a: one\r\n  two\r\n\tthree\r\n") == [("a", "one two three")]
+
+
+def test_warc_fields_keeps_duplicate_names():
+    assert parse_warc_fields("a: 1\na: 2\n") == [("a", "1"), ("a", "2")]
+
+
+def test_warc_fields_keeps_json_values_opaque():
+    assert parse_warc_fields(f"languages-cld2: {CLD2}\n") == [("languages-cld2", CLD2)]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "",
+        "   \n\n",
+        "not a field list at all",
+        '{"just": "json"}',
+        "  leading continuation with no field before it\n",
+        ": no name\n",
+    ],
+)
+def test_warc_fields_refuses_bodies_that_are_not_field_lists(body):
+    assert parse_warc_fields(body) is None
+
+
+# --- shallow flattening ------------------------------------------------------------------
+
+
+def test_flatten_prefixes_lowercases_and_underscores():
+    rows = flatten_body_rows("fetchTimeMs: 185\r\ncharset-detected: UTF-8\r\n")
+    assert rows == [("_body.fetchtimems", "185"), ("_body.charset_detected", "UTF-8")]
+
+
+def test_flatten_leaves_nested_json_as_one_value():
+    assert flatten_body_rows(f"languages-cld2: {CLD2}\n") == [("_body.languages_cld2", CLD2)]
+
+
+def test_flatten_falls_back_to_one_raw_row_for_a_non_field_body():
+    assert flatten_body_rows("just some prose") == [("_body", "just some prose")]
+
+
+def test_flatten_honours_a_custom_prefix():
+    assert flatten_body_rows("software: nutch\n", prefix="_info") == [("_info.software", "nutch")]
+
+
+# --- request line ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("GET / HTTP/1.1", [("request_method", "GET"), ("request_target", "/")]),
+        ("POST /a/b?c=1 HTTP/1.1", [("request_method", "POST"), ("request_target", "/a/b?c=1")]),
+        # tolerated: the protocol-first shape earlier versions composed
+        ("HTTP/1.1 GET /", [("request_method", "GET"), ("request_target", "/")]),
+        ("", []),
+        ("GET", []),
+    ],
+)
+def test_request_line_pairs(line, expected):
+    assert request_line_pairs(line) == expected
+
+
+# --- wide manifest CSV -------------------------------------------------------------------
+
+
+def test_manifest_csv_round_trips_a_comma_and_quote_heavy_uri():
+    entry = {
+        "filename": "1000000.html",
+        "warc_record_id": "<urn:uuid:abc>",
+        "warc_target_uri": 'https://example.com/a,b?q="x"',
+        "warc_date": "2026-05-08T07:59:02Z",
+        "http_status_code": "200",
+        "detected_mime_type": "text/html",
+        "content_type_header": "text/html; charset=UTF-8",
+        "payload_size": 299529,
+        "warc_filename": "CC-MAIN-20260618163205-20260618193205-00999.warc.gz",
+        "source_uri": "https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-25/segments/x/warc/y.warc.gz",
+        "warc_record_offset": 1048576,
+        "warc_record_length": 9636,
+    }
+
+    content, skipped = write_manifest_csv([entry])
+    rows = parse(content)
+
+    assert skipped == 0
+    assert rows[0] == list(MANIFEST_COLUMNS)
+    assert rows[1] == [str(entry[column]) for column in MANIFEST_COLUMNS]
+
+
+def test_manifest_csv_sanitizes_control_characters():
+    entry = dict.fromkeys(MANIFEST_COLUMNS, "")
+    entry["content_type_header"] = "text/html\x00".replace("\\x00", "\x00")
+
+    content, _ = write_manifest_csv([entry])
+
+    assert "\x00" not in content
+    assert parse(content)[1][MANIFEST_COLUMNS.index("content_type_header")] == "text/html\\x00"
+
+
+def test_manifest_csv_tolerates_a_missing_key():
+    content, skipped = write_manifest_csv([{"filename": "1000000.html"}])
+
+    assert skipped == 0
+    assert parse(content)[1] == ["1000000.html"] + [""] * (len(MANIFEST_COLUMNS) - 1)
+
+
+# --- record location ---------------------------------------------------------------------
+
+
+def test_record_location_pairs_stringifies_both_numbers():
+    assert record_location_pairs(1048576, 9636) == [
+        ("warc_record_offset", "1048576"),
+        ("warc_record_length", "9636"),
+    ]
+
+
+def test_record_location_pairs_are_emitted_for_offset_zero():
+    """The first record in a WARC sits at offset 0 — a falsy value that must not be dropped."""
+    assert record_location_pairs(0, 487) == [("warc_record_offset", "0"), ("warc_record_length", "487")]
+
+
+@pytest.mark.parametrize("offset, length", [(None, 9636), (1048576, None), (None, None)])
+def test_record_location_pairs_omitted_when_unknown(offset, length):
+    assert record_location_pairs(offset, length) == []
