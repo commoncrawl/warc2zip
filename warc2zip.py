@@ -17,12 +17,13 @@ from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
 from warcio.utils import fsspec_open
 
-
 MIME_EXTENSION_OVERRIDES = {
     "text/html": ".html",
     "text/plain": ".txt",
     "image/jpeg": ".jpg",
 }
+
+DRY_RUN_MAX = 10  # hard cap on capture records scanned by --dry-run
 
 
 @dataclass
@@ -465,6 +466,14 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     file_size = get_file_size(input_file)
 
     if dry_run:
+        capped = limit is None or limit > DRY_RUN_MAX
+        if capped:
+            limit = DRY_RUN_MAX
+            print(
+                f"Warning: --dry-run scans at most {DRY_RUN_MAX} capture records.",
+                file=sys.stderr,
+            )
+
         response_count = 0
         request_count = 0
         metadata_count = 0
@@ -493,7 +502,16 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         metadata_count += 1
                     pbar.update(stream.tell() - pbar.n)
 
-        print(f"[dry-run] {response_count} responses, {request_count} requests, {metadata_count} metadata records")
+        if not limit_reached:
+            limit_note = ""
+        elif capped:
+            limit_note = f" (stopped at the --dry-run cap of {limit})"
+        else:
+            limit_note = f" (stopped at --limit {limit})"
+        print(
+            f"[dry-run] {response_count} responses, {request_count} requests, "
+            f"{metadata_count} metadata records{limit_note}"
+        )
         print(f"[dry-run] Sample URIs: {sample_uris}")
         print(f"[dry-run] Detected mime-types: {sorted(sample_mimes)}")
         return
@@ -742,8 +760,10 @@ def cli():
     parser = argparse.ArgumentParser(description="Convert a gzipped WARC file into a zip-of-zips archive.")
     parser.add_argument("input_file", help="Path to a .warc.gz file")
     parser.add_argument("--output", default=None, help="Output zip path (default: replace .warc.gz with .zip)")
+
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", help="Skip processing, just print summary")
+    mode.add_argument("--dry-run", action="store_true",
+                        help=f"Skip processing, just print summary. Scans at most {DRY_RUN_MAX} capture records.")
     mode.add_argument(
         "--metadata-only",
         action="store_true",
