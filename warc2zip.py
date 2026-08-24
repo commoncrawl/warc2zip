@@ -15,15 +15,60 @@ from urllib.parse import urlparse
 
 from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
+from warcio.recordloader import ARC2WARCHeadersParser
 from warcio.utils import fsspec_open
 
 MIME_EXTENSION_OVERRIDES = {
     "text/html": ".html",
     "text/plain": ".txt",
     "image/jpeg": ".jpg",
+    # ARC-era Heritrix wrote DNS lookups as their own records with this type. It has no
+    # registered extension, but the body is plain text, so don't let it fall through to ".unk".
+    "text/dns": ".txt",
 }
 
+# Pseudo-header carrying the content-type the ARC record itself declared. warcio's ARC->WARC
+# mapping overwrites that field with "application/http;msgtype=response" (see _ARC2WARCKeepMime),
+# and for the many ARC records with no HTTP layer at all — dns:, whois:, ntp: — it is the only
+# mime information the archive has. Present on ARC-derived records only; its presence is also
+# how the rest of this module recognises that the input was an ARC.
+ARC_CONTENT_TYPE_HEADER = "ARC-Content-Type"
+
 DRY_RUN_MAX = 10  # hard cap on capture records scanned by --dry-run
+
+
+class _ARC2WARCKeepMime(ARC2WARCHeadersParser):
+    """warcio's ARC->WARC header mapper, minus the content-type amnesia.
+
+    The stock parser rewrites parts[3] to "application/http;msgtype=response" so an ARC record
+    looks like a WARC application/http envelope. That is right for the envelope and wrong for the
+    archive: the ARC header line's fourth field is the only place a dns:/whois:/ntp: record — which
+    has no HTTP layer to fall back on — ever states what it contains. Re-attach it under
+    ARC_CONTENT_TYPE_HEADER so nothing is lost.
+    """
+
+    def _get_protocol_and_headers(self, headerline, parts):
+        # Read before super(), which mutates parts[3] in place for non-filedesc records.
+        arc_content_type = parts[3] if len(parts) > 3 else ""
+        protocol, headers = super()._get_protocol_and_headers(headerline, parts)
+        headers.append((ARC_CONTENT_TYPE_HEADER, arc_content_type))
+        return protocol, headers
+
+
+def open_archive_iterator(stream):
+    """ArchiveIterator that understands ARC as well as WARC.
+
+    arc2warc=True is what makes ARC input work at all: without it warcio exposes the raw ARC
+    5-tuple ("uri", "archive-date", ...) and every WARC-Target-URI / WARC-Date lookup in this
+    module quietly returns None. It also mints a WARC-Record-ID per record, which the grouping
+    dict needs as a key — ARC/1.1 predates record IDs, so every record would otherwise collide
+    under the single key None and only the last one would survive into the manifest.
+
+    The flag costs pure-WARC input nothing but warcio's per-record format-caching shortcut.
+    """
+    iterator = ArchiveIterator(stream, arc2warc=True)
+    iterator.loader.arc_parser = _ARC2WARCKeepMime()
+    return iterator
 
 
 @dataclass
@@ -36,6 +81,10 @@ class RecordGroup:
     response_target_uri: str = ""
     response_date: str = ""
     response_record_id: str = ""
+    # True when response_record_id was minted by warcio for an ARC record rather than read from
+    # the archive. Usable as a grouping key, but never written out: it is a fresh random UUID on
+    # every run, and a CSV consumer would reasonably read it as identifying the source record.
+    response_record_id_synthetic: bool = False
     http_status_code: str = ""
     content_type_header: str = ""
     response_order: int = -1
@@ -54,11 +103,58 @@ class RecordGroup:
     metadata_entries: list[tuple[list[tuple[str, str]], str, int | None, int | None]] = field(default_factory=list)
 
 
+def is_arc_record(record):
+    """True when this record came from an ARC, i.e. warcio synthesized its WARC-* header names."""
+    return record.rec_headers.get_header(ARC_CONTENT_TYPE_HEADER) is not None
+
+
+def archive_header_pairs(record):
+    """A record's headers, minus anything warcio invented that the archive never contained.
+
+    For ARC input every WARC-* name is warcio's rename of a real ARC field — except
+    WARC-Record-ID, which has no ARC counterpart at all and is a fresh random UUID on every run.
+    Emitting it would invite a CSV consumer to read a per-run value as an identity, and it would
+    break the --metadata-only invariant, which compares the metadata of two separate runs byte
+    for byte.
+    """
+    pairs = list(record.rec_headers.headers)
+    if not is_arc_record(record):
+        return pairs
+    return [(name, value) for name, value in pairs if name != "WARC-Record-ID"]
+
+
+def normalize_mime_type(value):
+    """Bare lowercase type from a Content-Type value, or "" if there isn't one."""
+    if not value:
+        return ""
+    return value.split(";")[0].strip().lower()
+
+
 def detect_mime_type(record):
+    """Best available content-type for a record's payload.
+
+    Two sources, in priority order:
+
+      1. The HTTP response's Content-Type — what the origin server claimed on the wire, and the
+         only source a WARC response record has.
+      2. ARC_CONTENT_TYPE_HEADER — field 4 of the ARC header line, what the crawler recorded.
+         ARC input only. Heritrix normally copies it from (1), so for HTTP captures the two
+         agree; it earns its keep on the records with no HTTP layer at all (dns:, whois:, ntp:),
+         where record.http_headers is None and (1) simply does not exist.
+
+    The fallback is deliberately strict — (2) applies only when (1) is absent, never to override
+    it. Letting the ARC type win over a suspicious "application/octet-stream" from a 2004 server
+    would produce nicer file extensions, but it would also make manifest.csv's detected_mime_type
+    disagree with its own content_type_header column, and that column is how a CSV-only consumer
+    checks the tool's work.
+    """
     if record.http_headers:
-        ct = record.http_headers.get_header("Content-Type")
-        if ct:
-            return ct.split(";")[0].strip().lower()
+        mime = normalize_mime_type(record.http_headers.get_header("Content-Type"))
+        if mime:
+            return mime
+    mime = normalize_mime_type(record.rec_headers.get_header(ARC_CONTENT_TYPE_HEADER))
+    if mime:
+        return mime
     return "application/octet-stream"
 
 
@@ -317,13 +413,13 @@ def build_root_dir_name(crawl_name, partial=False):
 def extract_crawl_name(warc_filename):
     """Extract a clean crawl name from a WARC-Filename header value.
 
-    Strips path and extensions like .warc.gz to get a usable directory name.
+    Strips path and extensions like .warc.gz to get a usable directory name. Longest suffix
+    first, so .warc.gz is not left holding a stray ".warc".
     """
     name = posixpath.basename(warc_filename)
-    if name.endswith(".warc.gz"):
-        name = name[: -len(".warc.gz")]
-    elif name.endswith(".warc"):
-        name = name[: -len(".warc")]
+    for ext in (".warc.gz", ".warc", ".arc.gz", ".arc"):
+        if name.endswith(ext):
+            return name[: -len(ext)]
     return name
 
 
@@ -384,7 +480,9 @@ def build_group_metadata(group, warc_filename="", source_uri=""):
     # JSONL manifest entry
     jsonl_entry = {
         "filename": payload_filename,
-        "warc_record_id": group.response_record_id,
+        # Blank rather than a per-run random UUID when the source was an ARC: the field does not
+        # exist in ARC/1.1. warc_record_offset/length still make the row re-fetchable on its own.
+        "warc_record_id": "" if group.response_record_id_synthetic else (group.response_record_id or ""),
         "warc_target_uri": group.response_target_uri,
         "warc_date": group.response_date,
         "http_status_code": group.http_status_code,
@@ -483,7 +581,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
 
         with fsspec_open(input_file, "rb") as stream:
             with tqdm(total=file_size, unit="B", unit_scale=True, desc="Scanning") as pbar:
-                for record in ArchiveIterator(stream):
+                for record in open_archive_iterator(stream):
                     if limit_reached and record.rec_type == "response":
                         break
                     record.content_stream().read()
@@ -540,7 +638,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
             # Held by name rather than iterated anonymously: get_record_offset() /
             # get_record_length() hang off the iterator, not the record.
-            record_iter = ArchiveIterator(stream)
+            record_iter = open_archive_iterator(stream)
             for record in record_iter:
                 rec_type = record.rec_type
 
@@ -551,7 +649,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     body_text = record.content_stream().read().decode("utf-8", errors="replace")
                     warcinfos.append(
                         (
-                            list(record.rec_headers.headers),
+                            archive_header_pairs(record),
                             body_text,
                             record_iter.get_record_offset(),
                             record_iter.get_record_length(),
@@ -571,6 +669,9 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                 if rec_type == "response":
                     record_id = record.rec_headers.get_header("WARC-Record-ID")
                     target_uri = record.rec_headers.get_header("WARC-Target-URI")
+                    # ARC has no record IDs; warcio mints one per record so the grouping dict
+                    # below still gets a unique key. Flagged so it never reaches a CSV.
+                    is_arc = is_arc_record(record)
 
                     group = groups.setdefault(record_id, RecordGroup())
                     group.concurrent_to = record.rec_headers.get_header("WARC-Concurrent-To") or ""
@@ -593,9 +694,10 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     group.payload_filename = payload_filename
                     group.payload_size = len(payload)
                     group.response_record_id = record_id
+                    group.response_record_id_synthetic = is_arc
                     group.response_target_uri = target_uri or ""
                     group.response_date = record.rec_headers.get_header("WARC-Date") or ""
-                    group.response_warc_headers = list(record.rec_headers.headers)
+                    group.response_warc_headers = archive_header_pairs(record)
                     if record.http_headers:
                         group.response_http_headers = list(record.http_headers.headers)
                         group.content_type_header = record.http_headers.get_header("Content-Type") or ""
@@ -615,7 +717,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     body = record.content_stream().read()
                     request_record_id = record.rec_headers.get_header("WARC-Record-ID")
                     req_entry = {
-                        "warc_headers": list(record.rec_headers.headers),
+                        "warc_headers": archive_header_pairs(record),
                         "http_headers": list(record.http_headers.headers) if record.http_headers else [],
                         # warcio's parser splits a request line as protocol="GET",
                         # statusline="/path HTTP/1.1" — recompose it to get "GET /path HTTP/1.1".
@@ -637,7 +739,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     body_text = body.decode("utf-8", errors="replace")
                     group.metadata_entries.append(
                         (
-                            list(record.rec_headers.headers),
+                            archive_header_pairs(record),
                             body_text,
                             record_iter.get_record_offset(),
                             record_iter.get_record_length(),
