@@ -97,11 +97,28 @@ CAPTURES = [
     ),
     (
         # Heritrix wrote a literal "no-type" when it could not tell. Faithfully reported, not
-        # laundered into application/octet-stream.
-        ("http://usitc.gov/blob", "192.0.2.7", "20041014205823", "no-type"),
-        b"\x00\x01\x02binary-with-no-http-layer",
+        # laundered into application/octet-stream, and deliberately absent from
+        # MIME_EXTENSION_OVERRIDES so it lands as .unk rather than a type we cannot justify.
+        # whois: (like dns:) genuinely has no HTTP layer — warcio only skips the HTTP parse for
+        # non-http(s) schemes, so an http:// URI would take the other branch, however odd its body.
+        ("whois:usitc.gov", "192.0.2.7", "20041014205823", "no-type"),
+        b"Domain Name: USITC.GOV\nStatus: ACTIVE\n",
         "no-type",
         ".unk",
+    ),
+    (
+        # An HTTP layer that declares nothing. The ARC header line says text/html, but the HTTP
+        # transaction is what was captured and it named no type, so "unknown" is the honest
+        # answer — see test_arc_type_does_not_override_a_present_http_layer. Real 302s in the
+        # EOT-2004 file look exactly like this (29 of them).
+        ("http://dod.gov/robots.txt", "192.0.2.9", "20041014205824", "text/html"),
+        http_response(
+            "HTTP/1.1 302 Found",
+            [("Server", "Netscape-Enterprise/4.1"), ("Location", "http://www.dod.gov/robots.txt")],
+            b"",
+        ),
+        "application/octet-stream",
+        ".bin",
     ),
 ]
 
@@ -260,10 +277,37 @@ def test_captures_with_no_http_layer_still_reach_both_response_http_views(arc_pa
     assert ("status_code", "200") in {(r[1], r[2]) for r in denorm if r[0] == http}
 
 
+def test_arc_type_does_not_override_a_present_http_layer(arc_path, tmp_path):
+    """The ARC header line is a fallback for records with no HTTP layer, not a second opinion.
+
+    The dod.gov capture has real HTTP headers but no Content-Type, while its ARC header line
+    declares text/html. Promoting that would put a value in detected_mime_type that the row's own
+    content_type_header cannot corroborate. 35 records in the EOT-2004 file are shaped this way.
+    """
+    zf = convert(arc_path, tmp_path)
+    row = next(r for r in manifest(zf) if r["warc_target_uri"] == "http://dod.gov/robots.txt")
+
+    # Guard against a vacuous pass: this must be the has-an-HTTP-layer branch, not the None one.
+    http_rows = [r for r in read_csv(zf, "response_http_headers.csv")[1:] if r[0] == row["filename"]]
+    assert ("status_code", "302") in {(r[1], r[2]) for r in http_rows}
+
+    assert row["content_type_header"] == ""
+    assert row["detected_mime_type"] == "application/octet-stream"
+    assert row["filename"].endswith(".bin")
+
+    # ...and the ARC declaration is still in the output, just not promoted into the manifest
+    warc_rows = {(r[1], r[2]) for r in read_csv(zf, "response_warc_headers.csv")[1:]
+                 if r[0] == row["filename"]}
+    assert ("arc_content_type", "text/html") in warc_rows
+
+
 def test_sidecar_format_groups_arc_captures_by_host(arc_path, tmp_path):
     zf = convert(arc_path, tmp_path, output_format="sidecar")
     dirs = {n.split("/")[1] for n in zf.namelist() if n.count("/") > 1}
-    assert {"sba.gov", "energystar.gov", "usitc.gov"} <= dirs
+    assert {"sba.gov", "energystar.gov", "dod.gov"} <= dirs
+    # Known gap: urlparse() gives netloc "" for an opaque scheme, so dns:/whois: captures bucket
+    # under unknown/ even though the host is sitting in .path.
+    assert "unknown" in dirs
 
 
 @pytest.mark.parametrize("output_format", ["flat", "sidecar"])

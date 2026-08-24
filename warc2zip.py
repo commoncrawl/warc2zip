@@ -133,29 +133,29 @@ def normalize_mime_type(value):
 def detect_mime_type(record):
     """Best available content-type for a record's payload.
 
-    Two sources, in priority order:
+    Two sources, and which one applies is decided by whether the record has an HTTP layer at all,
+    never by whether that layer happened to declare a type:
 
-      1. The HTTP response's Content-Type — what the origin server claimed on the wire, and the
-         only source a WARC response record has.
-      2. ARC_CONTENT_TYPE_HEADER — field 4 of the ARC header line, what the crawler recorded.
-         ARC input only. Heritrix normally copies it from (1), so for HTTP captures the two
-         agree; it earns its keep on the records with no HTTP layer at all (dns:, whois:, ntp:),
-         where record.http_headers is None and (1) simply does not exist.
+      1. `record.http_headers` is not None — an HTTP transaction was captured. Its Content-Type is
+         authoritative, **including when it is missing**: a capture whose server sent no
+         Content-Type genuinely has no declared type, and saying so is the honest answer.
+      2. `record.http_headers` is None — there was no HTTP transaction to parse, so field 4 of the
+         ARC header line (ARC_CONTENT_TYPE_HEADER) is the only place the archive ever states what
+         the payload contains. ARC's dns:/whois:/ntp: records are the case that matters; warcio
+         also reports None for a zero-length record or a non-http(s) scheme, which are the same
+         situation.
 
-    The fallback is deliberately strict — (2) applies only when (1) is absent, never to override
-    it. Letting the ARC type win over a suspicious "application/octet-stream" from a 2004 server
-    would produce nicer file extensions, but it would also make manifest.csv's detected_mime_type
-    disagree with its own content_type_header column, and that column is how a CSV-only consumer
-    checks the tool's work.
+    The split is deliberately at `is None` rather than at "no Content-Type value". Letting the ARC
+    type fill in for an HTTP layer that declared nothing would put a value in manifest.csv's
+    detected_mime_type that its own content_type_header column cannot corroborate — and that column
+    is how a CSV-only consumer checks the tool's work. Nothing is lost by the strict rule: the ARC
+    declaration still reaches the output as an `arc_content_type` row in response_warc_headers.csv
+    for every ARC record (see archive_header_pairs()), it is just not promoted into a column that
+    cannot be cross-checked.
     """
-    if record.http_headers:
-        mime = normalize_mime_type(record.http_headers.get_header("Content-Type"))
-        if mime:
-            return mime
-    mime = normalize_mime_type(record.rec_headers.get_header(ARC_CONTENT_TYPE_HEADER))
-    if mime:
-        return mime
-    return "application/octet-stream"
+    if record.http_headers is None:
+        return normalize_mime_type(record.rec_headers.get_header(ARC_CONTENT_TYPE_HEADER)) or "application/octet-stream"
+    return normalize_mime_type(record.http_headers.get_header("Content-Type")) or "application/octet-stream"
 
 
 def mime_to_extension(mime_type):
