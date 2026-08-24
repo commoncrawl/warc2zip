@@ -874,8 +874,11 @@ def cli():
     parser.add_argument("--output", default=None, help="Output zip path (default: replace .warc.gz with .zip)")
 
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true",
-                        help=f"Skip processing, just print summary. Scans at most {DRY_RUN_MAX} capture records.")
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=f"Skip processing, just print summary. Scans at most {DRY_RUN_MAX} capture records.",
+    )
     mode.add_argument(
         "--metadata-only",
         action="store_true",

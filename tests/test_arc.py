@@ -200,9 +200,10 @@ def test_synthesized_record_ids_never_reach_the_output(arc_path, tmp_path):
     zf = convert(arc_path, tmp_path)
     assert {r["warc_record_id"] for r in manifest(zf)} == {""}
 
-    entries = [json.loads(line) for line in zf.read(
-        next(n for n in zf.namelist() if n.endswith("manifest.jsonl"))
-    ).decode().splitlines()]
+    entries = [
+        json.loads(line)
+        for line in zf.read(next(n for n in zf.namelist() if n.endswith("manifest.jsonl"))).decode().splitlines()
+    ]
     assert {e["warc_record_id"] for e in entries} == {""}
 
     header_names = {r[1] for r in read_csv(zf, "response_warc_headers.csv")[1:]}
@@ -213,9 +214,7 @@ def test_synthesized_record_ids_never_reach_the_output(arc_path, tmp_path):
     # The filedesc record gets a minted id too, and that one also lands in a file compared
     # byte-for-byte across runs by test_metadata_only_matches_a_full_arc_run.
     assert "warc_record_id" not in {r[1] for r in read_csv(zf, "warcinfo.csv")[1:]}
-    assert b"WARC-Record-ID" not in zf.read(
-        next(n for n in zf.namelist() if n.endswith("warcinfo.warc"))
-    )
+    assert b"WARC-Record-ID" not in zf.read(next(n for n in zf.namelist() if n.endswith("warcinfo.warc")))
 
 
 def test_filedesc_record_becomes_the_warcinfo(arc_path, tmp_path):
@@ -241,7 +240,7 @@ def test_manifest_offsets_locate_the_record_inside_the_arc(arc_path, tmp_path):
     raw = arc_path.read_bytes()
 
     for row in manifest(zf):
-        chunk = raw[int(row["warc_record_offset"]):][: int(row["warc_record_length"])]
+        chunk = raw[int(row["warc_record_offset"]) :][: int(row["warc_record_length"])]
         seen = 0
         # Read the payload inside the loop: advancing the iterator drains the previous record's
         # stream, so collecting records first would hand back exhausted streams.
@@ -296,8 +295,7 @@ def test_arc_type_does_not_override_a_present_http_layer(arc_path, tmp_path):
     assert row["filename"].endswith(".bin")
 
     # ...and the ARC declaration is still in the output, just not promoted into the manifest
-    warc_rows = {(r[1], r[2]) for r in read_csv(zf, "response_warc_headers.csv")[1:]
-                 if r[0] == row["filename"]}
+    warc_rows = {(r[1], r[2]) for r in read_csv(zf, "response_warc_headers.csv")[1:] if r[0] == row["filename"]}
     assert ("arc_content_type", "text/html") in warc_rows
 
 
