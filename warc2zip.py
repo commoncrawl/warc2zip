@@ -23,8 +23,20 @@ MIME_EXTENSION_OVERRIDES = {
     "text/plain": ".txt",
     "image/jpeg": ".jpg",
     # ARC-era Heritrix wrote DNS lookups as their own records with this type. It has no
-    # registered extension, but the body is plain text, so don't let it fall through to ".unk".
-    "text/dns": ".txt",
+    # registered extension, and ".txt" would say less than the archive knows, so name it after
+    # the type rather than after the fact that the body happens to be readable.
+    "text/dns": ".dns",
+}
+
+# Payload kinds settled by the URL rather than by the Content-Type. Servers hand robots.txt out as
+# text/plain, text/html, application/octet-stream and worse, and none of those say "this is an
+# exclusion file" — the path does. Keyed on urlparse().path exactly: RFC 9309 puts the exclusion
+# file at the site root and nowhere else, so "/help/robots.txt" is an ordinary page.
+#
+# Add other well-known *root* paths here as they come up (e.g. "/sitemap.xml"). Kinds that live at
+# arbitrary URLs cannot be caught this way at all — see choose_extension().
+PATH_EXTENSION_OVERRIDES = {
+    "/robots.txt": ".robots",
 }
 
 # Pseudo-header carrying the content-type the ARC record itself declared. warcio's ARC->WARC
@@ -162,6 +174,43 @@ def mime_to_extension(mime_type):
     if mime_type in MIME_EXTENSION_OVERRIDES:
         return MIME_EXTENSION_OVERRIDES[mime_type]
     return mimetypes.guess_extension(mime_type) or ".unk"
+
+
+def path_extension_override(target_uri):
+    """Extension implied by a capture's URL alone, or None.
+
+    Guards on netloc so an opaque scheme is never read as a path: urlparse("dns:ntsb.gov") puts
+    the host in .path and leaves .netloc empty, and ARC input is full of those. A query string is
+    tolerated ("/robots.txt?v=2" is the same resource, .query holds the rest); case is not, since
+    the path is case-sensitive and a server is under no obligation to serve "/Robots.txt".
+    """
+    if not target_uri:
+        return None
+    parsed = urlparse(target_uri)
+    if not parsed.netloc:
+        return None
+    return PATH_EXTENSION_OVERRIDES.get(parsed.path)
+
+
+def choose_extension(mime_type, target_uri):
+    """File extension for a payload: the URL where it knows better, else the declared type.
+
+    The URL rule is deliberately unconditional — status and body length do not gate it. The
+    extension records what was *requested*; whether the server actually served it is what
+    http_status_code and payload_size are for in manifest.csv, and a consumer that cares must
+    filter there anyway. In the EOT-2004 file that means 336 of 533 ".robots" files are in fact
+    404 error pages, and the 5 zero-byte 200s — an empty robots.txt is a real allow-all answer,
+    not a missing one — keep the extension they deserve.
+
+    This mechanism only reaches kinds that live at a fixed, well-known path. Feeds do not: they
+    sit at arbitrary URLs and are announced by <link rel="alternate">, so the thing that
+    identifies them is their registered type (application/rss+xml, application/atom+xml) and
+    they belong in MIME_EXTENSION_OVERRIDES instead. Sitemaps are half and half — "/sitemap.xml"
+    is conventional enough for the table above, but the ones announced by a robots.txt "Sitemap:"
+    line can be anywhere, and catching those would need the XML root element (<urlset> /
+    <sitemapindex>), i.e. reading the payload rather than the headers.
+    """
+    return path_extension_override(target_uri) or mime_to_extension(mime_type)
 
 
 # Every C0 control except TAB, plus DEL. TAB is harmless inside a quoted field and occurs
@@ -687,7 +736,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     group.concurrent_to = record.rec_headers.get_header("WARC-Concurrent-To") or ""
                     payload = record.content_stream().read()
                     group.response_mime_type = detect_mime_type(record)
-                    ext = mime_to_extension(group.response_mime_type)
+                    ext = choose_extension(group.response_mime_type, target_uri or "")
                     payload_filename = f"{counter}{ext}"
 
                     # Extract domain for sidecar format directory grouping

@@ -24,7 +24,7 @@ import zipfile
 
 import pytest
 
-from warc2zip import extract_crawl_name, main, open_archive_iterator
+from warc2zip import extract_crawl_name, main, open_archive_iterator, path_extension_override
 
 ARC_NAME = "TEST-EOT-2004-20041014205819-00000.arc"
 
@@ -67,13 +67,13 @@ CAPTURES = [
         ("dns:ntsb.gov", "207.241.224.11", "20041014205819", "text/dns"),
         b"20041014205819\nntsb.gov.\t\t600\tIN\tA\t199.173.155.8\n",
         "text/dns",
-        ".txt",
+        ".dns",
     ),
     (
         ("dns:4women.gov", "207.241.224.11", "20041014205818", "text/dns"),
         b"20041014205818\n4women.gov.\t\t86400\tIN\tA\t12.20.225.1\n",
         "text/dns",
-        ".txt",
+        ".dns",
     ),
     (
         ("http://sba.gov/robots.txt", "199.171.55.3", "20041014205821", "text/plain"),
@@ -83,7 +83,7 @@ CAPTURES = [
             b"User-agent: *\nDisallow: /cgi-bin/\n",
         ),
         "text/plain",
-        ".txt",
+        ".robots",
     ),
     (
         ("http://energystar.gov/index.html", "208.254.22.7", "20041014205821", "text/html"),
@@ -118,7 +118,10 @@ CAPTURES = [
             b"",
         ),
         "application/octet-stream",
-        ".bin",
+        # .robots, not the .bin its mime implies: PATH_EXTENSION_OVERRIDES is unconditional, so a
+        # redirect at /robots.txt is named for what was requested. detected_mime_type below is
+        # where the "declared nothing" fact survives.
+        ".robots",
     ),
 ]
 
@@ -191,6 +194,53 @@ def test_declared_type_survives_for_records_with_no_http_layer(arc_path, tmp_pat
     # ...and it is greppable in its own right, not just implied by the extension
     warc_rows = read_csv(zf, "response_warc_headers.csv")[1:]
     assert ("arc_content_type", "text/dns") in {(r[1], r[2]) for r in warc_rows}
+
+
+def test_robots_txt_is_named_from_the_url_whatever_the_server_said(arc_path, tmp_path):
+    """The one payload kind the URL settles and the Content-Type does not.
+
+    sba.gov served its exclusion file as text/plain, which is the polite case; the same file
+    arrives as text/html, as no type at all, or as a redirect, and ".txt"/".html"/".bin" then say
+    nothing a consumer can filter on. The path says it exactly — so the rule keys on the path and
+    ignores both the type and the status.
+
+    Both fixture captures at /robots.txt are asserted together on purpose: they are the two ends
+    of that rule (a 200 with a body, and a 302 with none), and a version of this that only held
+    for the well-behaved one would be the mime rule wearing a hat.
+    """
+    zf = convert(arc_path, tmp_path)
+    rows = {r["warc_target_uri"]: r for r in manifest(zf)}
+
+    served = rows["http://sba.gov/robots.txt"]
+    assert served["filename"].endswith(".robots"), served["filename"]
+    # The extension changed; the recorded type did not. detected_mime_type still reports what the
+    # server declared, so the rename adds a claim about the URL without erasing one about the body.
+    assert served["detected_mime_type"] == "text/plain"
+
+    redirected = rows["http://dod.gov/robots.txt"]
+    assert redirected["filename"].endswith(".robots"), redirected["filename"]
+    assert redirected["http_status_code"] == "302"
+    assert redirected["detected_mime_type"] == "application/octet-stream"
+
+
+def test_url_naming_does_not_reach_past_the_site_root(arc_path, tmp_path):
+    """The path match is exact, not a suffix.
+
+    "/help/robots.txt" is an ordinary page that happens to be named robots.txt, and an opaque
+    scheme (dns:) has no path at all — urlparse puts the host in .path — so neither may be
+    mistaken for an exclusion file. The dns: records in the fixture cover the second case.
+    """
+    assert path_extension_override("http://sba.gov/robots.txt") == ".robots"
+    assert path_extension_override("http://sba.gov/robots.txt?v=2") == ".robots"
+    assert path_extension_override("http://sba.gov:8080/robots.txt") == ".robots"
+    assert path_extension_override("http://sba.gov/help/robots.txt") is None
+    assert path_extension_override("http://sba.gov/Robots.txt") is None
+    assert path_extension_override("dns:ntsb.gov") is None
+    assert path_extension_override("") is None
+
+    zf = convert(arc_path, tmp_path)
+    dns = [r["filename"] for r in manifest(zf) if r["warc_target_uri"].startswith("dns:")]
+    assert dns and all(n.endswith(".dns") for n in dns), dns
 
 
 def test_synthesized_record_ids_never_reach_the_output(arc_path, tmp_path):
@@ -293,7 +343,9 @@ def test_arc_type_does_not_override_a_present_http_layer(arc_path, tmp_path):
 
     assert row["content_type_header"] == ""
     assert row["detected_mime_type"] == "application/octet-stream"
-    assert row["filename"].endswith(".bin")
+    # The extension cannot corroborate it here — this URL is claimed by PATH_EXTENSION_OVERRIDES —
+    # which is exactly why detected_mime_type is the assertion that carries this test.
+    assert row["filename"].endswith(".robots")
 
     # ...and the ARC declaration is still in the output, just not promoted into the manifest
     warc_rows = {(r[1], r[2]) for r in read_csv(zf, "response_warc_headers.csv")[1:]
