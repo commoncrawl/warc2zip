@@ -237,6 +237,29 @@ def test_manifest_offsets_locate_the_record_inside_the_arc(arc_path, tmp_path):
         assert payload == zf.read(next(n for n in zf.namelist() if n.endswith("/" + row["filename"])))
 
 
+def test_captures_with_no_http_layer_still_reach_both_response_http_views(arc_path, tmp_path):
+    """dns: records are complete ARC captures that never had an HTTP transaction. Both
+    response_http views must still list them, so a consumer that filters manifest.csv and joins
+    on `filename` sees "no headers" rather than a missing file."""
+    zf = convert(arc_path, tmp_path)
+    payloads = [r["filename"] for r in manifest(zf)]
+
+    denorm = read_csv(zf, "response_http_headers.csv")[1:]
+    multi = read_csv(zf, "response_http_headers_multi.csv")[1:]
+    assert {r[0] for r in denorm} == set(payloads)
+    assert {r[0] for r in multi} == set(payloads)
+
+    # The two dns: captures carry a blank row on each side; the HTTP ones carry real headers.
+    dns = [r["filename"] for r in manifest(zf) if r["warc_target_uri"].startswith("dns:")]
+    assert len(dns) == 2
+    for name in dns:
+        assert [r for r in denorm if r[0] == name] == [[name, "", ""]]
+        assert [r for r in multi if r[0] == name] == [[name, ""]]
+
+    http = next(r["filename"] for r in manifest(zf) if r["warc_target_uri"].startswith("http"))
+    assert ("status_code", "200") in {(r[1], r[2]) for r in denorm if r[0] == http}
+
+
 def test_sidecar_format_groups_arc_captures_by_host(arc_path, tmp_path):
     zf = convert(arc_path, tmp_path, output_format="sidecar")
     dirs = {n.split("/")[1] for n in zf.namelist() if n.count("/") > 1}

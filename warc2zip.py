@@ -438,7 +438,17 @@ def build_group_metadata(group, warc_filename="", source_uri=""):
     # protocol is already in response_warc_headers.csv as warc_protocol rows.
     status_pairs = [("status_code", group.http_status_code)] if group.http_status_code else []
     response_http_pairs = status_pairs + group.response_http_headers
-    response_http_rows = [(payload_filename, str.lower(n), v) for n, v in response_http_pairs]
+    # A capture with no HTTP layer at all still gets one blank row, so both response_http views
+    # carry every payload file and a consumer filtering manifest.csv down to a subset can join on
+    # `filename` without hitting a gap. ARC's dns:/whois:/ntp: records are the real case: they are
+    # complete captures that simply never had an HTTP transaction, so "no headers" is the answer,
+    # not a missing record. The multiline CSV already emitted a blank row here; this keeps the
+    # denormalized one from disagreeing about which files exist.
+    response_http_rows = (
+        [(payload_filename, str.lower(n), v) for n, v in response_http_pairs]
+        if response_http_pairs
+        else [(payload_filename, "", "")]
+    )
     response_http_multi = (payload_filename, response_http_pairs)
 
     # Request WARC and HTTP headers (all requests use the response's payload_filename).
