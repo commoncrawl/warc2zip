@@ -3,19 +3,39 @@ import csv
 import io
 import json
 import mimetypes
+import os
 import posixpath
 import re
 import secrets
 import sys
 import zipfile
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
 from warcio.utils import fsspec_open
+
+# botocore only arrives transitively, via warcio[s3], and LoginTokenLoadError is newer than
+# MissingDependencyException -- import them separately so a botocore predating the `aws login`
+# provider still gets the MissingDependencyException handler rather than silently losing both.
+try:
+    from botocore.exceptions import MissingDependencyException
+except ImportError:
+
+    class MissingDependencyException(Exception):
+        """Placeholder so the handler in cli() stays valid when botocore is absent."""
+
+
+try:
+    from botocore.exceptions import LoginTokenLoadError
+except ImportError:
+
+    class LoginTokenLoadError(Exception):
+        """Placeholder so the handler in cli() stays valid when botocore is absent."""
+
 
 MIME_EXTENSION_OVERRIDES = {
     "text/html": ".html",
@@ -462,8 +482,10 @@ def write_sidecar_files(zip_file, root_dir, group):
         zip_file.writestr(f"{base}.metadata.warc-fields", "\n\n".join(body_parts))
 
 
-def main(input_file, output_path, dry_run=False, limit=None, output_format="flat", metadata_only=False):
+def main(input_file, output_path, dry_run=False, limit=None, output_format="flat", metadata_only=False, profile=None):
     file_size = get_file_size(input_file)
+    # profile only makes sense for S3; other fsspec filesystems reject the kwarg
+    open_kwargs = {"profile": profile} if profile and urlparse(input_file).scheme == "s3" else {}
 
     if dry_run:
         capped = limit is None or limit > DRY_RUN_MAX
@@ -481,7 +503,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         sample_mimes = set()
         limit_reached = False
 
-        with fsspec_open(input_file, "rb") as stream:
+        with fsspec_open(input_file, "rb", **open_kwargs) as stream:
             with tqdm(total=file_size, unit="B", unit_scale=True, desc="Scanning") as pbar:
                 for record in ArchiveIterator(stream):
                     if limit_reached and record.rec_type == "response":
@@ -536,7 +558,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     # response -> Record id  <-> metadata -
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as outer_zip:
         # Pass 1: Read WARC, write payloads immediately, buffer only headers
-        with fsspec_open(input_file, "rb") as stream:
+        with fsspec_open(input_file, "rb", **open_kwargs) as stream:
             pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
             # Held by name rather than iterated anonymously: get_record_offset() /
             # get_record_length() hang off the iterator, not the record.
@@ -756,6 +778,56 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     return skipped
 
 
+def format_login_provider_error(input_file, profile, error):
+    """Explain a botocore MissingDependencyException, which for warc2zip almost always means awscrt.
+
+    `aws login` is a standard AWS credential provider, but Boto3/botocore is the one SDK that
+    requires CRT for it (it signs the token refresh with an elliptic-curve key from awscrt).
+    warc2zip depends on botocore[crt], so reaching this means the environment is incomplete --
+    typically an install into the wrong virtualenv, or one predating that dependency.
+
+    botocore raises MissingDependencyException from several places besides the login provider
+    (checksums, sigv4a, endpoint rules), so only claim the login provider when the underlying
+    message actually says so. Every case still points at the same fix: install botocore[crt].
+    """
+    is_login_failure = "login" in str(error).lower()
+    profile_name = profile or os.environ.get("AWS_PROFILE") or "default"
+
+    if is_login_failure:
+        opening = (
+            f"Error: AWS profile '{profile_name}' uses the `aws login` credential provider, "
+            "which requires awscrt."
+        )
+    else:
+        opening = "Error: this AWS operation requires awscrt."
+
+    lines = [
+        opening,
+        "",
+        "warc2zip depends on botocore[crt], so awscrt should already be present. This environment",
+        "is missing it. Check that warc2zip is installed into the virtualenv you are running,",
+        "then reinstall it (or `pip install \"botocore[crt]\"` directly).",
+    ]
+
+    # Switching credential sources only helps when it was the login provider that needed CRT
+    if is_login_failure:
+        lines += [
+            "",
+            "Alternatively, use a credential source that does not need CRT:",
+            "",
+            "  * a profile with SSO or access key / secret:  warc2zip <input> --profile <name>",
+            "  * environment credentials:                    export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...",
+        ]
+
+        # data.commoncrawl.org mirrors s3://commoncrawl over HTTPS, with no credentials at all
+        parsed = urlparse(input_file)
+        if parsed.scheme == "s3" and parsed.netloc == "commoncrawl":
+            lines.append(f"  * fetch over HTTPS instead:                   https://data.commoncrawl.org{parsed.path}")
+
+    lines += ["", f"Underlying error: {error}"]
+    return "\n".join(lines)
+
+
 def cli():
     parser = argparse.ArgumentParser(description="Convert a gzipped WARC file into a zip-of-zips archive.")
     parser.add_argument("input_file", help="Path to a .warc.gz file")
@@ -782,7 +854,15 @@ def cli():
         default="flat",
         help="Output format: 'flat' (counter-named files + global CSVs) or 'sidecar' (domain dirs + per-file metadata)",
     )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="AWS profile to use for S3 access (only valid for s3:// inputs)",
+    )
     args = parser.parse_args()
+
+    if args.profile and urlparse(args.input_file).scheme != "s3":
+        parser.error("--profile is only valid for s3:// inputs")
 
     input_file = args.input_file
     if args.output:
@@ -796,16 +876,27 @@ def cli():
             name = name + ".zip"
         output_path = Path(name)
 
-    skipped = main(
-        input_file,
-        str(output_path),
-        dry_run=args.dry_run,
-        limit=args.limit,
-        output_format=args.format,
-        metadata_only=args.metadata_only,
-    )
+
+    try:
+        skipped = main(
+            input_file,
+            str(output_path),
+            dry_run=args.dry_run,
+            limit=args.limit,
+            output_format=args.format,
+            metadata_only=args.metadata_only,
+            profile=args.profile,
+        )
+    except MissingDependencyException as e:
+        print(format_login_provider_error(input_file, args.profile, e), file=sys.stderr)
+        sys.exit(1)
+    except LoginTokenLoadError as e:
+        # Expired or absent `aws login` session; botocore's message already says to reauthenticate
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     return 1 if skipped else 0
+
 
 
 if __name__ == "__main__":

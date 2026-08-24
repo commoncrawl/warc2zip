@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Convert gzipped WARC files into zip-of-zips archives"
 requires-python = ">=3.10"
 dependencies = [
+    # AWS's Python SDK is the only one requiring CRT for the `aws login` credential provider;
+    # without it those profiles fail outright. See Caveats in README.md.
+    "botocore[crt]",
     "tqdm>=4.67.3",
     "warcio[s3]==1.8.1",
 ]
