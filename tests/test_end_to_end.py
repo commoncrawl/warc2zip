@@ -1,0 +1,390 @@
+"""End-to-end conversion over a synthetic WARC built in-process (no network).
+
+Covers both output formats and asserts the shipped CSVs parse with a stock csv.reader — the
+property that a single NUL byte from the wire used to break for a whole crawl.
+"""
+
+import csv
+import io
+import json
+import re
+import zipfile
+
+import pytest
+from warcio.archiveiterator import ArchiveIterator
+from warcio.statusandheaders import StatusAndHeaders
+from warcio.warcwriter import WARCWriter
+
+from warc2zip import MANIFEST_COLUMNS, main
+
+# Payload files are named {counter}{ext}. Sidecars share the payload's full name and add a second
+# suffix (1000000.html.request.json), so a plain endswith(".json") would confuse the two.
+PAYLOAD_RE = re.compile(r"^\d+\.[A-Za-z0-9]+$")
+
+EXPECTED_CSVS = {
+    "manifest.csv",
+    "metadata.csv",
+    "metadata_multi.csv",
+    "request_http_headers.csv",
+    "request_http_headers_multi.csv",
+    "request_warc_headers.csv",
+    "request_warc_headers_multi.csv",
+    "response_http_headers.csv",
+    "response_http_headers_multi.csv",
+    "response_warc_headers.csv",
+    "response_warc_headers_multi.csv",
+    "warcinfo.csv",
+    "warcinfo_multi.csv",
+}
+
+# The shape CC writes into a metadata record's warc-fields body.
+CLD2 = '{"reliable":true,"languages":[{"code":"zh","text-covered":0.87,"name":"Chinese"}]}'
+
+CAPTURES = [
+    (
+        "https://example.com/",
+        "text/html",
+        b"<html><body>hello</body></html>",
+        [("Content-Type", "text/html; charset=UTF-8"), ("Connection", "close\x00")],
+    ),
+    (
+        "https://cloudflare-ish.example.org/index.html",
+        "text/html",
+        b"<html>report-to</html>",
+        [
+            ("Content-Type", "text/html"),
+            ("Report-To", '{"group":"cf-nel","max_age":604800}'),
+            ("Server-Timing", 'cfCacheStatus;desc="DYNAMIC"'),
+            ("Cache-Control", "no-store, must-revalidate, no-cache"),
+        ],
+    ),
+    (
+        "https://plain.example.net/data.json",
+        "application/json",
+        b'{"ok": true}',
+        [("Content-Type", "application/json"), ("X-Fold", "a\r\n b")],
+    ),
+]
+
+
+@pytest.fixture
+def warc_path(tmp_path):
+    """A three-capture WARC: warcinfo + response/request/metadata per capture."""
+    path = tmp_path / "test.warc.gz"
+    with open(path, "wb") as fh:
+        writer = WARCWriter(fh, gzip=True)
+        writer.write_record(writer.create_warcinfo_record("test.warc.gz", {"software": "warc2zip-tests"}))
+        for i, (uri, _mime, payload, headers) in enumerate(CAPTURES):
+            request_id = f"<urn:uuid:req-{i}>"
+
+            http_headers = StatusAndHeaders("200 OK", headers, protocol="HTTP/1.1")
+            response = writer.create_warc_record(
+                uri,
+                "response",
+                payload=io.BytesIO(payload),
+                length=len(payload),
+                http_headers=http_headers,
+                warc_headers_dict={"WARC-Concurrent-To": request_id},
+            )
+            writer.write_record(response)
+            response_id = response.rec_headers.get_header("WARC-Record-ID")
+
+            request_headers = StatusAndHeaders(
+                "GET / HTTP/1.1", [("Host", "example.com"), ("User-Agent", 'cc-bot/1.0 "test"')], is_http_request=True
+            )
+            writer.write_record(
+                writer.create_warc_record(
+                    uri,
+                    "request",
+                    http_headers=request_headers,
+                    warc_headers_dict={"WARC-Record-ID": request_id, "WARC-Concurrent-To": response_id},
+                )
+            )
+
+            body = (
+                b"fetchTimeMs: 42\r\n"
+                b"charset-detected: utf-8\x00\r\n"
+                + f"languages-cld2: {CLD2}\r\n".encode()
+                + b"http-header-user-agent: cc-bot/1.0 (X11; Linux)\r\n"
+                b"  continued-on-the-next-line\r\n"
+            )
+            writer.write_record(
+                writer.create_warc_record(
+                    uri,
+                    "metadata",
+                    payload=io.BytesIO(body),
+                    length=len(body),
+                    warc_headers_dict={
+                        "WARC-Concurrent-To": response_id,
+                        "Content-Type": "application/warc-fields",
+                    },
+                )
+            )
+    return path
+
+
+def csv_members(zf):
+    return [n for n in zf.namelist() if n.endswith(".csv")]
+
+
+def basenames(zf):
+    return {n.rsplit("/", 1)[-1] for n in zf.namelist()}
+
+
+def read_csv(zf, suffix):
+    """Parse a CSV member with the stock reader — needing no special dialect is the invariant."""
+    name = next(n for n in zf.namelist() if n.endswith(suffix))
+    return list(csv.reader(io.StringIO(zf.read(name).decode("utf-8"))))
+
+
+def read_rows(zf, suffix):
+    """Same as read_csv(), without the header row."""
+    return read_csv(zf, suffix)[1:]
+
+
+@pytest.mark.parametrize("output_format", ["flat", "sidecar"])
+def test_conversion_produces_parseable_csvs(warc_path, tmp_path, output_format):
+    out = tmp_path / f"{output_format}.zip"
+
+    skipped = main(str(warc_path), str(out), output_format=output_format)
+
+    assert skipped == 0
+    with zipfile.ZipFile(out) as zf:
+        members = csv_members(zf)
+        assert {n.rsplit("/", 1)[-1] for n in members} == EXPECTED_CSVS
+
+        for name in members:
+            content = zf.read(name).decode("utf-8")
+            assert "\x00" not in content, f"{name} still carries a NUL"
+            rows = list(csv.reader(io.StringIO(content)))  # raises on NUL / unbalanced quotes
+            assert all(len(row) == len(rows[0]) for row in rows), f"{name} has ragged rows"
+
+        manifest = [
+            json.loads(line)
+            for line in zf.read(next(n for n in zf.namelist() if n.endswith("manifest.jsonl")))
+            .decode("utf-8")
+            .splitlines()
+        ]
+        assert len(manifest) == len(CAPTURES)
+        assert {entry["warc_target_uri"] for entry in manifest} == {uri for uri, _, _, _ in CAPTURES}
+
+
+def test_nul_from_the_wire_is_escaped_in_the_csv(warc_path, tmp_path):
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        name = next(n for n in zf.namelist() if n.endswith("response_http_headers.csv"))
+        rows = list(csv.reader(io.StringIO(zf.read(name).decode("utf-8"))))
+
+    assert ["connection", "close\\x00"] in [row[1:] for row in rows]
+
+
+def test_payloads_and_metadata_are_present(warc_path, tmp_path):
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        payloads = [n for n in zf.namelist() if n.endswith((".html", ".json"))]
+        assert len(payloads) == len(CAPTURES)
+
+        request_csv = next(n for n in zf.namelist() if n.endswith("request_warc_headers.csv"))
+        metadata_csv = next(n for n in zf.namelist() if n.endswith("metadata.csv"))
+        assert len(list(csv.reader(io.StringIO(zf.read(request_csv).decode("utf-8"))))) > 1
+        assert len(list(csv.reader(io.StringIO(zf.read(metadata_csv).decode("utf-8"))))) > 1
+
+
+def test_sidecar_format_writes_per_capture_files(warc_path, tmp_path):
+    out = tmp_path / "sidecar.zip"
+    main(str(warc_path), str(out), output_format="sidecar")
+
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+        assert any(n.endswith(".response.http") for n in names)
+        assert any(n.endswith(".request.warc") for n in names)
+        assert any(n.endswith(".metadata.warc-fields") for n in names)
+        assert any("/example.com/" in n for n in names)
+
+
+def test_warcinfo_reaches_the_zip_raw_and_as_csv(warc_path, tmp_path):
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        assert {"warcinfo.warc", "warcinfo.warc-fields"} <= basenames(zf)
+        raw_headers = zf.read(next(n for n in zf.namelist() if n.endswith("warcinfo.warc"))).decode("utf-8")
+        raw_body = zf.read(next(n for n in zf.namelist() if n.endswith("warcinfo.warc-fields"))).decode("utf-8")
+        rows = read_rows(zf, "warcinfo.csv")
+
+    assert "WARC-Type: warcinfo" in raw_headers
+    assert "software: warc2zip-tests" in raw_body
+    assert ["warcinfo", "warc_type", "warcinfo"] in rows
+    assert ["warcinfo", "_body.software", "warc2zip-tests"] in rows
+
+
+def test_manifest_csv_mirrors_the_jsonl(warc_path, tmp_path):
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        name = next(n for n in zf.namelist() if n.endswith("manifest.jsonl"))
+        entries = [json.loads(line) for line in zf.read(name).decode("utf-8").splitlines()]
+        header, *rows = read_csv(zf, "manifest.csv")
+
+    assert header == list(MANIFEST_COLUMNS)
+    assert len(rows) == len(entries)
+    for row, entry in zip(rows, entries):
+        assert row == [str(entry[column]) for column in MANIFEST_COLUMNS]
+
+
+def test_status_code_leads_each_files_response_http_headers(warc_path, tmp_path):
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        rows = read_rows(zf, "response_http_headers.csv")
+
+    first_seen = {}
+    for filename, header_name, value in rows:
+        first_seen.setdefault(filename, (header_name, value))
+
+    assert len(first_seen) == len(CAPTURES)
+    assert set(first_seen.values()) == {("status_code", "200")}
+
+
+def test_metadata_body_is_shallow_flattened(warc_path, tmp_path):
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        rows = read_rows(zf, "metadata.csv")
+        multi = zf.read(next(n for n in zf.namelist() if n.endswith("metadata_multi.csv"))).decode("utf-8")
+
+    fields = {name: value for _, name, value in rows if name.startswith("_body")}
+
+    assert fields["_body.fetchtimems"] == "42"
+    assert fields["_body.charset_detected"] == "utf-8\\x00"  # NUL escaped, not dropped
+    assert fields["_body.http_header_user_agent"].endswith("continued-on-the-next-line")
+    # one level only: the nested CLD2 language list stays a single opaque value
+    assert json.loads(fields["_body.languages_cld2"])["languages"][0]["code"] == "zh"
+    # the raw blob is gone from the denormalized CSV...
+    assert "_body" not in fields
+    # ...but the multiline CSV still carries it verbatim, so nothing is lost in flat format
+    assert "_body: fetchTimeMs: 42" in multi
+
+
+def test_request_http_headers_reach_a_csv(warc_path, tmp_path):
+    """They used to exist only in sidecar files, so flat format lost them entirely."""
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        pairs = {(name, value) for _, name, value in read_rows(zf, "request_http_headers.csv")}
+
+    assert ("request_method", "GET") in pairs
+    assert ("request_target", "/") in pairs
+    assert ("host", "example.com") in pairs
+
+
+@pytest.mark.parametrize("output_format", ["flat", "sidecar"])
+def test_metadata_only_drops_payloads_and_changes_nothing_else(warc_path, tmp_path, output_format):
+    full = tmp_path / "full.zip"
+    meta = tmp_path / "meta.zip"
+    main(str(warc_path), str(full), output_format=output_format)
+    main(str(warc_path), str(meta), output_format=output_format, metadata_only=True)
+
+    def members(path):
+        # strip the randomized root directory so the two runs are comparable
+        with zipfile.ZipFile(path) as zf:
+            return {n.split("/", 1)[1]: zf.read(n) for n in zf.namelist()}
+
+    full_members, meta_members = members(full), members(meta)
+
+    payloads = {n for n in full_members if PAYLOAD_RE.match(n.rsplit("/", 1)[-1])}
+    assert len(payloads) == len(CAPTURES)
+    assert not payloads & set(meta_members)
+
+    metadata_members = set(full_members) - payloads
+    assert metadata_members == set(meta_members)
+    for name in metadata_members:
+        assert full_members[name] == meta_members[name], name
+
+
+def test_manifest_offsets_locate_the_record_inside_the_warc(warc_path, tmp_path):
+    """The whole point of offset+length: reading those bytes must yield that exact record.
+
+    Each record is its own gzip member, so the slice is a standalone WARC — which is what makes
+    an HTTP range request against the original WARC work.
+    """
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        name = next(n for n in zf.namelist() if n.endswith("manifest.jsonl"))
+        entries = [json.loads(line) for line in zf.read(name).decode("utf-8").splitlines()]
+
+    raw = warc_path.read_bytes()
+    assert len(entries) == len(CAPTURES)
+    for entry in entries:
+        offset, length = entry["warc_record_offset"], entry["warc_record_length"]
+        assert isinstance(offset, int) and isinstance(length, int) and length > 0
+
+        record = next(iter(ArchiveIterator(io.BytesIO(raw[offset : offset + length]))))
+
+        assert record.rec_type == "response"
+        assert record.rec_headers.get_header("WARC-Record-ID") == entry["warc_record_id"]
+        assert record.rec_headers.get_header("WARC-Target-URI") == entry["warc_target_uri"]
+
+
+def test_manifest_names_the_source_warc(warc_path, tmp_path):
+    """A CSV-only consumer needs the filename on every row to re-fetch without the zip's context."""
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        rows = read_rows(zf, "manifest.csv")
+        warcinfo = read_rows(zf, "warcinfo.csv")
+
+    assert {row[MANIFEST_COLUMNS.index("warc_filename")] for row in rows} == {"test.warc.gz"}
+    # every row also carries where the file was actually read from, so no join is needed
+    assert {row[MANIFEST_COLUMNS.index("source_uri")] for row in rows} == {str(warc_path)}
+    # ...and warcinfo.csv records it once at crawl level
+    assert ["warcinfo", "source_uri", str(warc_path)] in warcinfo
+
+
+def test_every_record_type_carries_its_location(warc_path, tmp_path):
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        for suffix in ("response_warc_headers.csv", "request_warc_headers.csv", "metadata.csv", "warcinfo.csv"):
+            names = {name for _, name, _ in read_rows(zf, suffix)}
+            assert {"warc_record_offset", "warc_record_length"} <= names, suffix
+
+
+def test_source_uri_is_recorded_even_without_a_warcinfo_record(tmp_path):
+    """A WARC with no warcinfo still has to say where it came from."""
+    path = tmp_path / "no-warcinfo.warc.gz"
+    with open(path, "wb") as fh:
+        writer = WARCWriter(fh, gzip=True)
+        payload = b"<html>bare</html>"
+        writer.write_record(
+            writer.create_warc_record(
+                "https://bare.example.com/",
+                "response",
+                payload=io.BytesIO(payload),
+                length=len(payload),
+                http_headers=StatusAndHeaders("200 OK", [("Content-Type", "text/html")], protocol="HTTP/1.1"),
+            )
+        )
+
+    out = tmp_path / "flat.zip"
+    main(str(path), str(out), output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        warcinfo = read_rows(zf, "warcinfo.csv")
+        rows = read_rows(zf, "manifest.csv")
+
+    assert ["warcinfo", "source_uri", str(path)] in warcinfo
+    # WARC-Filename is unavailable, so the input's own basename stands in
+    assert {row[MANIFEST_COLUMNS.index("warc_filename")] for row in rows} == {"no-warcinfo.warc.gz"}

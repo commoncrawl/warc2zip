@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import posixpath
+import re
 import secrets
 import sys
 import zipfile
@@ -42,6 +43,8 @@ MIME_EXTENSION_OVERRIDES = {
     "image/jpeg": ".jpg",
 }
 
+DRY_RUN_MAX = 10  # hard cap on capture records scanned by --dry-run
+
 
 @dataclass
 class RecordGroup:
@@ -56,6 +59,8 @@ class RecordGroup:
     http_status_code: str = ""
     content_type_header: str = ""
     response_order: int = -1
+    response_offset: int | None = None  # byte offset of the response record in the WARC
+    response_length: int | None = None  # byte length of that record (gzip member size)
     http_status_line: str = ""  # Full HTTP status line, e.g. "HTTP/1.1 200 OK"
     response_domain: str = ""  # Domain from WARC-Target-URI, e.g. "example.com"
     concurrent_to: str = ""  # WARC-Concurrent-To from the response record (points to request)
@@ -63,7 +68,10 @@ class RecordGroup:
     request_http_headers: list[list[tuple[str, str]]] = field(default_factory=list)
     request_http_lines: list[str] = field(default_factory=list)  # e.g. "GET /path HTTP/1.1"
     request_bodies: list[bytes] = field(default_factory=list)
-    metadata_entries: list[tuple[list[tuple[str, str]], str]] = field(default_factory=list)
+    request_offsets: list[int | None] = field(default_factory=list)
+    request_lengths: list[int | None] = field(default_factory=list)
+    # (warc header pairs, body text, byte offset, byte length)
+    metadata_entries: list[tuple[list[tuple[str, str]], str, int | None, int | None]] = field(default_factory=list)
 
 
 def detect_mime_type(record):
@@ -80,28 +88,230 @@ def mime_to_extension(mime_type):
     return mimetypes.guess_extension(mime_type) or ".unk"
 
 
-def write_denormalized_csv(rows):
-    """Write denormalized CSV: filename, header_name, header_value (multiple rows per file)."""
+# Every C0 control except TAB, plus DEL. TAB is harmless inside a quoted field and occurs
+# legitimately in header values; NUL and CR/LF are not — see sanitize_csv_value().
+CSV_CONTROL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+# The dialect is pinned field-by-field rather than inherited from csv.excel's class attributes,
+# so a mutated global dialect can't silently change how values are quoted. No escapechar on
+# purpose: QUOTE_ALL + doublequote covers every case, and setting one would double every
+# backslash in a value (including the \xNN sequences sanitize_csv_value emits).
+CSV_DIALECT = {
+    "delimiter": ",",
+    "quotechar": '"',
+    "doublequote": True,
+    "lineterminator": "\r\n",
+    "quoting": csv.QUOTE_ALL,
+}
+
+
+def sanitize_csv_value(value):
+    r"""Make control characters visible so CSV output stays reader-parseable.
+
+    Header values off the wire can carry a NUL (seen in CC-MAIN-2026-21: `connection: close\x00`)
+    or, via obs-fold, an embedded CR/LF. A single NUL makes csv.reader reject the whole file;
+    rendering these as `\xNN` keeps rows single-line and the file parseable, without discarding
+    the evidence that the byte was there.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    return CSV_CONTROL_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", value)
+
+
+def write_denormalized_csv(rows, label="csv"):
+    """Write denormalized CSV: filename, header_name, header_value (multiple rows per file).
+
+    Returns (content, skipped) — a row that still fails to write is reported and skipped rather
+    than aborting a conversion that has already streamed the whole WARC.
+    """
     sio = io.StringIO()
-    writer = csv.writer(sio, quoting=csv.QUOTE_ALL)
+    writer = csv.writer(sio, **CSV_DIALECT)
     writer.writerow(["filename", "header_name", "header_value"])
+    skipped = 0
     for row in rows:
         filename, header_name, header_value = row
         header_name = header_name.strip().lower().replace("-", "_")
 
-        writer.writerow((filename, header_name, header_value))
-    return sio.getvalue()
+        try:
+            writer.writerow((filename, header_name, sanitize_csv_value(header_value)))
+        except (csv.Error, UnicodeError) as e:
+            skipped += 1
+            print(f"warning: {label}: skipped header {header_name!r} of {filename}: {e}", file=sys.stderr)
+    return sio.getvalue(), skipped
 
 
-def write_multiline_csv(rows):
-    """Write multiline CSV: filename, headers (one row per file, headers as multiline string)."""
+def write_multiline_csv(rows, label="csv"):
+    """Write multiline CSV: filename, headers (one row per file, headers as multiline string).
+
+    Returns (content, skipped) — see write_denormalized_csv().
+    """
     sio = io.StringIO()
-    writer = csv.writer(sio, quoting=csv.QUOTE_ALL)
+    writer = csv.writer(sio, **CSV_DIALECT)
     writer.writerow(["filename", "headers"])
+    skipped = 0
     for filename, header_pairs in rows:
-        headers_str = "\n".join(f"{name.replace('-', '_').lower()}: {value}" for name, value in header_pairs)
-        writer.writerow([filename, headers_str])
-    return sio.getvalue()
+        headers_str = "\n".join(
+            f"{name.replace('-', '_').lower()}: {sanitize_csv_value(value)}" for name, value in header_pairs
+        )
+        try:
+            writer.writerow([filename, headers_str])
+        except (csv.Error, UnicodeError) as e:
+            skipped += 1
+            print(f"warning: {label}: skipped headers of {filename}: {e}", file=sys.stderr)
+    return sio.getvalue(), skipped
+
+
+# A warc-fields name is an HTTP token (RFC 9110 5.6.2). Checking the charset, not just the
+# presence of a colon, is what stops a one-line JSON body ({"just": "json"}) from being read as a
+# field named '{"just"' — a real risk, since some producers put JSON in a metadata record.
+WARC_FIELD_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
+
+
+def parse_warc_fields(text):
+    r"""Parse an application/warc-fields body into (name, value) pairs.
+
+    Returns None when the body doesn't look like warc-fields, so callers keep the raw block
+    instead of mangling something that was never a field list (a JSON blob, free text).
+    Only the first ':' splits a line: CC emits fields like
+    `http-header-user-agent: Mozilla/5.0 (X11; Linux)` whose value carries its own colons.
+    Duplicate names are kept as separate pairs, the way repeated WARC headers already are.
+    """
+    pairs = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line.strip():
+            continue
+        if line[0] in " \t":
+            # obs-fold continuation of the previous field
+            if not pairs:
+                return None
+            name, value = pairs[-1]
+            pairs[-1] = (name, f"{value} {line.strip()}")
+            continue
+        name, sep, value = line.partition(":")
+        if not sep or not WARC_FIELD_NAME_RE.match(name.strip()):
+            return None
+        pairs.append((name.strip(), value.strip()))
+    return pairs or None
+
+
+def flatten_body_rows(body_text, prefix="_body"):
+    """Shallow-flatten a warc-fields body into ("_body.<field>", value) pairs.
+
+    One level only: a field whose value is JSON (CC's languages-cld2) stays a single opaque
+    value, because the list nested inside it doesn't flatten into columns usefully. Names are
+    normalized here rather than left to the writers, since write_denormalized_csv() and
+    write_multiline_csv() normalize slightly differently. A body that isn't warc-fields falls
+    back to one raw row, so nothing is lost.
+    """
+    pairs = parse_warc_fields(body_text)
+    if pairs is None:
+        return [(prefix, body_text)]
+    return [(f"{prefix}.{n.strip().lower().replace('-', '_')}", v) for n, v in pairs]
+
+
+def record_location_pairs(offset, length):
+    """Pseudo-headers locating a record inside the source WARC.
+
+    Same triple a CDX index carries (filename, offset, length): with the WARC filename from
+    manifest.csv, these two make a record re-fetchable with a single HTTP range request,
+    because each record is its own gzip member.
+    """
+    if offset is None or length is None:
+        return []
+    return [("warc_record_offset", str(offset)), ("warc_record_length", str(length))]
+
+
+def request_line_pairs(line):
+    """Split an HTTP request line into request_method / request_target pseudo-header pairs.
+
+    Expects "GET /path HTTP/1.1". A leading HTTP/x token is skipped rather than trusted, so a
+    line assembled protocol-first can't turn into a row claiming the method is "HTTP/1.1".
+    """
+    parts = line.split()
+    if parts and parts[0].upper().startswith("HTTP/"):
+        parts = parts[1:]
+    if len(parts) >= 2:
+        return [("request_method", parts[0]), ("request_target", parts[1])]
+    return []
+
+
+MANIFEST_COLUMNS = (
+    "filename",
+    "warc_record_id",
+    "warc_target_uri",
+    "warc_date",
+    "http_status_code",
+    "detected_mime_type",
+    "content_type_header",
+    "payload_size",
+    # Where this record came from: enough to re-fetch it from this row alone, with no join
+    # against warcinfo.csv and no knowledge of the zip it was extracted from.
+    "warc_filename",
+    "source_uri",
+    "warc_record_offset",
+    "warc_record_length",
+)
+
+
+def write_manifest_csv(entries, label="manifest.csv"):
+    """Write the wide CSV mirror of manifest.jsonl: one row per capture, one column per key.
+
+    Fed from the same entry dicts as the JSONL so the two files cannot drift.
+    Returns (content, skipped) - see write_denormalized_csv().
+    """
+    sio = io.StringIO()
+    writer = csv.writer(sio, **CSV_DIALECT)
+    writer.writerow(list(MANIFEST_COLUMNS))
+    skipped = 0
+    for entry in entries:
+        try:
+            writer.writerow([sanitize_csv_value(entry.get(column, "")) for column in MANIFEST_COLUMNS])
+        except (csv.Error, UnicodeError) as e:
+            skipped += 1
+            print(f"warning: {label}: skipped entry {entry.get('filename')!r}: {e}", file=sys.stderr)
+    return sio.getvalue(), skipped
+
+
+def build_warcinfo_rows(warcinfos, source_uri=""):
+    """Build denormalized and multiline CSV rows for the warcinfo record(s).
+
+    warcinfo is crawl-level and belongs to no payload file, so the filename column carries a
+    synthetic key: "warcinfo", then "warcinfo.1" etc. for the extra records a concatenated
+    WARC brings along.
+
+    `source_uri` is the input this zip was converted from, recorded as a synthetic row. The
+    WARC's own WARC-Filename says what the file is called; this says where it was read from,
+    which is what a range request actually needs. Emitted even when the WARC carries no
+    warcinfo record at all, so the provenance is never lost.
+    """
+    rows = []
+    multi = []
+    for i, (headers, body_text, offset, length) in enumerate(warcinfos):
+        key = "warcinfo" if i == 0 else f"warcinfo.{i}"
+        pairs = record_location_pairs(offset, length) + list(headers)
+        for n, v in pairs:
+            rows.append((key, str.lower(n.replace("-", "_")), v))
+        rows.extend((key, n, v) for n, v in flatten_body_rows(body_text))
+        multi.append((key, pairs + [("_body", body_text)]))
+    if source_uri:
+        rows.insert(0, ("warcinfo", "source_uri", source_uri))
+        if multi:
+            multi[0] = (multi[0][0], [("source_uri", source_uri)] + multi[0][1])
+        else:
+            multi.append(("warcinfo", [("source_uri", source_uri)]))
+    return rows, multi
+
+
+def write_warcinfo_files(zip_file, root_dir, warcinfos):
+    """Write the raw warcinfo record(s): WARC headers and warc-fields body, wire bytes preserved."""
+    zip_file.writestr(
+        f"{root_dir}/warcinfo.warc",
+        "\n\n".join("\n".join(f"{n}: {v}" for n, v in headers) for headers, _body, _o, _l in warcinfos),
+    )
+    zip_file.writestr(
+        f"{root_dir}/warcinfo.warc-fields",
+        "\n\n".join(body for _headers, body, _o, _l in warcinfos),
+    )
 
 
 def get_file_size(input_file):
@@ -137,33 +347,57 @@ def extract_crawl_name(warc_filename):
     return name
 
 
-def build_group_metadata(group):
+def build_group_metadata(group, warc_filename="", source_uri=""):
     """Build CSV rows and JSONL entry for a RecordGroup whose payload is already in the zip."""
     payload_filename = group.payload_filename
 
-    # Response WARC headers
-    response_warc_rows = [(payload_filename, str.lower(n), v) for n, v in group.response_warc_headers]
-    response_warc_multi = (payload_filename, group.response_warc_headers)
+    # Response WARC headers, led by the record's location in the source WARC
+    response_warc_pairs = record_location_pairs(group.response_offset, group.response_length)
+    response_warc_pairs += group.response_warc_headers
+    response_warc_rows = [(payload_filename, str.lower(n), v) for n, v in response_warc_pairs]
+    response_warc_multi = (payload_filename, response_warc_pairs)
 
-    # Response HTTP headers
-    response_http_rows = [(payload_filename, str.lower(n), v) for n, v in group.response_http_headers]
-    response_http_multi = (payload_filename, group.response_http_headers)
+    # Response HTTP headers, led by a synthetic status_code row so the status is greppable.
+    # Deliberately not the status line: CC's WARCs claim HTTP/1.1 even for h2 captures. The true
+    # protocol is already in response_warc_headers.csv as warc_protocol rows.
+    status_pairs = [("status_code", group.http_status_code)] if group.http_status_code else []
+    response_http_pairs = status_pairs + group.response_http_headers
+    response_http_rows = [(payload_filename, str.lower(n), v) for n, v in response_http_pairs]
+    response_http_multi = (payload_filename, response_http_pairs)
 
-    # Request WARC headers (all requests use the response's payload_filename)
+    # Request WARC and HTTP headers (all requests use the response's payload_filename).
+    # The HTTP side used to reach sidecar files only, so flat format lost it entirely.
     request_warc_rows = []
     request_warc_multi_entries = []
-    for req_pairs in group.requests:
+    request_http_rows = []
+    request_http_multi_entries = []
+    for i, req_pairs in enumerate(group.requests):
+        offset = group.request_offsets[i] if i < len(group.request_offsets) else None
+        length = group.request_lengths[i] if i < len(group.request_lengths) else None
+        req_pairs = record_location_pairs(offset, length) + req_pairs
         for n, v in req_pairs:
             request_warc_rows.append((payload_filename, str.lower(n.replace("-", "_")), v))
         request_warc_multi_entries.append((payload_filename, req_pairs))
 
-    # Metadata entries (all use the response's payload_filename)
+        http_pairs = group.request_http_headers[i] if i < len(group.request_http_headers) else []
+        request_line = group.request_http_lines[i] if i < len(group.request_http_lines) else ""
+        http_pairs = request_line_pairs(request_line) + http_pairs
+        if http_pairs:
+            for n, v in http_pairs:
+                request_http_rows.append((payload_filename, str.lower(n.replace("-", "_")), v))
+            request_http_multi_entries.append((payload_filename, http_pairs))
+
+    # Metadata entries (all use the response's payload_filename). The denormalized CSV gets the
+    # warc-fields body shallow-flattened so each field can be grepped; the multiline CSV keeps the
+    # raw block, so flat-format output still reproduces the wire bytes despite having no
+    # .metadata.warc-fields sidecar.
     metadata_rows = []
     metadata_multi_entries = []
-    for meta_pairs, body_text in group.metadata_entries:
+    for meta_pairs, body_text, offset, length in group.metadata_entries:
+        meta_pairs = record_location_pairs(offset, length) + meta_pairs
         for n, v in meta_pairs:
             metadata_rows.append((payload_filename, str.lower(n.replace("-", "_")), v))
-        metadata_rows.append((payload_filename, "_body", body_text))
+        metadata_rows.extend((payload_filename, n, v) for n, v in flatten_body_rows(body_text))
         all_pairs = meta_pairs + [("_body", body_text)]
         metadata_multi_entries.append((payload_filename, all_pairs))
 
@@ -177,6 +411,10 @@ def build_group_metadata(group):
         "detected_mime_type": group.response_mime_type or "application/octet-stream",
         "content_type_header": group.content_type_header,
         "payload_size": group.payload_size,
+        "warc_filename": warc_filename,
+        "source_uri": source_uri,
+        "warc_record_offset": "" if group.response_offset is None else group.response_offset,
+        "warc_record_length": "" if group.response_length is None else group.response_length,
     }
 
     return {
@@ -186,6 +424,8 @@ def build_group_metadata(group):
         "response_http_multi": response_http_multi,
         "request_warc_rows": request_warc_rows,
         "request_warc_multi": request_warc_multi_entries,
+        "request_http_rows": request_http_rows,
+        "request_http_multi": request_http_multi_entries,
         "metadata_rows": metadata_rows,
         "metadata_multi": metadata_multi_entries,
         "jsonl_entry": jsonl_entry,
@@ -235,19 +475,27 @@ def write_sidecar_files(zip_file, root_dir, group):
     if group.metadata_entries:
         warc_parts = []
         body_parts = []
-        for meta_headers, body_text in group.metadata_entries:
+        for meta_headers, body_text, _offset, _length in group.metadata_entries:
             warc_parts.append("\n".join(f"{n}: {v}" for n, v in meta_headers))
             body_parts.append(body_text)
         zip_file.writestr(f"{base}.metadata.warc", "\n\n".join(warc_parts))
         zip_file.writestr(f"{base}.metadata.warc-fields", "\n\n".join(body_parts))
 
 
-def main(input_file, output_path, dry_run=False, limit=None, output_format="flat", profile=None):
+def main(input_file, output_path, dry_run=False, limit=None, output_format="flat", metadata_only=False, profile=None):
     file_size = get_file_size(input_file)
     # profile only makes sense for S3; other fsspec filesystems reject the kwarg
     open_kwargs = {"profile": profile} if profile and urlparse(input_file).scheme == "s3" else {}
 
     if dry_run:
+        capped = limit is None or limit > DRY_RUN_MAX
+        if capped:
+            limit = DRY_RUN_MAX
+            print(
+                f"Warning: --dry-run scans at most {DRY_RUN_MAX} capture records.",
+                file=sys.stderr,
+            )
+
         response_count = 0
         request_count = 0
         metadata_count = 0
@@ -276,7 +524,16 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         metadata_count += 1
                     pbar.update(stream.tell() - pbar.n)
 
-        print(f"[dry-run] {response_count} responses, {request_count} requests, {metadata_count} metadata records")
+        if not limit_reached:
+            limit_note = ""
+        elif capped:
+            limit_note = f" (stopped at the --dry-run cap of {limit})"
+        else:
+            limit_note = f" (stopped at --limit {limit})"
+        print(
+            f"[dry-run] {response_count} responses, {request_count} requests, "
+            f"{metadata_count} metadata records{limit_note}"
+        )
         print(f"[dry-run] Sample URIs: {sample_uris}")
         print(f"[dry-run] Detected mime-types: {sorted(sample_mimes)}")
         return
@@ -286,6 +543,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     order_counter = 0
     counter = 1_000_000
     root_dir = None  # resolved from first warcinfo record
+    warcinfos = []  # list[(warc_header_pairs, body_text, offset, length)] - crawl-level provenance
+    warc_filename = ""  # WARC-Filename from the warcinfo record; every manifest row repeats it
 
     # Fallback crawl name from input filename
     input_basename = posixpath.basename(input_file.rstrip("/"))
@@ -301,14 +560,25 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         # Pass 1: Read WARC, write payloads immediately, buffer only headers
         with fsspec_open(input_file, "rb", **open_kwargs) as stream:
             pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
-            for record in ArchiveIterator(stream):
+            # Held by name rather than iterated anonymously: get_record_offset() /
+            # get_record_length() hang off the iterator, not the record.
+            record_iter = ArchiveIterator(stream)
+            for record in record_iter:
                 rec_type = record.rec_type
 
                 if limit_reached and rec_type == "response":
                     break
 
                 if rec_type == "warcinfo":
-                    record.content_stream().read()
+                    body_text = record.content_stream().read().decode("utf-8", errors="replace")
+                    warcinfos.append(
+                        (
+                            list(record.rec_headers.headers),
+                            body_text,
+                            record_iter.get_record_offset(),
+                            record_iter.get_record_length(),
+                        )
+                    )
                     if root_dir is None:
                         warc_filename = record.rec_headers.get_header("WARC-Filename") or ""
                         crawl_name = extract_crawl_name(warc_filename) if warc_filename else fallback_crawl_name
@@ -339,7 +609,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         zip_path = f"{root_dir}/{group.response_domain}/{payload_filename}"
                     else:
                         zip_path = f"{root_dir}/{payload_filename}"
-                    outer_zip.writestr(zip_path, payload)
+                    if not metadata_only:
+                        outer_zip.writestr(zip_path, payload)
 
                     group.payload_filename = payload_filename
                     group.payload_size = len(payload)
@@ -352,6 +623,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         group.content_type_header = record.http_headers.get_header("Content-Type") or ""
                         group.http_status_code = str(record.http_headers.get_statuscode() or "")
                         group.http_status_line = f"{record.http_headers.protocol} {record.http_headers.statusline}"
+                    group.response_offset = record_iter.get_record_offset()
+                    group.response_length = record_iter.get_record_length()
                     group.response_order = order_counter
                     order_counter += 1
                     counter += 1
@@ -366,10 +639,14 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     req_entry = {
                         "warc_headers": list(record.rec_headers.headers),
                         "http_headers": list(record.http_headers.headers) if record.http_headers else [],
+                        # warcio's parser splits a request line as protocol="GET",
+                        # statusline="/path HTTP/1.1" — recompose it to get "GET /path HTTP/1.1".
                         "http_request_line": f"{record.http_headers.protocol} {record.http_headers.statusline}"
                         if record.http_headers
                         else "",
                         "body": body,
+                        "offset": record_iter.get_record_offset(),
+                        "length": record_iter.get_record_length(),
                     }
                     pending_requests.setdefault(request_record_id, []).append(req_entry)
 
@@ -380,7 +657,14 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
 
                     group = groups.setdefault(concurrent_to, RecordGroup())
                     body_text = body.decode("utf-8", errors="replace")
-                    group.metadata_entries.append((list(record.rec_headers.headers), body_text))
+                    group.metadata_entries.append(
+                        (
+                            list(record.rec_headers.headers),
+                            body_text,
+                            record_iter.get_record_offset(),
+                            record_iter.get_record_length(),
+                        )
+                    )
 
                 else:
                     record.content_stream().read()
@@ -396,11 +680,17 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     group.request_http_headers.append(req["http_headers"])
                     group.request_http_lines.append(req["http_request_line"])
                     group.request_bodies.append(req["body"])
+                    group.request_offsets.append(req["offset"])
+                    group.request_lengths.append(req["length"])
 
         # Warn about orphan records (request/metadata without a matching response)
         orphan_count = sum(1 for g in groups.values() if not g.payload_filename)
         if orphan_count:
             print(f"Warning: {orphan_count} orphan group(s) without a response record, skipped")
+
+        # A WARC without a warcinfo record, or without WARC-Filename on it, still needs a name
+        # in the manifest: fall back to what the input was called.
+        warc_filename = warc_filename or input_basename
 
         # Pass 2: Build metadata from buffered headers (payloads already in zip)
         sorted_groups = sorted(
@@ -414,6 +704,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         response_http_multi = []
         request_warc_rows = []
         request_warc_multi = []
+        request_http_rows = []
+        request_http_multi = []
         metadata_rows = []
         metadata_multi = []
         jsonl_entries = []
@@ -422,7 +714,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             if output_format == "sidecar":
                 write_sidecar_files(outer_zip, root_dir, group)
 
-            result = build_group_metadata(group)
+            result = build_group_metadata(group, warc_filename, input_file)
 
             response_warc_rows.extend(result["response_warc_rows"])
             response_warc_multi.append(result["response_warc_multi"])
@@ -430,30 +722,60 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             response_http_multi.append(result["response_http_multi"])
             request_warc_rows.extend(result["request_warc_rows"])
             request_warc_multi.extend(result["request_warc_multi"])
+            request_http_rows.extend(result["request_http_rows"])
+            request_http_multi.extend(result["request_http_multi"])
             metadata_rows.extend(result["metadata_rows"])
             metadata_multi.extend(result["metadata_multi"])
             jsonl_entries.append(result["jsonl_entry"])
 
-        # Write manifest.jsonl
+        # Write the warcinfo record(s): raw wire bytes plus greppable CSVs
+        # Built unconditionally: warcinfo.csv records the source URI even for a WARC that
+        # carries no warcinfo record, so the provenance is never lost.
+        warcinfo_rows, warcinfo_multi = build_warcinfo_rows(warcinfos, input_file)
+        if warcinfos:
+            write_warcinfo_files(outer_zip, root_dir, warcinfos)
+
+        # Write manifest.jsonl and its wide CSV mirror, both from the same entries
         jsonl_content = "\n".join(json.dumps(entry) for entry in jsonl_entries)
         outer_zip.writestr(f"{root_dir}/manifest.jsonl", jsonl_content)
+        manifest_content, skipped = write_manifest_csv(jsonl_entries)
+        outer_zip.writestr(f"{root_dir}/manifest.csv", manifest_content)
 
         # Write denormalized CSVs
-        outer_zip.writestr(f"{root_dir}/response_warc_headers.csv", write_denormalized_csv(response_warc_rows))
-        outer_zip.writestr(f"{root_dir}/response_http_headers.csv", write_denormalized_csv(response_http_rows))
-        outer_zip.writestr(f"{root_dir}/request_warc_headers.csv", write_denormalized_csv(request_warc_rows))
-        outer_zip.writestr(f"{root_dir}/metadata.csv", write_denormalized_csv(metadata_rows))
+        for name, rows in (
+            ("response_warc_headers", response_warc_rows),
+            ("response_http_headers", response_http_rows),
+            ("request_warc_headers", request_warc_rows),
+            ("request_http_headers", request_http_rows),
+            ("metadata", metadata_rows),
+            ("warcinfo", warcinfo_rows),
+        ):
+            content, n = write_denormalized_csv(rows, label=f"{name}.csv")
+            outer_zip.writestr(f"{root_dir}/{name}.csv", content)
+            skipped += n
 
         # Write multiline CSVs
-        outer_zip.writestr(f"{root_dir}/response_warc_headers_multi.csv", write_multiline_csv(response_warc_multi))
-        outer_zip.writestr(f"{root_dir}/response_http_headers_multi.csv", write_multiline_csv(response_http_multi))
-        outer_zip.writestr(f"{root_dir}/request_warc_headers_multi.csv", write_multiline_csv(request_warc_multi))
-        outer_zip.writestr(f"{root_dir}/metadata_multi.csv", write_multiline_csv(metadata_multi))
+        for name, rows in (
+            ("response_warc_headers_multi", response_warc_multi),
+            ("response_http_headers_multi", response_http_multi),
+            ("request_warc_headers_multi", request_warc_multi),
+            ("request_http_headers_multi", request_http_multi),
+            ("metadata_multi", metadata_multi),
+            ("warcinfo_multi", warcinfo_multi),
+        ):
+            content, n = write_multiline_csv(rows, label=f"{name}.csv")
+            outer_zip.writestr(f"{root_dir}/{name}.csv", content)
+            skipped += n
 
     print(
         f"Created {output_path}: {response_count} responses, "
         f"{request_count} requests, {metadata_count} metadata records"
+        + (" (metadata only, no payloads written)" if metadata_only else "")
     )
+    if skipped:
+        print(f"warning: {skipped} CSV row(s) could not be written (see warnings above)", file=sys.stderr)
+
+    return skipped
 
 
 def format_login_provider_error(input_file, profile, error):
@@ -510,7 +832,16 @@ def cli():
     parser = argparse.ArgumentParser(description="Convert a gzipped WARC file into a zip-of-zips archive.")
     parser.add_argument("input_file", help="Path to a .warc.gz file")
     parser.add_argument("--output", default=None, help="Output zip path (default: replace .warc.gz with .zip)")
-    parser.add_argument("--dry-run", action="store_true", help="Skip processing, just print summary")
+
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                        help=f"Skip processing, just print summary. Scans at most {DRY_RUN_MAX} capture records.")
+    mode.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Write every CSV, manifest and sidecar but no payload files. The WARC is still "
+        "streamed in full, so this saves output size, not transfer (use --limit for that).",
+    )
     parser.add_argument(
         "--limit",
         help="Limit to N capture records, with their full set of associated request/metadata records",
@@ -545,13 +876,15 @@ def cli():
             name = name + ".zip"
         output_path = Path(name)
 
+
     try:
-        main(
+        skipped = main(
             input_file,
             str(output_path),
             dry_run=args.dry_run,
             limit=args.limit,
             output_format=args.format,
+            metadata_only=args.metadata_only,
             profile=args.profile,
         )
     except MissingDependencyException as e:
@@ -562,6 +895,9 @@ def cli():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    return 1 if skipped else 0
+
+
 
 if __name__ == "__main__":
-    cli()
+    sys.exit(cli())
