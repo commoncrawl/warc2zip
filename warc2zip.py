@@ -23,8 +23,9 @@ MIME_EXTENSION_OVERRIDES = {
     "text/plain": ".txt",
     "image/jpeg": ".jpg",
     # ARC-era Heritrix wrote DNS lookups as their own records with this type. It has no
-    # registered extension, but the body is plain text, so don't let it fall through to ".unk".
-    "text/dns": ".bin",
+    # registered extension, and ".txt" would say less than the archive knows, so name it after
+    # the type rather than after the fact that the body happens to be readable.
+    "text/dns": ".dns",
 }
 
 # Pseudo-header carrying the content-type the ARC record itself declared. warcio's ARC->WARC

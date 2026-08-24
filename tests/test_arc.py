@@ -24,7 +24,7 @@ import zipfile
 
 import pytest
 
-from warc2zip import extract_crawl_name, main, open_archive_iterator
+from warc2zip import extract_crawl_name, main, open_archive_iterator, path_extension_override
 
 ARC_NAME = "TEST-EOT-2004-20041014205819-00000.arc"
 
@@ -67,13 +67,13 @@ CAPTURES = [
         ("dns:ntsb.gov", "207.241.224.11", "20041014205819", "text/dns"),
         b"20041014205819\nntsb.gov.\t\t600\tIN\tA\t199.173.155.8\n",
         "text/dns",
-        ".txt",
+        ".dns",
     ),
     (
         ("dns:4women.gov", "207.241.224.11", "20041014205818", "text/dns"),
         b"20041014205818\n4women.gov.\t\t86400\tIN\tA\t12.20.225.1\n",
         "text/dns",
-        ".txt",
+        ".dns",
     ),
     (
         ("http://sba.gov/robots.txt", "199.171.55.3", "20041014205821", "text/plain"),
