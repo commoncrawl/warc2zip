@@ -468,3 +468,13 @@ FIXME: all 3 of these download to the same zip name
 #### Heretrix-style arcs from EOT 2004 (arc is the predecessor to warc)
 
 - crawl-data/EOT-2004/segments/NARA-000/warc/NARA-PEOT-2004-20041014205819-00000-crawling009-c_NARA-PEOT-2004-20041014205819-00000-crawling009.archive.org.arc.gz
+
+## Old CCF ARCs
+
+- prefix: s3://commoncrawl/
+- crawl-001/2008/06/19/0/1213886083018_0.arc.gz
+
+## Cuil 2012
+
+- prefix: not public
+- domainshard-corpus5-large-merge-rev1.00004-of-25000.1000000sample.v1.arc.gz
