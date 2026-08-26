@@ -1,6 +1,12 @@
 # warc2zip
 
-warc2zip converts WARC web archive files into zip archives, while preserving 100% of the metadata.
+`warc2zip` converts WARC web archive files into zip archives, while preserving 100% of the metadata.
+
+The goal of warc2zip is to facilitate low-code and no-code usage of web archives. A researcher
+can make a selection of WARCs, perhaps from an Archive-It collection, perhaps a Browsertrix
+collection, perhaps a repackage of Common Crawl containing just webpages labeled as being in
+Swahili. `warc2zip` then converts these WARCs into zip files containing the web capture payloads,
+with metadata stored as csv (spreadsheet) files.
 
 FIXME: should we always write WARC (all caps) other than filenames?
 
