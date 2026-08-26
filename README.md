@@ -405,11 +405,11 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/h
   ```
 - URLs of federal institutions (response records only, 1/2 GByte), as part of the [End Of Term Archive](https://eotarchive.org/) project: [is_us_federal_CC-MAIN-2025-13.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true)
   - make the zip, note the limit
-  ```
+```
 warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true' --format flat --limit 1000
   ```
   - here is the warcinfo
-  ```
+```
   software: pypi_cdx_toolkit/0.9.40.dev91+ga04800ea0
   isPartOf: CC-MAIN-2025-13
   description: Repackage of CC-MAIN-2025-13 containing only response records of US federal government hosts
