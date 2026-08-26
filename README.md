@@ -2,8 +2,10 @@
 
 warc2zip converts WARC web archive files into zip archives, while preserving 100% of the metadata.
 
+FIXME: should we always write WARC (all caps) other than filenames?
+
 Each response record's payload is stored as a individual file with a proper extension, derived from its Content-Type.
-Metadata from the request, response, and metadata records are  written to CSV (spreadsheet) files.
+Metadata (both WARC and http) from the request, response, and metadata records are  written to CSV (spreadsheet) files.
 
 > [!WARNING]
 > **Feedback is welcome**: this project is in early development. Feel free to open an issue or submit
@@ -32,6 +34,8 @@ Input can be a local path or a remote URI (S3, HTTP, etc.):
 warc2zip s3://commoncrawl/crawl-data/.../CC-MAIN-....warc.gz
 warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 ```
+
+**Note**: Please use s3 inside of AWS and https outside.
 
 **Note**: `s3://commoncrawl` does **not** allow anonymous access — requests must be signed with credentials from any AWS account. To fetch Common Crawl data without an AWS account, use the HTTPS endpoint (`https://data.commoncrawl.org/...`) instead.
 
@@ -315,7 +319,11 @@ The intended workflow is: convert once with `--metadata-only` (a few tens of KB 
 # 1. metadata only — no payloads
 warc2zip 'https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz' --metadata-only --output meta.zip
 unzip -p meta.zip '*/manifest.csv' > manifest.csv
+```
 
+FIXME: replace 2. with grep and csv sorts of instructions
+
+```
 # 2. filter it with whatever you already use — here, everything that came back 200
 python - <<'EOF'
 import csv
@@ -326,7 +334,13 @@ with open("subset.csv", "w", newline="") as fh:
     w.writeheader()
     w.writerows(rows)
 EOF
+```
 
+FIXME: replace 3. by expending warc2zip to do this download, with
+appropriate retrying and rate limits. That might mean installing
+cdx_toolkit and using it for this step.
+
+```
 # 3. fetch each surviving row — every row already knows where it came from
 python - <<'EOF'
 import csv, urllib.request
@@ -403,3 +417,48 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/i
   creator: Common Crawl Foundation <https://commoncrawl.org>
   operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
   ```
+
+## Many more WARC examples for testing
+
+### Common Crawl style repackaged warcs (intended for testing)
+
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true (13 MBytes)
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true (1 GByte)
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true (1/2 GByte)
+
+FIXME REPACKAGE should be in the name. Are these also on s3://commoncrawl/ ? projects/warc2zip-examples ?
+
+### Normal Common Crawl CC-MAIN warcs
+
+- prefixes: https://data.commoncrawl.org/ or s3://commoncrawl/
+- crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/warc/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
+- crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/crawldiagnostics/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
+- crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/robotstxt/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
+
+FIXME: all 3 of these download to the same zip name
+
+### End Of Term Archive (https://eotarchive.org/data/)
+
+- prefixes: https://eotarchive.s3.amazonaws.com/ or s3://eotarchive/
+
+#### Heretrix/IA style warcs from EOT 2024
+
+- crawl-data/EOT-2024/segments/IA-000/EOT24PRE-20240926172119-crawl804_EOT24PRE-20240926172119-00000.warc.gz
+
+#### Nutch/CCF style warcs from EOT 2024
+
+- crawl-data/EOT-2024/segments/CC-000/warc/EOT-2024-REPACKAGE-CC-MAIN-2024-42-GOV-000000-001.warc.gz
+
+#### Browsertrix style WARCs, EOT 2024
+
+- crawl-data/EOT-2024/segments/WR-000/warc/EOT24WR-0015_20250114215650265-8c53efcc-e2d-0_eot-http-energy-gov-eere-office-energy-efficiency-renewable-energy-manual-20250114215335-8c53efcc-e2d-20250114215647018-0.warc.gz
+- crawl-data/EOT-2024/segments/WR-000/warc/EOT24WR-0015_20250114215650265-8c53efcc-e2d-0_eot-http-energy-gov-eere-office-energy-efficiency-renewable-energy-manual-20250114215335-8c53efcc-e2d-screenshots-20250114215649547.warc.gz
+- crawl-data/EOT-2024/segments/WR-000/warc/EOT24WR-0015_20250114215650265-8c53efcc-e2d-0_eot-http-energy-gov-eere-office-energy-efficiency-renewable-energy-manual-20250114215335-8c53efcc-e2d-text-20250114215649747.warc.gz
+
+#### ArchiveTeam style megawarcs, EOT 2024 (warning: 10 gigabytes)
+
+- crawl-data/EOT-2024/segments/AT-000/warc/archiveteam_usgovernment_20250131232111_96ad506d_usgovernment_20250131232111_96ad506d.1738361595.megawarc.warc.gz
+
+#### Heretrix-style arcs from EOT 2004 (arc is the predecessor to warc)
+
+- crawl-data/EOT-2004/segments/NARA-000/warc/NARA-PEOT-2004-20041014205819-00000-crawling009-c_NARA-PEOT-2004-20041014205819-00000-crawling009.archive.org.arc.gz
