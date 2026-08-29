@@ -49,6 +49,35 @@ ARC_CONTENT_TYPE_HEADER = "ARC-Content-Type"
 DRY_RUN_MAX = 10  # hard cap on capture records scanned by --dry-run
 
 
+class CountingStream(io.IOBase):
+    def __init__(self, raw_stream):
+        self._stream = raw_stream
+        self._bytes_read = 0
+
+    def tell(self):
+        """Acts as the progress tracker for progress bar libraries."""
+        return self._bytes_read
+
+    def read(self, size=-1):
+        data = self._stream.read(size)
+        if data:
+            self._bytes_read += len(data)
+        return data
+
+    def readline(self, size=-1):
+        data = self._stream.readline(size)
+        if data:
+            self._bytes_read += len(data)
+        return data
+
+    # Forward other essential methods to the underlying stream
+    def readable(self):
+        return getattr(self._stream, 'readable', lambda: True)()
+
+    def close(self):
+        self._stream.close()
+
+
 class _ARC2WARCKeepMime(ARC2WARCHeadersParser):
     """warcio's ARC->WARC header mapper, minus the content-type amnesia.
 
@@ -638,7 +667,10 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         sample_mimes = set()
         limit_reached = False
 
-        with fsspec_open(input_file, "rb") as stream:
+        with fsspec_open(input_file, "rb", default_fh=sys.stdin.buffer) as stream:
+            if not hasattr(stream, "tell") or stream == sys.stdin.buffer:
+                # sys.stdin.buffer has a tell() method but it crashes
+                stream = CountingStream(stream)
             with tqdm(total=file_size, unit="B", unit_scale=True, desc="Scanning") as pbar:
                 for record in open_archive_iterator(stream):
                     if limit_reached and record.rec_type == "response":
@@ -693,7 +725,10 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     # response -> Record id  <-> metadata -
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as outer_zip:
         # Pass 1: Read WARC, write payloads immediately, buffer only headers
-        with fsspec_open(input_file, "rb") as stream:
+        with fsspec_open(input_file, "rb", default_fh=sys.stdin.buffer) as stream:
+            if not hasattr(stream, "tell") or stream == sys.stdin.buffer:
+                # sys.stdin.buffer has a tell() method but it crashes
+                stream = CountingStream(stream)
             pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
             # Held by name rather than iterated anonymously: get_record_offset() /
             # get_record_length() hang off the iterator, not the record.
@@ -919,7 +954,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
 
 def cli():
     parser = argparse.ArgumentParser(description="Convert a gzipped WARC file into a zip-of-zips archive.")
-    parser.add_argument("input_file", help="Path to a .warc.gz file")
+    parser.add_argument("input_file", help="Path to a .warc.gz file, or '-' for stdin")
     parser.add_argument("--output", default=None, help="Output zip path (default: replace .warc.gz with .zip)")
 
     mode = parser.add_mutually_exclusive_group()

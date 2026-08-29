@@ -478,3 +478,9 @@ FIXME: all 3 of these download to the same zip name
 
 - prefix: not public
 - domainshard-corpus5-large-merge-rev1.00004-of-25000.1000000sample.v1.arc.gz
+
+## TODO
+
+- CC-NEWS - old, pre-upgrade, post-upgrade
+- ArchiveTeam warcs (not megawarcs)
+- ArchiveIt old and new, for various flavors
