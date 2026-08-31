@@ -50,9 +50,9 @@ ARC_CONTENT_TYPE_HEADER = "ARC-Content-Type"
 DRY_RUN_MAX = 10  # hard cap on capture records scanned by --dry-run
 
 # The record types main() actually consumes, in the order the summary table lists them.
-# Anything else (revisit, resource, conversion, continuation, ...) is read and discarded, and
-# the table printed by format_record_type_summary() is the only place it shows up at all.
-EXTRACTED_RECORD_TYPES = ("warcinfo", "response", "request", "metadata")
+# Anything else (resource, conversion, continuation, ...) is read and discarded, and the
+# table printed by format_record_type_summary() is the only place it shows up at all.
+EXTRACTED_RECORD_TYPES = ("warcinfo", "response", "revisit", "request", "metadata")
 
 
 class CountingStream(io.IOBase):
@@ -140,6 +140,12 @@ class RecordGroup:
     http_status_line: str = ""  # Full HTTP status line, e.g. "HTTP/1.1 200 OK"
     response_domain: str = ""  # Domain from WARC-Target-URI, e.g. "example.com"
     concurrent_to: str = ""  # WARC-Concurrent-To from the response record (points to request)
+    # "response" or "revisit". A revisit capture gets every CSV row a response does, but no
+    # payload file: its content lives in an earlier capture, named by the refers_to_* fields.
+    warc_type: str = "response"
+    refers_to_record_id: str = ""  # WARC-Refers-To (on CC revisits: the request's record id)
+    refers_to_target_uri: str = ""  # WARC-Refers-To-Target-URI
+    refers_to_date: str = ""  # WARC-Refers-To-Date (absent on ~2% of CC revisits)
     requests: list[list[tuple[str, str]]] = field(default_factory=list)
     request_http_headers: list[list[tuple[str, str]]] = field(default_factory=list)
     request_http_lines: list[str] = field(default_factory=list)  # e.g. "GET /path HTTP/1.1"
@@ -397,6 +403,9 @@ def request_line_pairs(line):
 
 MANIFEST_COLUMNS = (
     "filename",
+    # "response" or "revisit". Revisit rows name no file in the zip (their filename is the
+    # synthetic {counter}.revisit key); filter warc_type == "response" for the files that exist.
+    "warc_type",
     "warc_record_id",
     "warc_target_uri",
     "warc_date",
@@ -404,6 +413,10 @@ MANIFEST_COLUMNS = (
     "detected_mime_type",
     "content_type_header",
     "payload_size",
+    # The re-fetch pointer of a revisit: which capture holds the content this one deduplicated.
+    # Empty on response rows (and warc_refers_to_date is absent on a few CC revisits).
+    "warc_refers_to_target_uri",
+    "warc_refers_to_date",
     # Where this record came from: enough to re-fetch it from this row alone, with no join
     # against warcinfo.csv and no knowledge of the zip it was extracted from.
     "warc_filename",
@@ -596,6 +609,7 @@ def build_group_metadata(group, warc_filename="", source_uri=""):
     # JSONL manifest entry
     jsonl_entry = {
         "filename": payload_filename,
+        "warc_type": group.warc_type,
         # Blank rather than a per-run random UUID when the source was an ARC: the field does not
         # exist in ARC/1.1. warc_record_offset/length still make the row re-fetchable on its own.
         "warc_record_id": "" if group.response_record_id_synthetic else (group.response_record_id or ""),
@@ -605,6 +619,8 @@ def build_group_metadata(group, warc_filename="", source_uri=""):
         "detected_mime_type": group.response_mime_type or "application/octet-stream",
         "content_type_header": group.content_type_header,
         "payload_size": group.payload_size,
+        "warc_refers_to_target_uri": group.refers_to_target_uri,
+        "warc_refers_to_date": group.refers_to_date,
         "warc_filename": warc_filename,
         "source_uri": source_uri,
         "warc_record_offset": "" if group.response_offset is None else group.response_offset,
@@ -699,17 +715,17 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                 stream = CountingStream(stream)
             with tqdm(total=file_size, unit="B", unit_scale=True, desc="Scanning") as pbar:
                 for record in open_archive_iterator(stream):
-                    if limit_reached and record.rec_type == "response":
+                    if limit_reached and record.rec_type in ("response", "revisit"):
                         break
                     record_types[record.rec_type] += 1
                     record.content_stream().read()
-                    if record.rec_type == "response":
+                    if record.rec_type in ("response", "revisit"):
                         uri = record.rec_headers.get_header("WARC-Target-URI") or "unknown"
                         mime = detect_mime_type(record)
                         if len(sample_uris) < 5:
                             sample_uris.append(uri)
                         sample_mimes.add(mime)
-                        if limit is not None and record_types["response"] >= limit:
+                        if limit is not None and record_types["response"] + record_types["revisit"] >= limit:
                             limit_reached = True
                     pbar.update(stream.tell() - pbar.n)
 
@@ -756,9 +772,9 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             for record in record_iter:
                 rec_type = record.rec_type
 
-                if limit_reached and rec_type == "response":
+                if limit_reached and rec_type in ("response", "revisit"):
                     break
-                # Counted after the --limit break so the unconsumed next response stays out,
+                # Counted after the --limit break so the unconsumed next capture stays out,
                 # and before the warcinfo `continue` so every record read is in the table.
                 record_types[rec_type] += 1
 
@@ -783,7 +799,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                 if root_dir is None:
                     root_dir = build_root_dir_name(fallback_crawl_name, limit is not None)
 
-                if rec_type == "response":
+                if rec_type in ("response", "revisit"):
                     record_id = record.rec_headers.get_header("WARC-Record-ID")
                     target_uri = record.rec_headers.get_header("WARC-Target-URI")
                     # ARC has no record IDs; warcio mints one per record so the grouping dict
@@ -791,11 +807,25 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     is_arc = is_arc_record(record)
 
                     group = groups.setdefault(record_id, RecordGroup())
+                    group.warc_type = rec_type
                     group.concurrent_to = record.rec_headers.get_header("WARC-Concurrent-To") or ""
+                    if rec_type == "revisit":
+                        # CC's revisit names its request in WARC-Refers-To and carries no
+                        # WARC-Concurrent-To. A spec-conformant Refers-To names the original
+                        # capture instead — an id that is never in pending_requests — so using
+                        # it as a join candidate cannot mislink.
+                        group.refers_to_record_id = record.rec_headers.get_header("WARC-Refers-To") or ""
+                        group.refers_to_target_uri = record.rec_headers.get_header("WARC-Refers-To-Target-URI") or ""
+                        group.refers_to_date = record.rec_headers.get_header("WARC-Refers-To-Date") or ""
                     payload = record.content_stream().read()
                     group.response_mime_type = detect_mime_type(record)
-                    ext = choose_extension(group.response_mime_type, target_uri or "")
-                    payload_filename = f"{counter}{ext}"
+                    if rec_type == "revisit":
+                        # Synthetic key for the CSVs; no such file is ever written to the zip,
+                        # and the name itself says why (a revisit has no body of its own).
+                        payload_filename = f"{counter}.revisit"
+                    else:
+                        ext = choose_extension(group.response_mime_type, target_uri or "")
+                        payload_filename = f"{counter}{ext}"
 
                     # Extract domain for sidecar format directory grouping
                     domain = urlparse(target_uri).netloc if target_uri else "unknown"
@@ -805,7 +835,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         zip_path = f"{root_dir}/{group.response_domain}/{payload_filename}"
                     else:
                         zip_path = f"{root_dir}/{payload_filename}"
-                    if not metadata_only:
+                    if not metadata_only and rec_type == "response":
                         outer_zip.writestr(zip_path, payload)
 
                     group.payload_filename = payload_filename
@@ -825,7 +855,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     group.response_order = order_counter
                     order_counter += 1
                     counter += 1
-                    if limit is not None and record_types["response"] >= limit:
+                    if limit is not None and record_types["response"] + record_types["revisit"] >= limit:
                         limit_reached = True
 
                 elif rec_type == "request":
@@ -866,12 +896,18 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                 pbar.update(stream.tell() - pbar.n)
             pbar.close()
 
-        # Link pending requests to their response groups via WARC-Concurrent-To
+        # Link pending requests to their capture groups. A response names its request in
+        # WARC-Concurrent-To; a CC revisit names it in WARC-Refers-To instead, so both are
+        # tried (only ids that actually belong to a request record can match).
         linked_request_ids = set()
         for group in groups.values():
-            if group.concurrent_to and group.concurrent_to in pending_requests:
-                linked_request_ids.add(group.concurrent_to)
-                for req in pending_requests[group.concurrent_to]:
+            request_id = next(
+                (rid for rid in (group.concurrent_to, group.refers_to_record_id) if rid and rid in pending_requests),
+                None,
+            )
+            if request_id:
+                linked_request_ids.add(request_id)
+                for req in pending_requests[request_id]:
                     group.requests.append(req["warc_headers"])
                     group.request_http_headers.append(req["http_headers"])
                     group.request_http_lines.append(req["http_request_line"])
@@ -880,24 +916,24 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     group.request_lengths.append(req["length"])
 
         # Two audits feed one warning, because they see different things. A group is only ever
-        # created by a response or a metadata record, so orphan groups are metadata-anchored
-        # captures whose anchor was not a `response` (a revisit, on Common Crawl). Requests are
-        # joined from the response side and never create a group, so a request whose response
-        # never appeared — or was a revisit — is invisible to the first audit and only the
-        # second sees it. The two record counts are exact and run in parallel with the capture
-        # count (each dropped capture loses its request AND its metadata record) — they are not
-        # a partition of it, which is why the message says "along with their". The capture count
-        # is the best available figure, since nothing links an unclaimed request to an orphan
-        # group (on CC they are the same captures, on a producer with no metadata records only
-        # requests exist). Either way the whole capture is dropped from every output file, not
-        # just the payload: pass 2 below iterates only groups with a payload_filename.
+        # created by a response/revisit or a metadata record, so orphan groups are
+        # metadata-anchored captures whose anchor record is missing (truncated input) or of a
+        # type that is not extracted (e.g. resource). Requests are joined from the capture side
+        # and never create a group, so a request whose capture record never appeared is
+        # invisible to the first audit and only the second sees it. The two record counts are
+        # exact and run in parallel with the capture count (each dropped capture loses its
+        # request AND its metadata record) — they are not a partition of it, which is why the
+        # message says "along with their". The capture count is the best available figure, since
+        # nothing links an unclaimed request to an orphan group. Either way the whole capture is
+        # dropped from every output file, not just the payload: pass 2 below iterates only
+        # groups with a payload_filename.
         orphan_groups = [g for g in groups.values() if not g.payload_filename]
         dropped_metadata = sum(len(g.metadata_entries) for g in orphan_groups)
         unlinked_requests = sum(len(v) for k, v in pending_requests.items() if k not in linked_request_ids)
         if orphan_groups or unlinked_requests:
             print(
                 f"Warning: skipped {max(len(orphan_groups), unlinked_requests)} capture(s) that have no "
-                f"response record (e.g. revisits), along with their {unlinked_requests} request and "
+                f"response record, along with their {unlinked_requests} request and "
                 f"{dropped_metadata} metadata records",
                 file=sys.stderr,
             )
@@ -981,8 +1017,9 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             outer_zip.writestr(f"{root_dir}/{name}.csv", content)
             skipped += n
 
+    revisit_part = f", {record_types['revisit']} revisits" if record_types["revisit"] else ""
     print(
-        f"Created {output_path}: {record_types['response']} responses, "
+        f"Created {output_path}: {record_types['response']} responses{revisit_part}, "
         f"{record_types['request']} requests, {record_types['metadata']} metadata records"
         + (" (metadata only, no payloads written)" if metadata_only else "")
     )

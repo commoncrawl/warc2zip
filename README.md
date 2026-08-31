@@ -101,19 +101,18 @@ Every CSV, manifest, warcinfo file and sidecar is written exactly as it would be
 Every run ends with a summary line, a table of every record read, and, when something was left out, a warning on stderr. This is a Common Crawl `crawldiagnostics/` file:
 
 ```
-Created CC-MAIN-20260807101845-20260807131845-00000.zip: 3639 responses, 3789 requests, 3789 metadata records
+Created CC-MAIN-20260807101845-20260807131845-00000.zip: 3639 responses, 150 revisits, 3789 requests, 3789 metadata records
 Record types:
   warcinfo     1
   response  3639
+  revisit    150
   request   3789
   metadata  3789
-  revisit    150  (not extracted)
-Warning: skipped 150 capture(s) that have no response record (e.g. revisits), along with their 150 request and 150 metadata records
 ```
 
 ### The `Record types` table
 
-One row per `WARC-Type` found in the file, so the table always adds up to the number of records read. warc2zip extracts four types, listed first; everything else is read and discarded, and flagged `(not extracted)`. The table is the only place such a record is visible at all, so if a WARC seems to be "missing" captures, look here first.
+One row per `WARC-Type` found in the file, so the table always adds up to the number of records read. warc2zip extracts five types, listed first; everything else is read and discarded, and flagged `(not extracted)`. The table is the only place such a record is visible at all, so if a WARC seems to be "missing" captures, look here first.
 
 WARC 1.1 defines eight record types. Seven occur in crawl WARCs; the eighth, `conversion`, holds a transformed copy of a response (Common Crawl's WET files — the extracted plain text — are made of nothing else) and does not appear in the `warc/` family.
 
@@ -123,7 +122,7 @@ WARC 1.1 defines eight record types. Seven occur in crawl WARCs; the eighth, `co
 | `response`     | A complete HTTP response — status line, headers and body — for `WARC-Target-URI`. The anchor of a capture.                                                                                              | Everyone. ARC records are read as this type.                                                                  | Extracted → the payload file and the `manifest.csv` row                                      |
 | `request`      | The HTTP request that produced a response. Linked to it by `WARC-Concurrent-To` (on the response, in CC and wget output).                                                                               | CC, Heritrix, wget, Browsertrix                                                                               | Extracted → `request_*.csv`, `.request.*` sidecars                                           |
 | `metadata`     | Crawler-side facts about a capture, as `application/warc-fields`: `fetchTimeMs`, detected charset and languages, outlinks. `WARC-Concurrent-To` names the record it describes.                          | CC, Heritrix. wget writes one for its own log; Browsertrix does not write them                                | Extracted → `metadata.csv` (body flattened), `metadata_multi.csv` (body raw), `.metadata.*` sidecars |
-| `revisit`      | A capture whose content was **not stored** because it duplicates an earlier one. Two profiles: `server-not-modified` (a `304`, headers only) and `identical-payload-digest` (fetched, same hash, body discarded). `WARC-Refers-To-Target-URI` / `-Date` say which capture holds the bytes. | CC `crawldiagnostics/`, Heritrix, Browsertrix, wget with `--warc-dedup`                                       | Not extracted; the capture is reported by the warning                                        |
+| `revisit`      | A capture whose content was **not stored** because it duplicates an earlier one. Two profiles: `server-not-modified` (a `304`, headers only) and `identical-payload-digest` (fetched, same hash, body discarded). `WARC-Refers-To-Target-URI` / `-Date` say which capture holds the bytes. | CC `crawldiagnostics/`, Heritrix, Browsertrix, wget with `--warc-dedup`                                       | Extracted → a `manifest.csv` row and every header CSV, but no payload file; the row's `warc_refers_to_*` columns say which capture holds the content |
 | `resource`     | A block that *is* the content, with no HTTP transaction around it: DNS lookups (`dns:` URIs, `text/dns`), `ftp://` fetches, screenshots (`urn:screenshot:`), page text, crawler logs.                   | Heritrix (DNS), wget (FTP, its own `wget.log`), Browsertrix and warcprox (screenshots, `urn:pageinfo:`)       | Not extracted. Leaves no other trace — only the table shows it                               |
 | `continuation` | Segment 2..N of a record too large for one file. The first segment is a normal `response` with `WARC-Segment-Number: 1`; the rest carry `WARC-Segment-Origin-ID`.                                       | Heritrix, when configured to segment. **Never Common Crawl**, which truncates at 1 MiB and sets `WARC-Truncated: length` instead | Not extracted. **Caveat:** the first segment *is* a response, so its payload file is written holding only that segment |
 
@@ -131,19 +130,19 @@ Where a producer's habits matter: a `resource` record — how Heritrix stores DN
 
 ### The warning
 
-A **capture** is a response with its request and metadata records. The three are linked by `WARC-Concurrent-To`, and a payload file, a `manifest.csv` row and the rows in every header CSV all hang off the `response`. When the record in the response's place is of another type, the whole capture is dropped — **not just the payload**: there is no manifest row, no rows in `request_*.csv` or `metadata*.csv`, and no sidecar.
+A **capture** is a response (or revisit) with its request and metadata records, and a `manifest.csv` row and the rows in every header CSV all hang off that anchor record. When the anchor is missing or of a type that is not extracted, the whole capture is dropped — **not just the payload** — and a stderr warning accounts for it:
 
-On Common Crawl the cause is almost always a **`revisit`** record, and the numbers match the table (150 revisits, 150 captures). A revisit is CC's dedup record for a `304 Not Modified`: the crawler sent `If-Modified-Since` with the date of its previous capture, the server said nothing changed, so the record holds the 304 headers and no body — the profile is `http://netpreserve.org/warc/1.1/revisit/server-not-modified`. The content is in an earlier crawl, and the record says which one: `WARC-Refers-To-Target-URI` and `WARC-Refers-To-Date` name the URL and the timestamp of the capture it duplicates, which the CC index can resolve to a `warc/` file and offset. A 304 is not a 2xx, which is why revisits live in `crawldiagnostics/` rather than `warc/`.
+```
+Warning: skipped N capture(s) that have no response record, along with their R request and M metadata records
+```
 
-Other things that produce the warning:
+Causes:
 
 - **A truncated file**, or a stream cut off mid-capture — a request whose response never arrived.
 - **A `resource` record with a metadata record pointing at it.** The metadata is counted as dropped; the resource itself only shows in the table.
 - **A producer that writes no metadata records** (wget, Browsertrix). Then only request records can be counted, so the capture figure comes from them.
 
-The capture count is derived from the two record counts (the larger of the two), because nothing in the file links an unclaimed request to an orphaned metadata record. On CC they belong to the same captures; on other producers only one of the two may exist.
-
-Warnings do not change the exit status. warc2zip exits 1 only when a CSV row could not be written (see the message above the summary in that case); a run that dropped captures still exits 0, because the zip it wrote is complete for every capture it did extract.
+Warnings never change the exit status; warc2zip exits 1 only when a CSV row could not be written.
 
 ## Output Formats
 
@@ -322,12 +321,15 @@ The metadata record's `application/warc-fields` body is shallow-flattened: one r
 
 ### manifest.csv
 
-The wide mirror of `manifest.jsonl` — one row per response, one column per key:
+The wide mirror of `manifest.jsonl` — one row per capture (response or revisit), one column per key:
 
 ```csv
-"filename","warc_record_id","warc_target_uri","warc_date","http_status_code","detected_mime_type","content_type_header","payload_size","warc_filename","source_uri","warc_record_offset","warc_record_length"
-"1000000.html","<urn:uuid:12345678-abcd-...>","https://example.com/page","2025-12-15T00:58:13Z","200","text/html","text/html; charset=UTF-8","34521","CC-MAIN-20251215005813-20251215035813-00995.warc.gz","https://data.commoncrawl.org/crawl-data/CC-MAIN-2025-51/segments/.../CC-MAIN-...warc.gz","1062","3585"
+"filename","warc_type","warc_record_id","warc_target_uri","warc_date","http_status_code","detected_mime_type","content_type_header","payload_size","warc_refers_to_target_uri","warc_refers_to_date","warc_filename","source_uri","warc_record_offset","warc_record_length"
+"1000000.html","response","<urn:uuid:12345678-abcd-...>","https://example.com/page","2025-12-15T00:58:13Z","200","text/html","text/html; charset=UTF-8","34521","","","CC-MAIN-20251215005813-20251215035813-00995.warc.gz","https://data.commoncrawl.org/crawl-data/CC-MAIN-2025-51/segments/.../CC-MAIN-...warc.gz","1062","3585"
+"1000038.revisit","revisit","<urn:uuid:9abcdef0-1234-...>","http://avt-studio.de/index.htm","2026-08-07T11:19:40Z","304","application/octet-stream","","0","http://avt-studio.de/index.htm","2026-05-11T12:10:15Z","CC-MAIN-20260807101845-20260807131845-00000.warc.gz","https://data.commoncrawl.org/crawl-data/.../CC-MAIN-...warc.gz","264601","597"
 ```
+
+A `revisit` row names no file in the zip (its `filename` is a synthetic join key): the capture was a `304 Not Modified`, so its content lives in an earlier capture — `warc_refers_to_target_uri` + `warc_refers_to_date` say which one, resolvable through the CC index. Filter `warc_type == "response"` for exactly the files that exist in the zip.
 
 The last four columns are what make a row re-fetchable on its own, and they are repeated on every row on purpose — no join against another file, no knowledge of the zip they came from:
 

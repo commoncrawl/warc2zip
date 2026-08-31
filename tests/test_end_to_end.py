@@ -393,23 +393,29 @@ def test_source_uri_is_recorded_even_without_a_warcinfo_record(tmp_path):
 def test_record_type_summary_is_aligned_and_flags_unextracted_types():
     from collections import Counter
 
-    counts = Counter({"response": 3639, "request": 3789, "metadata": 3789, "revisit": 150, "warcinfo": 1, "resource": 0})
+    counts = Counter(
+        {"response": 3639, "request": 3789, "metadata": 3789, "revisit": 150, "warcinfo": 1, "resource": 12, "conversion": 0}
+    )
     assert format_record_type_summary(counts) == (
         "Record types:\n"
         "  warcinfo     1\n"
         "  response  3639\n"
+        "  revisit    150\n"
         "  request   3789\n"
         "  metadata  3789\n"
-        "  revisit    150  (not extracted)"
+        "  resource    12  (not extracted)"
     )
     assert format_record_type_summary(Counter()) == "Record types: none"
 
 
-def test_revisit_capture_is_dropped_whole_and_accounted_for(warc_path, tmp_path, capsys):
-    """A CC-style revisit capture (request + 304 revisit + metadata) leaves no trace in the zip,
-    so the record-type table and the two warnings are the only place it is visible."""
+def append_revisit_capture(warc_path):
+    """Append a CC-style revisit capture (request + 304 revisit + metadata) to the fixture.
+
+    As CC writes it: no WARC-Concurrent-To anywhere; the revisit names its request in
+    WARC-Refers-To. Every record is its own gzip member, so appending keeps the WARC valid.
+    Returns the capture's target URI.
+    """
     uri = "http://revisited.example.org/index.htm"
-    # Every record is its own gzip member, so appending to the fixture is a valid WARC.
     with open(warc_path, "ab") as fh:
         writer = WARCWriter(fh, gzip=True)
         request = writer.create_warc_record(
@@ -422,7 +428,6 @@ def test_revisit_capture_is_dropped_whole_and_accounted_for(warc_path, tmp_path,
             ),
         )
         writer.write_record(request)
-        # As CC writes it: no WARC-Concurrent-To anywhere; WARC-Refers-To names the request.
         revisit = writer.create_warc_record(
             uri,
             "revisit",
@@ -448,28 +453,69 @@ def test_revisit_capture_is_dropped_whole_and_accounted_for(warc_path, tmp_path,
                 },
             )
         )
+    return uri
+
+
+def test_revisit_capture_is_extracted_without_payload(warc_path, tmp_path, capsys):
+    """A revisit capture gets every CSV row a response does — its request joined through the
+    revisit's WARC-Refers-To — but no payload file: a 304 has no body of its own."""
+    uri = append_revisit_capture(warc_path)
 
     out = tmp_path / "flat.zip"
     main(str(warc_path), str(out), output_format="flat")
     captured = capsys.readouterr()
 
-    assert "Created " in captured.out and ": 3 responses, 4 requests, 4 metadata records" in captured.out
+    assert ": 3 responses, 1 revisits, 4 requests, 4 metadata records" in captured.out
     table = [line.split() for line in captured.out.split("Record types:\n", 1)[1].splitlines()]
-    assert [row[0] for row in table] == ["warcinfo", "response", "request", "metadata", "revisit"]
-    assert {row[0]: int(row[1]) for row in table} == {
-        "warcinfo": 1, "response": 3, "request": 4, "metadata": 4, "revisit": 1,
-    }
-    assert [row[0] for row in table if row[-1] == "extracted)"] == ["revisit"]
-
-    assert (
-        "Warning: skipped 1 capture(s) that have no response record (e.g. revisits), "
-        "along with their 1 request and 1 metadata records"
-    ) in captured.err
+    assert [row[0] for row in table] == ["warcinfo", "response", "revisit", "request", "metadata"]
+    assert not any(row[-1] == "extracted)" for row in table)
+    assert "Warning" not in captured.err
 
     with zipfile.ZipFile(out) as zf:
+        # The synthetic .revisit key names no member of the zip
+        assert not any(n.endswith(".revisit") for n in zf.namelist())
         payloads = [n for n in zf.namelist() if PAYLOAD_RE.match(n.rsplit("/", 1)[-1])]
         assert len(payloads) == 3
-        assert len(read_rows(zf, "manifest.csv")) == 3
-        # Dropped whole: not the payload alone, but the request and metadata records too.
-        for name in csv_members(zf):
-            assert b"revisited.example.org" not in zf.read(name), name
+
+        manifest = [dict(zip(MANIFEST_COLUMNS, row)) for row in read_rows(zf, "manifest.csv")]
+        assert [row["warc_type"] for row in manifest] == ["response"] * 3 + ["revisit"]
+        revisit_row = manifest[-1]
+        assert revisit_row["filename"] == "1000003.revisit"
+        assert revisit_row["http_status_code"] == "304"
+        assert revisit_row["payload_size"] == "0"
+        assert revisit_row["warc_refers_to_target_uri"] == uri
+        assert revisit_row["warc_refers_to_date"] == "2026-05-11T12:10:15Z"
+
+        request_rows = [r for r in read_rows(zf, "request_http_headers.csv") if r[0] == "1000003.revisit"]
+        assert ["1000003.revisit", "if_modified_since", "Mon, 11 May 2026 12:10:15 GMT"] in request_rows
+        response_rows = [r for r in read_rows(zf, "response_http_headers.csv") if r[0] == "1000003.revisit"]
+        assert response_rows[0][1:] == ["status_code", "304"]
+        metadata_rows = [r for r in read_rows(zf, "metadata.csv") if r[0] == "1000003.revisit"]
+        assert any("fetchtimems" in name for _, name, _ in metadata_rows)
+
+    # The --metadata-only invariant extends to revisit captures: metadata is byte-identical
+    meta_out = tmp_path / "meta.zip"
+    main(str(warc_path), str(meta_out), output_format="flat", metadata_only=True)
+
+    def members(path):
+        # strip the randomized root directory so the two runs are comparable
+        with zipfile.ZipFile(path) as inner:
+            return {n.split("/", 1)[1]: inner.read(n) for n in inner.namelist()}
+
+    full_members, meta_members = members(out), members(meta_out)
+    metadata_members = {n for n in full_members if not PAYLOAD_RE.match(n.rsplit("/", 1)[-1])}
+    assert metadata_members == set(meta_members)
+    for name in metadata_members:
+        assert full_members[name] == meta_members[name], name
+
+
+def test_limit_counts_revisit_captures(warc_path, tmp_path):
+    append_revisit_capture(warc_path)
+
+    out = tmp_path / "limited.zip"
+    main(str(warc_path), str(out), limit=4, output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        manifest = [dict(zip(MANIFEST_COLUMNS, row)) for row in read_rows(zf, "manifest.csv")]
+    assert len(manifest) == 4
+    assert manifest[-1]["warc_type"] == "revisit"
