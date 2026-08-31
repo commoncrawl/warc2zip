@@ -108,14 +108,14 @@ Record types:
   request   3789
   metadata  3789
   revisit    150  (not extracted)
-Warning: 150 capture(s) had no response record (e.g. revisits): 150 metadata and 150 request records dropped with them
+Warning: skipped 150 capture(s) that have no response record (e.g. revisits), along with their 150 request and 150 metadata records
 ```
 
 ### The `Record types` table
 
 One row per `WARC-Type` found in the file, so the table always adds up to the number of records read. warc2zip extracts four types, listed first; everything else is read and discarded, and flagged `(not extracted)`. The table is the only place such a record is visible at all, so if a WARC seems to be "missing" captures, look here first.
 
-WARC 1.1 defines eight record types. Seven occur in crawl WARCs; the eighth, `conversion`, is what WET files are made of and is covered in the WET/WAT note below the table.
+WARC 1.1 defines eight record types. Seven occur in crawl WARCs; the eighth, `conversion`, holds a transformed copy of a response (Common Crawl's WET files — the extracted plain text — are made of nothing else) and does not appear in the `warc/` family.
 
 | `WARC-Type`    | What it is                                                                                                                                                                                              | Typical producers                                                                                             | warc2zip                                                                                     |
 |----------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
@@ -131,7 +131,7 @@ Where a producer's habits matter: a `resource` record — how Heritrix stores DN
 
 ### The warning
 
-A **capture** is a response with its request and metadata records. The three are linked by `WARC-Concurrent-To`, and a payload file, a `manifest.csv` row and the rows in every header CSV all hang off the `response`. When the record in the response's place is of another type, the whole capture is dropped — **not just the payload**: there is no manifest row, no rows in `request_*.csv` or `metadata*.csv`, and no sidecar. The warning says how many records went with it; the two record counts are exact.
+A **capture** is a response with its request and metadata records. The three are linked by `WARC-Concurrent-To`, and a payload file, a `manifest.csv` row and the rows in every header CSV all hang off the `response`. When the record in the response's place is of another type, the whole capture is dropped — **not just the payload**: there is no manifest row, no rows in `request_*.csv` or `metadata*.csv`, and no sidecar.
 
 On Common Crawl the cause is almost always a **`revisit`** record, and the numbers match the table (150 revisits, 150 captures). A revisit is CC's dedup record for a `304 Not Modified`: the crawler sent `If-Modified-Since` with the date of its previous capture, the server said nothing changed, so the record holds the 304 headers and no body — the profile is `http://netpreserve.org/warc/1.1/revisit/server-not-modified`. The content is in an earlier crawl, and the record says which one: `WARC-Refers-To-Target-URI` and `WARC-Refers-To-Date` name the URL and the timestamp of the capture it duplicates, which the CC index can resolve to a `warc/` file and offset. A 304 is not a 2xx, which is why revisits live in `crawldiagnostics/` rather than `warc/`.
 
@@ -141,7 +141,7 @@ Other things that produce the warning:
 - **A `resource` record with a metadata record pointing at it.** The metadata is counted as dropped; the resource itself only shows in the table.
 - **A producer that writes no metadata records** (wget, Browsertrix). Then only request records can be counted, so the capture figure comes from them.
 
-The capture count is derived from the two record counts, because nothing in the file links an unclaimed request to an orphaned metadata record. On CC they belong to the same captures; on other producers only one of the two may exist.
+The capture count is derived from the two record counts (the larger of the two), because nothing in the file links an unclaimed request to an orphaned metadata record. On CC they belong to the same captures; on other producers only one of the two may exist.
 
 Warnings do not change the exit status. warc2zip exits 1 only when a CSV row could not be written (see the message above the summary in that case); a run that dropped captures still exits 0, because the zip it wrote is complete for every capture it did extract.
 

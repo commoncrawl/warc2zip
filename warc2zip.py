@@ -884,19 +884,21 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         # captures whose anchor was not a `response` (a revisit, on Common Crawl). Requests are
         # joined from the response side and never create a group, so a request whose response
         # never appeared — or was a revisit — is invisible to the first audit and only the
-        # second sees it. The two record counts are exact; the capture count is the best
-        # available figure, since nothing links an unclaimed request to an orphan group (on CC
-        # they are the same captures, on a producer with no metadata records only requests
-        # exist). Either way the whole capture is dropped from every output file, not just the
-        # payload: pass 2 below iterates only groups with a payload_filename.
+        # second sees it. The two record counts are exact and run in parallel with the capture
+        # count (each dropped capture loses its request AND its metadata record) — they are not
+        # a partition of it, which is why the message says "along with their". The capture count
+        # is the best available figure, since nothing links an unclaimed request to an orphan
+        # group (on CC they are the same captures, on a producer with no metadata records only
+        # requests exist). Either way the whole capture is dropped from every output file, not
+        # just the payload: pass 2 below iterates only groups with a payload_filename.
         orphan_groups = [g for g in groups.values() if not g.payload_filename]
         dropped_metadata = sum(len(g.metadata_entries) for g in orphan_groups)
         unlinked_requests = sum(len(v) for k, v in pending_requests.items() if k not in linked_request_ids)
         if orphan_groups or unlinked_requests:
             print(
-                f"Warning: {max(len(orphan_groups), unlinked_requests)} capture(s) had no response record "
-                f"(e.g. revisits): {dropped_metadata} metadata and {unlinked_requests} request records "
-                f"dropped with them",
+                f"Warning: skipped {max(len(orphan_groups), unlinked_requests)} capture(s) that have no "
+                f"response record (e.g. revisits), along with their {unlinked_requests} request and "
+                f"{dropped_metadata} metadata records",
                 file=sys.stderr,
             )
 

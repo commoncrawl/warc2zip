@@ -462,8 +462,8 @@ def test_revisit_capture_is_dropped_whole_and_accounted_for(warc_path, tmp_path,
     assert [row[0] for row in table if row[-1] == "extracted)"] == ["revisit"]
 
     assert (
-        "Warning: 1 capture(s) had no response record (e.g. revisits): "
-        "1 metadata and 1 request records dropped with them"
+        "Warning: skipped 1 capture(s) that have no response record (e.g. revisits), "
+        "along with their 1 request and 1 metadata records"
     ) in captured.err
 
     with zipfile.ZipFile(out) as zf:
