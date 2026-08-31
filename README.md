@@ -321,25 +321,29 @@ The point of `warc_filename` + `warc_record_offset` + `warc_record_length` is th
 
 The intended workflow is: convert once with `--metadata-only` (a few tens of KB instead of gigabytes), filter the CSV however you like, then pull only the captures you kept.
 
+### Get metadata only — no payloads
 ```bash
-# 1. metadata only — no payloads
 warc2zip 'https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz' --metadata-only --output meta.zip
 unzip -p meta.zip '*/manifest.csv' > manifest.csv
 ```
 
-FIXME: replace 2. with grep and csv sorts of instructions
+### Filter it with whatever you already use
 
+List the column names: 
+```bash
+head -1 manifest.csv | tr ',' '\n' | tr -d '"\r' | nl
 ```
-# 2. filter it with whatever you already use — here, everything that came back 200
-python - <<'EOF'
-import csv
-with open("manifest.csv") as fh:
-    rows = [r for r in csv.DictReader(fh) if r["http_status_code"] == "200"]
-with open("subset.csv", "w", newline="") as fh:
-    w = csv.DictWriter(fh, fieldnames=rows[0].keys(), quoting=csv.QUOTE_ALL)
-    w.writeheader()
-    w.writerows(rows)
-EOF
+
+Filter by column name and value, e.g. get all the 200 responses:
+```bash
+awk -F'","' -v col="http_status_code" -v val="200" '
+NR==1 { for (i=1; i<=NF; i++) { h=$i; gsub(/["\r]/,"",h); if (h==col) c=i } print; next }
+{ v=$c; gsub(/["\r]/,"",v) } v==val
+' manifest.csv > subset.csv
+````
+or with [miller](https://miller.readthedocs.io/en/latest/): 
+```
+mlr --csv filter '$http_status_code == 200' manifest.csv > subset.csv
 ```
 
 FIXME: replace 3. by expending warc2zip to do this download, with
