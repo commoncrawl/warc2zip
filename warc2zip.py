@@ -8,6 +8,7 @@ import re
 import secrets
 import sys
 import zipfile
+from collections import Counter
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +48,11 @@ PATH_EXTENSION_OVERRIDES = {
 ARC_CONTENT_TYPE_HEADER = "ARC-Content-Type"
 
 DRY_RUN_MAX = 10  # hard cap on capture records scanned by --dry-run
+
+# The record types main() actually consumes, in the order the summary table lists them.
+# Anything else (revisit, resource, conversion, continuation, ...) is read and discarded, and
+# the table printed by format_record_type_summary() is the only place it shows up at all.
+EXTRACTED_RECORD_TYPES = ("warcinfo", "response", "request", "metadata")
 
 
 class CountingStream(io.IOBase):
@@ -468,6 +474,28 @@ def write_warcinfo_files(zip_file, root_dir, warcinfos):
     )
 
 
+def format_record_type_summary(counts):
+    """Aligned per-type table of every record read, extracted types first.
+
+    Types outside EXTRACTED_RECORD_TYPES were read and discarded, and are flagged as such:
+    a `resource` record with no metadata pointing at it leaves no other trace in the output.
+    Zero-count types are omitted.
+    """
+    ordered = [t for t in EXTRACTED_RECORD_TYPES if counts.get(t)]
+    ordered += sorted(t for t in counts if t not in EXTRACTED_RECORD_TYPES and counts[t])
+    if not ordered:
+        return "Record types: none"
+    name_width = max(len(t) for t in ordered)
+    count_width = max(len(str(counts[t])) for t in ordered)
+    lines = ["Record types:"]
+    for t in ordered:
+        line = f"  {t:<{name_width}}  {counts[t]:>{count_width}}"
+        if t not in EXTRACTED_RECORD_TYPES:
+            line += "  (not extracted)"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def get_file_size(input_file):
     """Get file size, handling both local paths and remote URIs."""
     try:
@@ -660,9 +688,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                 file=sys.stderr,
             )
 
-        response_count = 0
-        request_count = 0
-        metadata_count = 0
+        record_types = Counter()
         sample_uris = []
         sample_mimes = set()
         limit_reached = False
@@ -675,20 +701,16 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                 for record in open_archive_iterator(stream):
                     if limit_reached and record.rec_type == "response":
                         break
+                    record_types[record.rec_type] += 1
                     record.content_stream().read()
                     if record.rec_type == "response":
-                        response_count += 1
                         uri = record.rec_headers.get_header("WARC-Target-URI") or "unknown"
                         mime = detect_mime_type(record)
                         if len(sample_uris) < 5:
                             sample_uris.append(uri)
                         sample_mimes.add(mime)
-                        if limit is not None and response_count >= limit:
+                        if limit is not None and record_types["response"] >= limit:
                             limit_reached = True
-                    elif record.rec_type == "request":
-                        request_count += 1
-                    elif record.rec_type == "metadata":
-                        metadata_count += 1
                     pbar.update(stream.tell() - pbar.n)
 
         if not limit_reached:
@@ -698,8 +720,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         else:
             limit_note = f" (stopped at --limit {limit})"
         print(
-            f"[dry-run] {response_count} responses, {request_count} requests, "
-            f"{metadata_count} metadata records{limit_note}"
+            f"[dry-run] {record_types['response']} responses, {record_types['request']} requests, "
+            f"{record_types['metadata']} metadata records{limit_note}"
         )
         print(f"[dry-run] Sample URIs: {sample_uris}")
         print(f"[dry-run] Detected mime-types: {sorted(sample_mimes)}")
@@ -717,9 +739,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     input_basename = posixpath.basename(input_file.rstrip("/"))
     fallback_crawl_name = extract_crawl_name(input_basename) if input_basename else "unknown"
 
-    response_count = 0
-    request_count = 0
-    metadata_count = 0
+    record_types = Counter()  # every record read, by WARC-Type — extracted or not
     limit_reached = False
 
     # response -> Record id  <-> metadata -
@@ -738,6 +758,9 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
 
                 if limit_reached and rec_type == "response":
                     break
+                # Counted after the --limit break so the unconsumed next response stays out,
+                # and before the warcinfo `continue` so every record read is in the table.
+                record_types[rec_type] += 1
 
                 if rec_type == "warcinfo":
                     body_text = record.content_stream().read().decode("utf-8", errors="replace")
@@ -802,12 +825,10 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     group.response_order = order_counter
                     order_counter += 1
                     counter += 1
-                    response_count += 1
-                    if limit is not None and response_count >= limit:
+                    if limit is not None and record_types["response"] >= limit:
                         limit_reached = True
 
                 elif rec_type == "request":
-                    request_count += 1
                     body = record.content_stream().read()
                     request_record_id = record.rec_headers.get_header("WARC-Record-ID")
                     req_entry = {
@@ -825,7 +846,6 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     pending_requests.setdefault(request_record_id, []).append(req_entry)
 
                 elif rec_type == "metadata":
-                    metadata_count += 1
                     body = record.content_stream().read()
                     concurrent_to = record.rec_headers.get_header("WARC-Concurrent-To")
 
@@ -847,8 +867,10 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             pbar.close()
 
         # Link pending requests to their response groups via WARC-Concurrent-To
+        linked_request_ids = set()
         for group in groups.values():
             if group.concurrent_to and group.concurrent_to in pending_requests:
+                linked_request_ids.add(group.concurrent_to)
                 for req in pending_requests[group.concurrent_to]:
                     group.requests.append(req["warc_headers"])
                     group.request_http_headers.append(req["http_headers"])
@@ -857,10 +879,26 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     group.request_offsets.append(req["offset"])
                     group.request_lengths.append(req["length"])
 
-        # Warn about orphan records (request/metadata without a matching response)
-        orphan_count = sum(1 for g in groups.values() if not g.payload_filename)
-        if orphan_count:
-            print(f"Warning: {orphan_count} orphan group(s) without a response record, skipped")
+        # Two audits feed one warning, because they see different things. A group is only ever
+        # created by a response or a metadata record, so orphan groups are metadata-anchored
+        # captures whose anchor was not a `response` (a revisit, on Common Crawl). Requests are
+        # joined from the response side and never create a group, so a request whose response
+        # never appeared — or was a revisit — is invisible to the first audit and only the
+        # second sees it. The two record counts are exact; the capture count is the best
+        # available figure, since nothing links an unclaimed request to an orphan group (on CC
+        # they are the same captures, on a producer with no metadata records only requests
+        # exist). Either way the whole capture is dropped from every output file, not just the
+        # payload: pass 2 below iterates only groups with a payload_filename.
+        orphan_groups = [g for g in groups.values() if not g.payload_filename]
+        dropped_metadata = sum(len(g.metadata_entries) for g in orphan_groups)
+        unlinked_requests = sum(len(v) for k, v in pending_requests.items() if k not in linked_request_ids)
+        if orphan_groups or unlinked_requests:
+            print(
+                f"Warning: {max(len(orphan_groups), unlinked_requests)} capture(s) had no response record "
+                f"(e.g. revisits): {dropped_metadata} metadata and {unlinked_requests} request records "
+                f"dropped with them",
+                file=sys.stderr,
+            )
 
         # A WARC without a warcinfo record, or without WARC-Filename on it, still needs a name
         # in the manifest: fall back to what the input was called.
@@ -942,10 +980,11 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             skipped += n
 
     print(
-        f"Created {output_path}: {response_count} responses, "
-        f"{request_count} requests, {metadata_count} metadata records"
+        f"Created {output_path}: {record_types['response']} responses, "
+        f"{record_types['request']} requests, {record_types['metadata']} metadata records"
         + (" (metadata only, no payloads written)" if metadata_only else "")
     )
+    print(format_record_type_summary(record_types))
     if skipped:
         print(f"warning: {skipped} CSV row(s) could not be written (see warnings above)", file=sys.stderr)
 

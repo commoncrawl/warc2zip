@@ -15,7 +15,7 @@ from warcio.archiveiterator import ArchiveIterator
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 
-from warc2zip import MANIFEST_COLUMNS, main
+from warc2zip import MANIFEST_COLUMNS, format_record_type_summary, main
 
 # Payload files are named {counter}{ext}. Sidecars share the payload's full name and add a second
 # suffix (1000000.html.request.json), so a plain endswith(".json") would confuse the two.
@@ -388,3 +388,88 @@ def test_source_uri_is_recorded_even_without_a_warcinfo_record(tmp_path):
     assert ["warcinfo", "source_uri", str(path)] in warcinfo
     # WARC-Filename is unavailable, so the input's own basename stands in
     assert {row[MANIFEST_COLUMNS.index("warc_filename")] for row in rows} == {"no-warcinfo.warc.gz"}
+
+
+def test_record_type_summary_is_aligned_and_flags_unextracted_types():
+    from collections import Counter
+
+    counts = Counter({"response": 3639, "request": 3789, "metadata": 3789, "revisit": 150, "warcinfo": 1, "resource": 0})
+    assert format_record_type_summary(counts) == (
+        "Record types:\n"
+        "  warcinfo     1\n"
+        "  response  3639\n"
+        "  request   3789\n"
+        "  metadata  3789\n"
+        "  revisit    150  (not extracted)"
+    )
+    assert format_record_type_summary(Counter()) == "Record types: none"
+
+
+def test_revisit_capture_is_dropped_whole_and_accounted_for(warc_path, tmp_path, capsys):
+    """A CC-style revisit capture (request + 304 revisit + metadata) leaves no trace in the zip,
+    so the record-type table and the two warnings are the only place it is visible."""
+    uri = "http://revisited.example.org/index.htm"
+    # Every record is its own gzip member, so appending to the fixture is a valid WARC.
+    with open(warc_path, "ab") as fh:
+        writer = WARCWriter(fh, gzip=True)
+        request = writer.create_warc_record(
+            uri,
+            "request",
+            http_headers=StatusAndHeaders(
+                "GET /index.htm HTTP/1.1",
+                [("Host", "revisited.example.org"), ("If-Modified-Since", "Mon, 11 May 2026 12:10:15 GMT")],
+                is_http_request=True,
+            ),
+        )
+        writer.write_record(request)
+        # As CC writes it: no WARC-Concurrent-To anywhere; WARC-Refers-To names the request.
+        revisit = writer.create_warc_record(
+            uri,
+            "revisit",
+            http_headers=StatusAndHeaders("304 Not Modified", [("ETag", '"3820"'), ("Content-Length", "0")], protocol="HTTP/1.1"),
+            warc_headers_dict={
+                "WARC-Profile": "http://netpreserve.org/warc/1.1/revisit/server-not-modified",
+                "WARC-Refers-To": request.rec_headers.get_header("WARC-Record-ID"),
+                "WARC-Refers-To-Target-URI": uri,
+                "WARC-Refers-To-Date": "2026-05-11T12:10:15Z",
+            },
+        )
+        writer.write_record(revisit)
+        body = b"fetchTimeMs: 118\r\n"
+        writer.write_record(
+            writer.create_warc_record(
+                uri,
+                "metadata",
+                payload=io.BytesIO(body),
+                length=len(body),
+                warc_headers_dict={
+                    "WARC-Concurrent-To": revisit.rec_headers.get_header("WARC-Record-ID"),
+                    "Content-Type": "application/warc-fields",
+                },
+            )
+        )
+
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+    captured = capsys.readouterr()
+
+    assert "Created " in captured.out and ": 3 responses, 4 requests, 4 metadata records" in captured.out
+    table = [line.split() for line in captured.out.split("Record types:\n", 1)[1].splitlines()]
+    assert [row[0] for row in table] == ["warcinfo", "response", "request", "metadata", "revisit"]
+    assert {row[0]: int(row[1]) for row in table} == {
+        "warcinfo": 1, "response": 3, "request": 4, "metadata": 4, "revisit": 1,
+    }
+    assert [row[0] for row in table if row[-1] == "extracted)"] == ["revisit"]
+
+    assert (
+        "Warning: 1 capture(s) had no response record (e.g. revisits): "
+        "1 metadata and 1 request records dropped with them"
+    ) in captured.err
+
+    with zipfile.ZipFile(out) as zf:
+        payloads = [n for n in zf.namelist() if PAYLOAD_RE.match(n.rsplit("/", 1)[-1])]
+        assert len(payloads) == 3
+        assert len(read_rows(zf, "manifest.csv")) == 3
+        # Dropped whole: not the payload alone, but the request and metadata records too.
+        for name in csv_members(zf):
+            assert b"revisited.example.org" not in zf.read(name), name
