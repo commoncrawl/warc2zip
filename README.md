@@ -15,7 +15,7 @@ Metadata (both WARC and http) from the request, response, and metadata records a
 
 > [!WARNING]
 > **Feedback is welcome**: this project is in early development. Feel free to open an issue or submit
-> a pull request if you have suggestions, bug reports, or feature requests. See [WARC examples](#example-warc-for-testing) for testing below.
+> a pull request if you have suggestions, bug reports, or feature requests. See [WARC examples](#warc-examples-for-testing) for testing below.
 
 ## Installation
 
