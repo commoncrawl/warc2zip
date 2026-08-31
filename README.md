@@ -98,7 +98,7 @@ Every CSV, manifest, warcinfo file and sidecar is written exactly as it would be
 
 ## Reading the run summary
 
-Every run ends with a summary line, a table of every record read, and — when something was left out — a warning on stderr. This is a Common Crawl `crawldiagnostics/` file:
+Every run ends with a summary line, a table of every record read, and, when something was left out, a warning on stderr. This is a Common Crawl `crawldiagnostics/` file:
 
 ```
 Created CC-MAIN-20260807101845-20260807131845-00000.zip: 3639 responses, 3789 requests, 3789 metadata records
@@ -115,7 +115,7 @@ Warning: 150 capture(s) had no response record (e.g. revisits): 150 metadata and
 
 One row per `WARC-Type` found in the file, so the table always adds up to the number of records read. warc2zip extracts four types, listed first; everything else is read and discarded, and flagged `(not extracted)`. The table is the only place such a record is visible at all, so if a WARC seems to be "missing" captures, look here first.
 
-WARC 1.1 defines eight record types:
+WARC 1.1 defines eight record types. Seven occur in crawl WARCs; the eighth, `conversion`, is what WET files are made of and is covered in the WET/WAT note below the table.
 
 | `WARC-Type`    | What it is                                                                                                                                                                                              | Typical producers                                                                                             | warc2zip                                                                                     |
 |----------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
@@ -125,7 +125,6 @@ WARC 1.1 defines eight record types:
 | `metadata`     | Crawler-side facts about a capture, as `application/warc-fields`: `fetchTimeMs`, detected charset and languages, outlinks. `WARC-Concurrent-To` names the record it describes.                          | CC, Heritrix. wget writes one for its own log; Browsertrix does not write them                                | Extracted → `metadata.csv` (body flattened), `metadata_multi.csv` (body raw), `.metadata.*` sidecars |
 | `revisit`      | A capture whose content was **not stored** because it duplicates an earlier one. Two profiles: `server-not-modified` (a `304`, headers only) and `identical-payload-digest` (fetched, same hash, body discarded). `WARC-Refers-To-Target-URI` / `-Date` say which capture holds the bytes. | CC `crawldiagnostics/`, Heritrix, Browsertrix, wget with `--warc-dedup`                                       | Not extracted; the capture is reported by the warning                                        |
 | `resource`     | A block that *is* the content, with no HTTP transaction around it: DNS lookups (`dns:` URIs, `text/dns`), `ftp://` fetches, screenshots (`urn:screenshot:`), page text, crawler logs.                   | Heritrix (DNS), wget (FTP, its own `wget.log`), Browsertrix and warcprox (screenshots, `urn:pageinfo:`)       | Not extracted. Leaves no other trace — only the table shows it                               |
-| `conversion`   | A transformed copy of another record — a format migration, extracted text — pointing back with `WARC-Refers-To`.                                                                                        | Rare: Internet Archive preservation and derivative workflows                                                  | Not extracted                                                                                |
 | `continuation` | Segment 2..N of a record too large for one file. The first segment is a normal `response` with `WARC-Segment-Number: 1`; the rest carry `WARC-Segment-Origin-ID`.                                       | Heritrix, when configured to segment. **Never Common Crawl**, which truncates at 1 MiB and sets `WARC-Truncated: length` instead | Not extracted. **Caveat:** the first segment *is* a response, so its payload file is written holding only that segment |
 
 Where a producer's habits matter: a `resource` record — how Heritrix stores DNS lookups, and how Browsertrix stores screenshots and page text — is a real capture with a real payload, but since it has no HTTP layer it is not a `response` and is skipped. The pre-2009 ARC format has no record types at all; every ARC record, DNS lookups included, is read as a `response` (see the EOT-2004 examples below), which is why ARC `dns:` records *are* extracted while WARC-era `resource` DNS records are not.
