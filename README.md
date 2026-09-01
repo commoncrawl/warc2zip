@@ -430,17 +430,22 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/i
 
 ## Many more WARC examples for testing
 
-### Common Crawl style repackaged warcs (intended for testing)
+### Common Crawl style repackaged WARCs (intended for testing)
 
-- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true (13 MBytes)
-- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true (1 GByte)
-- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true (1/2 GByte)
+#### HuggingFace: 
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz?download=true (13 MBytes)
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz?download=true (1 GByte)
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz?download=true (1/2 GByte)
 
-FIXME REPACKAGE should be in the name. Are these also on s3://commoncrawl/ ? projects/warc2zip-examples ?
+#### AWS:
+**Prefixes**: https://data.commoncrawl.org/ or `s3://commoncrawl/`:
+- /projects/warc2zip-examples/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz (13 MBytes)
+- /projects/warc2zip-examples/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz (1 GByte)
+- /projects/warc2zip-examples/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz (1/2 GByte)
 
-### Normal Common Crawl CC-MAIN warcs
+### Normal Common Crawl CC-MAIN WARCs
 
-- prefixes: https://data.commoncrawl.org/ or s3://commoncrawl/
+**Prefixes**: https://data.commoncrawl.org/ or `s3://commoncrawl/`: 
 - crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/warc/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
 - crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/crawldiagnostics/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
 - crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/robotstxt/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
@@ -449,7 +454,7 @@ FIXME: all 3 of these download to the same zip name
 
 ### End Of Term Archive (https://eotarchive.org/data/)
 
-- prefixes: https://eotarchive.s3.amazonaws.com/ or s3://eotarchive/
+**Prefixes**: https://eotarchive.s3.amazonaws.com/ or `s3://eotarchive/`: 
 
 #### Heretrix/IA style warcs from EOT 2024
 
