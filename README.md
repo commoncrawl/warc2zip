@@ -334,7 +334,7 @@ List the column names:
 head -1 manifest.csv | tr ',' '\n' | tr -d '"\r' | nl
 ```
 
-Filter by column name and value, e.g. get all the 200 responses:
+Filter by column name and value, e.g. get all the `200` responses from the column `http_status_code`:
 ```bash
 awk -F'","' -v col="http_status_code" -v val="200" '
 NR==1 { for (i=1; i<=NF; i++) { h=$i; gsub(/["\r]/,"",h); if (h==col) c=i } print; next }
