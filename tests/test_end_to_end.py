@@ -9,13 +9,14 @@ import io
 import json
 import re
 import zipfile
+from pathlib import Path
 
 import pytest
 from warcio.archiveiterator import ArchiveIterator
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 
-from warc2zip import MANIFEST_COLUMNS, main
+from warc2zip import MANIFEST_COLUMNS, default_output_path, main
 
 # Payload files are named {counter}{ext}. Sidecars share the payload's full name and add a second
 # suffix (1000000.html.request.json), so a plain endswith(".json") would confuse the two.
@@ -167,6 +168,60 @@ def test_conversion_produces_parseable_csvs(warc_path, tmp_path, output_format):
         ]
         assert len(manifest) == len(CAPTURES)
         assert {entry["warc_target_uri"] for entry in manifest} == {uri for uri, _, _, _ in CAPTURES}
+
+
+RUN_ID_RE = r"\d{8}T\d{6}_[0-9a-f]{4}"
+
+
+@pytest.mark.parametrize("limit", [None, 2])
+def test_default_output_name_follows_the_root_dirs_partial_rule(warc_path, tmp_path, monkeypatch, limit):
+    """No --output: the zip is {basename}[_partial].zip, with _partial iff --limit was given.
+
+    That is the root directory's rule, so the zip name tells you whether it holds a sample.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    main(str(warc_path), output_path=None, limit=limit)
+
+    suffix = "_partial" if limit else ""
+    assert [p.name for p in tmp_path.glob("*.zip")] == [f"test{suffix}.zip"]
+
+    with zipfile.ZipFile(tmp_path / f"test{suffix}.zip") as zf:
+        root_dirs = {n.split("/", 1)[0] for n in zf.namelist()}
+    assert len(root_dirs) == 1
+    assert re.fullmatch(rf"test_{RUN_ID_RE}{suffix}", next(iter(root_dirs)))
+
+
+@pytest.mark.parametrize(
+    ("input_file", "expected"),
+    [
+        # Every input shape the README shows
+        ("archive.warc.gz", "archive.zip"),
+        ("/data/crawls/archive.warc.gz", "archive.zip"),
+        ("s3://commoncrawl/crawl-data/CC-MAIN-2026-34/segments/x/warc/CC-MAIN-0000.warc.gz", "CC-MAIN-0000.zip"),
+        ("https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-34/warc/CC-MAIN-0000.warc.gz", "CC-MAIN-0000.zip"),
+        (
+            "https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/"
+            "CC-MAIN-2026-30-500_records.warc.gz?download=true",
+            "CC-MAIN-2026-30-500_records.zip",
+        ),
+        ("https://eotarchive.s3.amazonaws.com/crawl-data/EOT-2004/NARA-PEOT-2004.arc.gz", "NARA-PEOT-2004.zip"),
+        ("plain.warc", "plain.zip"),
+        ("-", "stdin.zip"),
+    ],
+)
+def test_default_output_path_handles_every_readme_input_shape(input_file, expected):
+    assert default_output_path(input_file).name == expected
+    assert default_output_path(input_file, partial=True).name == expected[: -len(".zip")] + "_partial.zip"
+    # Always the current directory, never the input's
+    assert default_output_path(input_file).parent == Path(".")
+
+
+def test_explicit_output_path_is_used_verbatim(warc_path, tmp_path):
+    out = tmp_path / "chosen-name.zip"
+    main(str(warc_path), str(out), limit=1)
+    assert out.exists()
+    assert list(tmp_path.glob("*.zip")) == [out]
 
 
 def test_nul_from_the_wire_is_escaped_in_the_csv(warc_path, tmp_path):

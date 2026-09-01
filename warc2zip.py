@@ -479,13 +479,42 @@ def get_file_size(input_file):
 def build_root_dir_name(crawl_name, partial=False):
     """Build a unique root directory name from a crawl name.
 
-    Format: {crawl_name}_{YYYYMMDDTHHMMSS}_{4-char hex suffix}
-    The suffix doesn't affect sort order since it comes after the timestamp.
+    Format: {crawl_name}_{YYYYMMDDTHHMMSS}_{4-char hex suffix}[_partial]
+    The hex suffix doesn't affect sort order since it comes after the timestamp. `partial` is
+    set iff --limit was given.
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     suffix = secrets.token_hex(2) if not partial else secrets.token_hex(2) + "_partial"
 
     return f"{crawl_name}_{timestamp}_{suffix}"
+
+
+def input_basename(input_file):
+    """Basename of the input, whatever shape it comes in.
+
+    The README's inputs are local paths, `s3://bucket/key`, `https://host/path`, the same with a
+    query string (`https://huggingface.co/.../X.warc.gz?download=true`), and `-` for stdin. A
+    plain posixpath.basename() keeps the query string, which would put `?download=true` in the
+    zip name and the root directory. URIs are parsed and only the path's last segment kept;
+    stdin has no name and is labelled "stdin".
+    """
+    if input_file == "-":
+        return "stdin"
+    parsed = urlparse(input_file)
+    path = parsed.path if parsed.scheme and parsed.netloc else input_file
+    return posixpath.basename(path.rstrip("/"))
+
+
+def default_output_path(input_file, partial=False):
+    """Default zip path when --output is not given: {input_basename}[_partial].zip.
+
+    The .warc.gz / .warc / .arc.gz / .arc suffix is stripped and .zip appended; `_partial`
+    follows the same rule as the root directory inside the zip (set iff --limit was given).
+    Written to the current directory.
+    """
+    basename = input_basename(input_file)
+    label = extract_crawl_name(basename) if basename else "unknown"
+    return Path(label + ("_partial" if partial else "") + ".zip")
 
 
 def extract_crawl_name(warc_filename):
@@ -648,8 +677,9 @@ def write_sidecar_files(zip_file, root_dir, group):
         zip_file.writestr(f"{base}.metadata.warc-fields", "\n\n".join(body_parts))
 
 
-def main(input_file, output_path, dry_run=False, limit=None, output_format="flat", metadata_only=False):
+def main(input_file, output_path=None, dry_run=False, limit=None, output_format="flat", metadata_only=False):
     file_size = get_file_size(input_file)
+    partial = limit is not None
 
     if dry_run:
         capped = limit is None or limit > DRY_RUN_MAX
@@ -713,14 +743,18 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     warcinfos = []  # list[(warc_header_pairs, body_text, offset, length)] - crawl-level provenance
     warc_filename = ""  # WARC-Filename from the warcinfo record; every manifest row repeats it
 
-    # Fallback crawl name from input filename
-    input_basename = posixpath.basename(input_file.rstrip("/"))
-    fallback_crawl_name = extract_crawl_name(input_basename) if input_basename else "unknown"
+    # Fallback crawl name from input filename (same label default_output_path uses)
+    basename = input_basename(input_file)
+    fallback_crawl_name = extract_crawl_name(basename) if basename else "unknown"
 
     response_count = 0
     request_count = 0
     metadata_count = 0
     limit_reached = False
+
+    # An explicit --output is used verbatim; the default shares the root directory's _partial rule.
+    if output_path is None:
+        output_path = str(default_output_path(input_file, partial))
 
     # response -> Record id  <-> metadata -
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as outer_zip:
@@ -752,13 +786,13 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     if root_dir is None:
                         warc_filename = record.rec_headers.get_header("WARC-Filename") or ""
                         crawl_name = extract_crawl_name(warc_filename) if warc_filename else fallback_crawl_name
-                        root_dir = build_root_dir_name(crawl_name, limit is not None)
+                        root_dir = build_root_dir_name(crawl_name, partial)
                     pbar.update(stream.tell() - pbar.n)
                     continue
 
                 # Resolve root_dir before first payload write if no warcinfo appeared
                 if root_dir is None:
-                    root_dir = build_root_dir_name(fallback_crawl_name, limit is not None)
+                    root_dir = build_root_dir_name(fallback_crawl_name, partial)
 
                 if rec_type == "response":
                     record_id = record.rec_headers.get_header("WARC-Record-ID")
@@ -864,7 +898,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
 
         # A WARC without a warcinfo record, or without WARC-Filename on it, still needs a name
         # in the manifest: fall back to what the input was called.
-        warc_filename = warc_filename or input_basename
+        warc_filename = warc_filename or basename
 
         # Pass 2: Build metadata from buffered headers (payloads already in zip)
         sorted_groups = sorted(
@@ -955,7 +989,12 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
 def cli():
     parser = argparse.ArgumentParser(description="Convert a gzipped WARC file into a zip-of-zips archive.")
     parser.add_argument("input_file", help="Path to a .warc.gz file, or '-' for stdin")
-    parser.add_argument("--output", default=None, help="Output zip path (default: replace .warc.gz with .zip)")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output zip path (default: replace .warc.gz with .zip in the current directory, "
+        "with _partial appended when --limit is set, like the root directory inside)",
+    )
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true",
@@ -980,21 +1019,10 @@ def cli():
     )
     args = parser.parse_args()
 
-    input_file = args.input_file
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        # Extract basename from local path or remote URI
-        name = posixpath.basename(input_file.rstrip("/"))
-        if name.endswith(".warc.gz"):
-            name = name[: -len(".warc.gz")] + ".zip"
-        else:
-            name = name + ".zip"
-        output_path = Path(name)
-
+    # Default output naming lives in main() (see default_output_path).
     skipped = main(
-        input_file,
-        str(output_path),
+        args.input_file,
+        args.output,
         dry_run=args.dry_run,
         limit=args.limit,
         output_format=args.format,
