@@ -8,8 +8,6 @@ collection, perhaps a repackage of Common Crawl containing just webpages labeled
 Swahili. `warc2zip` then converts these WARCs into zip files containing the web capture payloads,
 with metadata stored as csv (spreadsheet) files.
 
-FIXME: should we always write WARC (all caps) other than filenames?
-
 Each response record's payload is stored as a individual file with a proper extension, derived from its Content-Type.
 Metadata (both WARC and http) from the request, response, and metadata records are  written to CSV (spreadsheet) files.
 
@@ -137,7 +135,7 @@ FOO.zip
 - **Denormalized CSVs** (`*_headers.csv`, `metadata.csv`, `warcinfo.csv`): multiple rows per file — columns: `filename, header_name, header_value`. Header names are normalized to lowercase with `-` replaced by `_`.
 - **Multiline CSVs** (`*_multi.csv`): one row per file — columns: `filename, headers` (headers as a multiline string)
 - **`manifest.csv`**: the wide mirror of `manifest.jsonl` — one row per response, one column per key. Both are written from the same entries, so they cannot drift.
-- **`warcinfo.*`**: crawl-level provenance (`isPartOf`, `publisher`, `software`, `hostname`, `conformsTo`, …). The `filename` column carries the synthetic key `warcinfo`, since the record belongs to no payload file; a concatenated WARC with several warcinfo records numbers the extras `warcinfo.1`, `warcinfo.2`, ….
+- **`warcinfo.*`**: crawl-level provenance (`isPartOf`, `publisher`, `software`, `hostname`, `conformsTo`, …). The `filename` column carries the synthetic key `warcinfo`, since the record belongs to no payload file; a concatenated WARC with several `warcinfo` records numbers the extras `warcinfo.1`, `warcinfo.2`, ….
 
 ### Sidecar format (`--format sidecar`)
 
@@ -282,13 +280,13 @@ The wide mirror of `manifest.jsonl` — one row per response, one column per key
 
 The last four columns are what make a row re-fetchable on its own, and they are repeated on every row on purpose — no join against another file, no knowledge of the zip they came from:
 
-| Column | Meaning |
-|---|---|
-| `warc_filename` | What the WARC **calls itself** (the warcinfo record's `WARC-Filename`), falling back to the input's basename. A label — for Common Crawl it is a bare basename, not a fetchable path. |
-| `source_uri` | Where warc2zip **read the file from** — the `input_file` argument, verbatim. **This is the fetch target.** |
-| `warc_record_offset` / `warc_record_length` | Byte range of the record. The same triple a CDX index carries. |
+| Column                                      | Meaning                                                                                                                                                                               |
+|---------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `warc_filename`                             | What the WARC **calls itself** (the `warcinfo` record's `WARC-Filename`), falling back to the input's basename. A label — for Common Crawl it is a bare basename, not a fetchable path. |
+| `source_uri`                                | Where warc2zip **read the file from** — the `input_file` argument, verbatim. **This is the fetch target.**                                                                            |
+| `warc_record_offset` / `warc_record_length` | Byte range of the record. The same triple a CDX index carries.                                                                                                                        |
 
-The offsets are positions in the file named by `source_uri` — that is the only file they are guaranteed to address. `warc_filename` may name a *different* file: a derived WARC (an extract, or the output of `tools/warc_limit.py`) copies the original warcinfo record, so it keeps advertising the original WARC's name while its byte offsets refer to the derived file. Use `source_uri` to fetch, `warc_filename` to say where the records originated. See [Building and downloading a subset](#building-and-downloading-a-subset).
+The offsets are positions in the file named by `source_uri` — that is the only file they are guaranteed to address. `warc_filename` may name a *different* file: a derived WARC (an extract, or the output of `tools/warc_limit.py`) copies the original `warcinfo` record, so it keeps advertising the original WARC's name while its byte offsets refer to the derived file. Use `source_uri` to fetch, `warc_filename` to say where the records originated. See [Building and downloading a subset](#building-and-downloading-a-subset).
 
 ### warcinfo.csv
 
@@ -309,7 +307,7 @@ Crawl-level provenance, with the record body flattened the same way as `metadata
 
 `warcinfo.warc` and `warcinfo.warc-fields` hold the same record as raw wire bytes.
 
-`source_uri` is the input this zip was converted from. It is also a column on every `manifest.csv` row; the copy here is the crawl-level one, written even when the WARC carries no warcinfo record at all, so the provenance is never lost.
+`source_uri` is the input this zip was converted from. It is also a column on every `manifest.csv` row; the copy here is the crawl-level one, written even when the WARC carries no `warcinfo` record at all, so the provenance is never lost.
 
 Both `source_uri` and the `warc_record_*` fields are pseudo-headers — computed while streaming, not read off the wire. A real warcinfo header named `Source-URI` would normalize to the same name; none exists in practice, but the collision is worth knowing about, same as for `status_code`.
 
@@ -368,7 +366,7 @@ Concatenated gzip members are themselves a valid `.warc.gz`, so appending the fe
 Three caveats:
 
 - Fetch with `source_uri`, not `warc_filename`. For Common Crawl the latter is a bare basename like `CC-MAIN-20260618163205-20260618193205-00999.warc.gz`; the full path is `crawl-data/{crawl}/segments/{segment}/warc/{basename}`, and **the segment is not recorded anywhere in the WARC** — `warcinfo.csv` gives you the crawl (`_body.ispartof`) but you would need the crawl's `warc.paths.gz` to resolve the rest.
-- Offsets address the file named by `source_uri`, nothing else. A derived WARC keeps the original's warcinfo record, so its `warc_filename` names a file its offsets do not index.
+- Offsets address the file named by `source_uri`, nothing else. A derived WARC keeps the original's `warcinfo` record, so its `warc_filename` names a file its offsets do not index.
 - Offsets stay valid under `--limit`: limiting only stops the read early, it never rewrites them.
 
 ## WARC examples for testing
