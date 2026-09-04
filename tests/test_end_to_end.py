@@ -9,13 +9,15 @@ import io
 import json
 import re
 import zipfile
+from pathlib import Path
 
 import pytest
+from conftest import CAPTURES
 from warcio.archiveiterator import ArchiveIterator
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 
-from warc2zip import MANIFEST_COLUMNS, format_record_type_summary, main
+from warc2zip import MANIFEST_COLUMNS, default_output_path, format_record_type_summary, main
 
 # Payload files are named {counter}{ext}. Sidecars share the payload's full name and add a second
 # suffix (1000000.html.request.json), so a plain endswith(".json") would confuse the two.
@@ -36,92 +38,6 @@ EXPECTED_CSVS = {
     "warcinfo.csv",
     "warcinfo_multi.csv",
 }
-
-# The shape CC writes into a metadata record's warc-fields body.
-CLD2 = '{"reliable":true,"languages":[{"code":"zh","text-covered":0.87,"name":"Chinese"}]}'
-
-CAPTURES = [
-    (
-        "https://example.com/",
-        "text/html",
-        b"<html><body>hello</body></html>",
-        [("Content-Type", "text/html; charset=UTF-8"), ("Connection", "close\x00")],
-    ),
-    (
-        "https://cloudflare-ish.example.org/index.html",
-        "text/html",
-        b"<html>report-to</html>",
-        [
-            ("Content-Type", "text/html"),
-            ("Report-To", '{"group":"cf-nel","max_age":604800}'),
-            ("Server-Timing", 'cfCacheStatus;desc="DYNAMIC"'),
-            ("Cache-Control", "no-store, must-revalidate, no-cache"),
-        ],
-    ),
-    (
-        "https://plain.example.net/data.json",
-        "application/json",
-        b'{"ok": true}',
-        [("Content-Type", "application/json"), ("X-Fold", "a\r\n b")],
-    ),
-]
-
-
-@pytest.fixture
-def warc_path(tmp_path):
-    """A three-capture WARC: warcinfo + response/request/metadata per capture."""
-    path = tmp_path / "test.warc.gz"
-    with open(path, "wb") as fh:
-        writer = WARCWriter(fh, gzip=True)
-        writer.write_record(writer.create_warcinfo_record("test.warc.gz", {"software": "warc2zip-tests"}))
-        for i, (uri, _mime, payload, headers) in enumerate(CAPTURES):
-            request_id = f"<urn:uuid:req-{i}>"
-
-            http_headers = StatusAndHeaders("200 OK", headers, protocol="HTTP/1.1")
-            response = writer.create_warc_record(
-                uri,
-                "response",
-                payload=io.BytesIO(payload),
-                length=len(payload),
-                http_headers=http_headers,
-                warc_headers_dict={"WARC-Concurrent-To": request_id},
-            )
-            writer.write_record(response)
-            response_id = response.rec_headers.get_header("WARC-Record-ID")
-
-            request_headers = StatusAndHeaders(
-                "GET / HTTP/1.1", [("Host", "example.com"), ("User-Agent", 'cc-bot/1.0 "test"')], is_http_request=True
-            )
-            writer.write_record(
-                writer.create_warc_record(
-                    uri,
-                    "request",
-                    http_headers=request_headers,
-                    warc_headers_dict={"WARC-Record-ID": request_id, "WARC-Concurrent-To": response_id},
-                )
-            )
-
-            body = (
-                b"fetchTimeMs: 42\r\n"
-                b"charset-detected: utf-8\x00\r\n"
-                + f"languages-cld2: {CLD2}\r\n".encode()
-                + b"http-header-user-agent: cc-bot/1.0 (X11; Linux)\r\n"
-                b"  continued-on-the-next-line\r\n"
-            )
-            writer.write_record(
-                writer.create_warc_record(
-                    uri,
-                    "metadata",
-                    payload=io.BytesIO(body),
-                    length=len(body),
-                    warc_headers_dict={
-                        "WARC-Concurrent-To": response_id,
-                        "Content-Type": "application/warc-fields",
-                    },
-                )
-            )
-    return path
-
 
 def csv_members(zf):
     return [n for n in zf.namelist() if n.endswith(".csv")]
@@ -167,6 +83,82 @@ def test_conversion_produces_parseable_csvs(warc_path, tmp_path, output_format):
         ]
         assert len(manifest) == len(CAPTURES)
         assert {entry["warc_target_uri"] for entry in manifest} == {uri for uri, _, _, _ in CAPTURES}
+
+
+RUN_ID_RE = r"\d{8}T\d{6}_[0-9a-f]{4}"
+
+
+@pytest.mark.parametrize("limit", [None, 2])
+def test_default_output_name_follows_the_root_dirs_rule(warc_path, tmp_path, monkeypatch, limit):
+    """No --output: the zip is {basename}_{hex}[_partial].zip, with _partial iff --limit was given.
+
+    That is the root directory's rule, so the zip name tells you whether it holds a sample, and
+    the hex is the *same* one the root directory carries, so a zip on disk can be matched to the
+    directory it extracts to.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    main(str(warc_path), output_path=None, limit=limit)
+
+    suffix = "_partial" if limit else ""
+    zips = [p.name for p in tmp_path.glob("*.zip")]
+    assert len(zips) == 1
+    zip_match = re.fullmatch(rf"test_([0-9a-f]{{4}}){suffix}\.zip", zips[0])
+    assert zip_match, zips[0]
+
+    with zipfile.ZipFile(tmp_path / zips[0]) as zf:
+        root_dirs = {n.split("/", 1)[0] for n in zf.namelist()}
+    assert len(root_dirs) == 1
+    dir_match = re.fullmatch(rf"test_\d{{8}}T\d{{6}}_([0-9a-f]{{4}}){suffix}", next(iter(root_dirs)))
+    assert dir_match, root_dirs
+    assert dir_match.group(1) == zip_match.group(1)
+
+
+def test_default_output_names_do_not_collide_for_same_basename(warc_path, tmp_path, monkeypatch):
+    """CC's warc/, crawldiagnostics/ and robotstxt/ files share a basename: two runs, two zips."""
+    monkeypatch.chdir(tmp_path)
+
+    main(str(warc_path), output_path=None)
+    main(str(warc_path), output_path=None)
+
+    assert len(list(tmp_path.glob("test_*.zip"))) == 2
+
+
+@pytest.mark.parametrize(
+    ("input_file", "expected"),
+    [
+        # Every input shape the README shows
+        ("archive.warc.gz", "archive.zip"),
+        ("/data/crawls/archive.warc.gz", "archive.zip"),
+        ("s3://commoncrawl/crawl-data/CC-MAIN-2026-34/segments/x/warc/CC-MAIN-0000.warc.gz", "CC-MAIN-0000.zip"),
+        ("https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-34/warc/CC-MAIN-0000.warc.gz", "CC-MAIN-0000.zip"),
+        (
+            (
+                "https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/"
+                "CC-MAIN-2026-30-500_records.warc.gz?download=true"
+            ),
+            "CC-MAIN-2026-30-500_records.zip",
+        ),
+        ("https://eotarchive.s3.amazonaws.com/crawl-data/EOT-2004/NARA-PEOT-2004.arc.gz", "NARA-PEOT-2004.zip"),
+        ("plain.warc", "plain.zip"),
+        ("-", "stdin.zip"),
+    ],
+)
+def test_default_output_path_handles_every_readme_input_shape(input_file, expected):
+    label = expected[: -len(".zip")]
+    assert default_output_path(input_file, run_id="abcd").name == f"{label}_abcd.zip"
+    assert default_output_path(input_file, partial=True, run_id="abcd").name == f"{label}_abcd_partial.zip"
+    # Without a run id one is minted, and it is 4 hex chars like the root directory's
+    assert re.fullmatch(rf"{re.escape(label)}_[0-9a-f]{{4}}\.zip", default_output_path(input_file).name)
+    # Always the current directory, never the input's
+    assert default_output_path(input_file).parent == Path(".")
+
+
+def test_explicit_output_path_is_used_verbatim(warc_path, tmp_path):
+    out = tmp_path / "chosen-name.zip"
+    main(str(warc_path), str(out), limit=1)
+    assert out.exists()
+    assert list(tmp_path.glob("*.zip")) == [out]
 
 
 def test_nul_from_the_wire_is_escaped_in_the_csv(warc_path, tmp_path):
