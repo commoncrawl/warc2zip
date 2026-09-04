@@ -209,6 +209,19 @@ wheels = [
 ]
 
 [[package]]
+name = "cdx-toolkit"
+version = "0.9.39"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+    { name = "warcio" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c2/92/ab18e28629867f3af01f64974ef75075dd5775ad9cbd1dca42faba1504af/cdx_toolkit-0.9.39.tar.gz", hash = "sha256:7fd85cd5b00ec3ac57bfa21e7f70ba633e1df59760eb54dae3a85e63596af4bc", size = 92815, upload-time = "2026-06-01T11:49:02.752Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/93/22/5cda1ba55a88188b5b19ae60961244759b8b0cc5fe97fb29516afef32adf/cdx_toolkit-0.9.39-py3-none-any.whl", hash = "sha256:577ae9a9578f33ce4bae6c887074f0f70331bf4d6a66a26d1e20836b3004e431", size = 32685, upload-time = "2026-06-01T11:49:01.507Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.2.25"
 source = { registry = "https://pypi.org/simple" }
@@ -961,6 +974,7 @@ name = "warc2zip"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cdx-toolkit" },
     { name = "fsspec" },
     { name = "tqdm" },
     { name = "warcio", extra = ["s3"] },
@@ -974,6 +988,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cdx-toolkit", specifier = ">=0.9.39" },
     { name = "fsspec" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "ruff", marker = "extra == 'dev'" },

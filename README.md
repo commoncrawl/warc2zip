@@ -54,8 +54,9 @@ warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 | `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
 | `--metadata-only`         | Write every CSV, manifest and sidecar but no payload files                             | Off, payloads are written               |
 | `--fetch`                 | Treat `input_file` as a `manifest.csv` and download every row's byte range into one `.warc.gz` (see [Building and downloading a subset](#building-and-downloading-a-subset)). Not combinable with `--limit` or `--format` | Off |
-| `--rate <N>`              | `--fetch` only: requests per second per host, `0` for unlimited                        | `2`                                     |
-| `--retries <N>`           | `--fetch` only: retries per request on throttling, server errors and timeouts          | `8`                                     |
+| `--rate <N>`              | `--fetch` only: requests per second per host, `0` for unlimited                        | [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s per-host pacing for http(s), `2` for s3 |
+| `--retries <N>`           | `--fetch` only: connection failures tolerated per request (http(s), throttling is retried without limit) or retries per request (s3) | `100` / `8`                            |
+| `--source-headers`        | `--fetch` only: add `WARC-Source-URI` and `WARC-Source-Range` to every record, as cdx_toolkit does. Records are re-serialised | Off, bytes are copied verbatim |
 
 ### Small Examples
 
@@ -403,7 +404,7 @@ mlr --csv filter '$http_status_code == 200' manifest.csv > subset.csv
 warc2zip subset.csv --fetch --output subset.warc.gz
 ```
 
-Every row is fetched by byte range from its own `source_uri` (https, s3 or a local file). Nearby rows share one request, requests are retried with backoff and rate-limited per host (`--rate`, `--retries`), and each source's own `warcinfo` record leads the output. The bytes are copied verbatim, so `subset.warc.gz` goes straight back into `warc2zip` — or into any other WARC tool.
+Every row is fetched by byte range from its own `source_uri` (https, s3 or a local file). Nearby rows share one request, http(s) requests go through [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s Common Crawl-aware retry and pacing (`--rate`, `--retries`), and each source's own `warcinfo` record leads the output. The bytes are copied verbatim, so `subset.warc.gz` goes straight back into `warc2zip` — or into any other WARC tool. `--source-headers` instead stamps each record with where it came from, cdx_toolkit style.
 
 Three caveats:
 

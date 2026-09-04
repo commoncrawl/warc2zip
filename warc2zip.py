@@ -12,18 +12,20 @@ import secrets
 import sys
 import time
 import zipfile
-from collections import Counter
 import zlib
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
+from cdx_toolkit.myrequests import get_retries, myrequests_get, retry_info
 from fsspec.core import url_to_fs
 from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
 from warcio.recordloader import ARC2WARCHeadersParser
 from warcio.utils import fsspec_open
+from warcio.warcwriter import WARCWriter
 
 MIME_EXTENSION_OVERRIDES = {
     "text/html": ".html",
@@ -1098,6 +1100,8 @@ FETCH_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 FETCH_MAX_GAP = 64 * 1024  # bytes between two rows that still get fetched in one request
 FETCH_MAX_SPAN = 64 * 1024 * 1024  # bytes held in memory for one request
 FETCH_HEAD_BYTES = 64 * 1024  # probe size for the source's leading warcinfo record
+FETCH_MAX_REDIRECTS = 5  # cdx_toolkit's myrequests_get does not follow redirects; http_range does
+FETCH_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
 @dataclass
@@ -1300,18 +1304,6 @@ def fetch_with_retry(fetch, *, retries=FETCH_DEFAULT_RETRIES, label="", sleep=ti
             sleep(delay)
 
 
-def fetch_range(fs, path, start, end, exact=True):
-    """Bytes [start, end) of a file through fsspec (https, s3 and local alike).
-
-    With `exact`, a short or long answer raises FetchLengthMismatch (see there). The warcinfo
-    probe passes exact=False because it deliberately asks past the end of small files.
-    """
-    data = fs.cat_file(path, start=start, end=end)
-    if exact and len(data) != end - start:
-        raise FetchLengthMismatch(f"asked for {end - start} bytes at offset {start}, got {len(data)}")
-    return data
-
-
 def leading_warcinfo(head):
     """The first gzip member of `head`, verbatim, if it is a warcinfo record; else None.
 
@@ -1402,62 +1394,149 @@ def default_fetch_output_path(csv_path, run_id=None):
     return Path(f"{label or 'unknown'}_{run_id or new_run_id()}.warc.gz")
 
 
+def http_range(url, start, end, retries=None, redirects=FETCH_MAX_REDIRECTS, get=None):
+    """Bytes [start, end) over http(s), through cdx_toolkit's `myrequests_get`.
+
+    That function carries Common Crawl's own retry policy (429/5xx backed off without limit,
+    connection failures up to `retries`) and per-host pacing, so neither is reimplemented here.
+    It does not follow redirects (`allow_redirects=False`), so 3xx answers are followed by hand,
+    re-entering `myrequests_get` each time so the new host is paced too. A 200 with the whole
+    file, from a server that ignores Range, is left to the caller's length check.
+    """
+    get = get or myrequests_get  # resolved at call time so tests can substitute the transport
+    headers = {"Range": f"bytes={start}-{end - 1}"}
+    for _ in range(redirects + 1):
+        resp = get(url, headers=headers, raise_error_after_n_errors=retries)
+        location = resp.headers.get("Location")
+        if resp.status_code in FETCH_REDIRECT_STATUSES and location:
+            url = urljoin(url, location)
+            continue
+        return resp.content
+    raise RuntimeError(f"more than {redirects} redirects")
+
+
+def set_host_interval(host, rate):
+    """Map --rate onto cdx_toolkit's per-host schedule; rate=None keeps cdx_toolkit's own defaults.
+
+    cdx_toolkit paces requests from a module-level table keyed by hostname (0.55 s between
+    requests to data.commoncrawl.org, 3 s to a host it does not know). `get_retries()` creates
+    the host's entry from the default one, and the interval is then overwritten in place — the
+    table is the only place the pacing can be set.
+    """
+    if rate is None:
+        return
+    get_retries(host)
+    retry_info[host]["minimum_interval"] = 1.0 / rate if rate > 0 else 0.0
+
+
+def check_length(data, start, end):
+    if len(data) != end - start:
+        raise FetchLengthMismatch(f"asked for {end - start} bytes at offset {start}, got {len(data)}")
+    return data
+
+
+def fetch_range(fs, path, start, end, exact=True):
+    """Bytes [start, end) of a file through fsspec (s3 and local paths).
+
+    With `exact`, a short or long answer raises FetchLengthMismatch (see there). The warcinfo
+    probe passes exact=False because it deliberately asks past the end of small files.
+    """
+    data = fs.cat_file(path, start=start, end=end)
+    return check_length(data, start, end) if exact else data
+
+
+def annotate_record_slice(data, source_uri, offset, length):
+    """Re-serialise one record with WARC-Source-URI / WARC-Source-Range added (--source-headers).
+
+    The names and values are cdx_toolkit's convention for extracts, so a subset made this way
+    matches one from `cdxt warc`. The record is parsed and rewritten by warcio, so the bytes are
+    no longer the source's; that is why this is opt-in and the default stays verbatim.
+    """
+    record = next(iter(open_archive_iterator(io.BytesIO(data))))
+    record.rec_headers.replace_header("WARC-Source-URI", source_uri)
+    record.rec_headers.replace_header("WARC-Source-Range", f"bytes={offset}-{offset + length - 1}")
+    buffer = io.BytesIO()
+    WARCWriter(buffer, gzip=True).write_record(record)
+    return buffer.getvalue()
+
+
 def _is_local_filesystem(fs):
     protocol = fs.protocol if isinstance(fs.protocol, (tuple, list)) else (fs.protocol,)
     return "file" in protocol
 
 
 class _FetchSource:
-    """One source WARC: its fsspec filesystem, rate-limit key and transfer counters."""
+    """One source WARC: its transport, retry policy, pacing key and transfer counters.
 
-    def __init__(self, source_uri, limiter):
-        self.fs, self.path = url_to_fs(source_uri)
-        # Local files bypass the limiter; for https the key is the host, for s3 the bucket.
-        self.host = None if _is_local_filesystem(self.fs) else urlparse(source_uri).netloc
-        self.limiter = limiter
+    http(s) goes through cdx_toolkit (`http_range`), which retries and paces on its own; s3 and
+    local paths go through fsspec with `fetch_with_retry` and `RateLimiter` around them.
+    """
+
+    def __init__(self, source_uri, limiter, rate=None, retries=None):
+        self.source_uri = source_uri
+        parsed = urlparse(source_uri)
+        self.via_http = parsed.scheme.lower() in ("http", "https")
+        self.retries = retries
         self.requests = 0
         self.transferred = 0
+        if self.via_http:
+            self.fs = self.path = self.limiter = None
+            set_host_interval(parsed.hostname, rate)
+            self.host = parsed.hostname
+        else:
+            self.fs, self.path = url_to_fs(source_uri)
+            # Local files bypass the limiter; for s3 the key is the bucket.
+            self.host = None if _is_local_filesystem(self.fs) else parsed.netloc
+            self.limiter = limiter
 
     def get(self, start, end, exact=True):
-        if self.host:
-            self.limiter.wait(self.host)
         self.requests += 1
-        data = fetch_range(self.fs, self.path, start, end, exact)
+        if self.via_http:
+            data = http_range(self.source_uri, start, end, retries=self.retries)
+            if exact:
+                check_length(data, start, end)
+        else:
+            if self.host:
+                self.limiter.wait(self.host)
+            data = fetch_range(self.fs, self.path, start, end, exact)
         self.transferred += len(data)
         return data
 
+    def fetch(self, start, end, exact=True, label="", sleep=time.sleep):
+        if self.via_http:
+            return self.get(start, end, exact)
+        retries = FETCH_DEFAULT_RETRIES if self.retries is None else self.retries
+        return fetch_with_retry(
+            functools.partial(self.get, start, end, exact), retries=retries, label=label, sleep=sleep
+        )
 
-def fetch_main(csv_path, output_path=None, rate=None, retries=None, sleep=time.sleep):
+
+def fetch_main(csv_path, output_path=None, rate=None, retries=None, source_headers=False, sleep=time.sleep):
     """--fetch: download every manifest row's byte range and concatenate the raw members.
 
     Each source's own warcinfo record is copied first (see leading_warcinfo), then its rows
     in offset order. A span that fails after retries skips all its rows with a warning and
     the run goes on, like the CSV writers: the file is a valid .warc.gz at every member
-    boundary, and the return value (skipped rows) makes cli() exit 1.
+    boundary, and the return value (skipped rows) makes cli() exit 1. `rate` and `retries`
+    are None by default so each transport keeps its own defaults (see _FetchSource).
     """
-    rate = FETCH_DEFAULT_RATE if rate is None else rate
-    retries = FETCH_DEFAULT_RETRIES if retries is None else retries
-
     rows, skipped = read_fetch_rows(csv_path)
     groups = group_fetch_rows(rows)
     if output_path is None:
         output_path = str(default_fetch_output_path(csv_path, new_run_id()))
 
-    limiter = RateLimiter(rate, sleep=sleep)
+    limiter = RateLimiter(FETCH_DEFAULT_RATE if rate is None else rate, sleep=sleep)
     total_rows = sum(len(source_rows) for source_rows in groups.values())
     written = warcinfo_count = 0
     sources = []
 
     with open(output_path, "wb") as out, tqdm(total=total_rows, unit="rec", desc="Fetching") as pbar:
         for source_uri, source_rows in groups.items():
-            source = _FetchSource(source_uri, limiter)
+            source = _FetchSource(source_uri, limiter, rate=rate, retries=retries)
             sources.append(source)
 
             try:
-                head = fetch_with_retry(
-                    functools.partial(source.get, 0, FETCH_HEAD_BYTES, False),
-                    retries=retries, label=f"{source_uri} (warcinfo probe)", sleep=sleep,
-                )
+                head = source.fetch(0, FETCH_HEAD_BYTES, exact=False, label=f"{source_uri} (warcinfo probe)", sleep=sleep)
             except Exception as exc:  # noqa: BLE001 - reported below; the rows are still attempted
                 print(f"warning: {source_uri}: could not read the leading warcinfo record ({exc})", file=sys.stderr)
                 head = b""
@@ -1472,7 +1551,7 @@ def fetch_main(csv_path, output_path=None, rate=None, retries=None, sleep=time.s
             for start, end, span_rows in coalesce_ranges(source_rows):
                 label = f"{source_uri} bytes {start}-{end - 1}"
                 try:
-                    data = fetch_with_retry(functools.partial(source.get, start, end), retries=retries, label=label, sleep=sleep)
+                    data = source.fetch(start, end, label=label, sleep=sleep)
                 except Exception as exc:  # noqa: BLE001 - skip-and-warn, the run continues
                     print(f"warning: {label}: could not be fetched ({exc}), {len(span_rows)} row(s) skipped",
                           file=sys.stderr)
@@ -1487,6 +1566,8 @@ def fetch_main(csv_path, output_path=None, rate=None, retries=None, sleep=time.s
                               f"({problem}), skipped", file=sys.stderr)
                         skipped += 1
                     else:
+                        if source_headers:
+                            chunk = annotate_record_slice(chunk, source_uri, row.offset, row.length)
                         out.write(chunk)
                         written += 1
                     pbar.update(1)
@@ -1501,7 +1582,6 @@ def fetch_main(csv_path, output_path=None, rate=None, retries=None, sleep=time.s
     if skipped:
         print(f"warning: {skipped} row(s) could not be fetched (see warnings above)", file=sys.stderr)
     return skipped
-
 
 
 def cli():
@@ -1547,14 +1627,22 @@ def cli():
         "--rate",
         type=float,
         default=None,
-        help=f"--fetch only: requests per second per host, 0 for unlimited (default: {FETCH_DEFAULT_RATE:g})",
+        help="--fetch only: requests per second per host, 0 for unlimited. Default: cdx_toolkit's per-host "
+        f"pacing for http(s) (about 1.8/s for data.commoncrawl.org, 0.33/s elsewhere), {FETCH_DEFAULT_RATE:g}/s for s3",
     )
     parser.add_argument(
         "--retries",
         type=int,
         default=None,
-        help=f"--fetch only: retries per request on throttling, server errors and timeouts "
-        f"(default: {FETCH_DEFAULT_RETRIES})",
+        help="--fetch only: for http(s), connection failures tolerated per request (default 100; throttling "
+        f"and server errors are retried without limit, as cdx_toolkit does); for s3, retries per request "
+        f"(default {FETCH_DEFAULT_RETRIES})",
+    )
+    parser.add_argument(
+        "--source-headers",
+        action="store_true",
+        help="--fetch only: add WARC-Source-URI and WARC-Source-Range to every record, as cdx_toolkit does. "
+        "Records are re-serialised, so they are no longer the source's bytes.",
     )
     args = parser.parse_args()
 
@@ -1563,9 +1651,12 @@ def cli():
     if args.fetch:
         if args.limit is not None or args.format is not None:
             parser.error("--limit and --format do not apply to --fetch")
-        return 1 if fetch_main(args.input_file, args.output, rate=args.rate, retries=args.retries) else 0
-    if args.rate is not None or args.retries is not None:
-        parser.error("--rate and --retries only apply to --fetch")
+        skipped = fetch_main(
+            args.input_file, args.output, rate=args.rate, retries=args.retries, source_headers=args.source_headers
+        )
+        return 1 if skipped else 0
+    if args.rate is not None or args.retries is not None or args.source_headers:
+        parser.error("--rate, --retries and --source-headers only apply to --fetch")
 
     # Default output naming lives in main() (see default_output_path).
     skipped = main(

@@ -18,6 +18,7 @@ from warcio.archiveiterator import ArchiveIterator
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 
+import warc2zip
 from warc2zip import (
     FETCH_MAX_BACKOFF,
     FetchLengthMismatch,
@@ -28,8 +29,10 @@ from warc2zip import (
     default_fetch_output_path,
     fetch_main,
     fetch_with_retry,
+    http_range,
     leading_warcinfo,
     main,
+    set_host_interval,
     validate_record_slice,
 )
 
@@ -389,6 +392,7 @@ def test_default_fetch_output_path():
         ["subset.csv", "--fetch", "--format", "sidecar"],
         ["x.warc.gz", "--rate", "1"],
         ["x.warc.gz", "--retries", "2"],
+        ["x.warc.gz", "--source-headers"],
         ["subset.csv", "--fetch", "--dry-run"],
     ],
 )
@@ -413,3 +417,123 @@ def test_cli_fetch_and_default_format_still_flat(warc_path, metadata_zip, tmp_pa
         names = {n.rsplit("/", 1)[-1] for n in zf.namelist()}
     assert "manifest.csv" in names and not any(".request." in n for n in names)  # flat, not sidecar
     assert len(CAPTURES) == 3  # the fixture shape the row indexes above rely on
+
+
+# --- http(s) transport through cdx_toolkit ------------------------------------------------
+
+
+class FakeResponse:
+    def __init__(self, content=b"", status_code=200, headers=None):
+        self.content = content
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
+def fake_myrequests_get(warc_bytes, log, redirect_from=None, ignore_range=False):
+    """A `myrequests_get` stand-in serving Range requests for `warc_bytes`, optionally after a 302."""
+
+    def get(url, params=None, headers=None, **kwargs):
+        log.append((url, headers["Range"], kwargs))
+        if url == redirect_from:
+            return FakeResponse(b"<html>moved</html>", 302, {"Location": "/cdn/x.warc.gz"})
+        if ignore_range:
+            return FakeResponse(warc_bytes, 200)
+        start, end = (int(v) for v in headers["Range"][len("bytes=") :].split("-"))
+        return FakeResponse(warc_bytes[start : end + 1], 206)
+
+    return get
+
+
+def https_rows(rows, uri):
+    return [dict(row, source_uri=uri) for row in rows]
+
+
+def test_https_sources_go_through_cdx_toolkit(warc_path, metadata_zip, tmp_path, monkeypatch):
+    log = []
+    monkeypatch.setattr(warc2zip, "myrequests_get", fake_myrequests_get(warc_path.read_bytes(), log))
+    uri = "https://data.example.org/crawl-data/x.warc.gz"
+    rows = manifest_rows(metadata_zip)
+    subset = write_subset(tmp_path / "subset.csv", https_rows([rows[0], rows[2]], uri))
+    out = tmp_path / "subset.warc.gz"
+
+    assert fetch_main(str(subset), str(out), retries=3) == 0
+
+    raw = warc_path.read_bytes()
+    offset, length = warcinfo_range(metadata_zip)
+    assert out.read_bytes() == raw[offset : offset + length] + slice_of(raw, rows[0]) + slice_of(raw, rows[2])
+    # One probe plus one coalesced span, both Range requests to cdx_toolkit's transport.
+    assert [(u, r) for u, r, _ in log] == [
+        (uri, "bytes=0-65535"),
+        (uri, f"bytes={rows[0]['warc_record_offset']}-{int(rows[2]['warc_record_offset']) + int(rows[2]['warc_record_length']) - 1}"),
+    ]
+    assert all(kw == {"raise_error_after_n_errors": 3} for _, _, kw in log)
+
+
+def test_http_range_follows_redirects_by_hand(warc_path):
+    """myrequests_get passes allow_redirects=False, so a 302 would otherwise come back as the slice."""
+    log = []
+    raw = warc_path.read_bytes()
+    get = fake_myrequests_get(raw, log, redirect_from="https://hub.example/resolve/x.warc.gz?download=true")
+
+    data = http_range("https://hub.example/resolve/x.warc.gz?download=true", 10, 20, get=get)
+
+    assert data == raw[10:20]
+    assert [u for u, _, _ in log] == ["https://hub.example/resolve/x.warc.gz?download=true", "https://hub.example/cdn/x.warc.gz"]
+    assert {r for _, r, _ in log} == {"bytes=10-19"}
+
+
+def test_http_range_gives_up_on_a_redirect_loop(warc_path):
+    log = []
+    get = fake_myrequests_get(warc_path.read_bytes(), log, redirect_from="https://hub.example/cdn/x.warc.gz")
+    with pytest.raises(RuntimeError, match="redirects"):
+        http_range("https://hub.example/cdn/x.warc.gz", 0, 10, redirects=2, get=get)
+    assert len(log) == 3
+
+
+def test_https_server_ignoring_range_is_caught(warc_path, metadata_zip, tmp_path, monkeypatch, capsys):
+    log = []
+    monkeypatch.setattr(warc2zip, "myrequests_get", fake_myrequests_get(warc_path.read_bytes(), log, ignore_range=True))
+    rows = https_rows(manifest_rows(metadata_zip)[:1], "https://data.example.org/x.warc.gz")
+    subset = write_subset(tmp_path / "subset.csv", rows)
+    out = tmp_path / "subset.warc.gz"
+
+    assert fetch_main(str(subset), str(out)) == 1
+
+    assert "got" in capsys.readouterr().err
+    assert [t for t, _ in record_types_and_ids(out)] == ["warcinfo"]  # the probe tolerates a long answer
+
+
+def test_set_host_interval_maps_rate_onto_cdx_toolkit(monkeypatch):
+    from cdx_toolkit.myrequests import retry_info
+
+    host = "data.example.org"
+    monkeypatch.delitem(retry_info, host, raising=False)
+    set_host_interval(host, None)
+    assert host not in retry_info  # None leaves cdx_toolkit's own defaults alone
+    set_host_interval(host, 4)
+    assert retry_info[host]["minimum_interval"] == 0.25
+    set_host_interval(host, 0)
+    assert retry_info[host]["minimum_interval"] == 0.0
+    assert retry_info["data.commoncrawl.org"]["minimum_interval"] == 0.55
+
+
+def test_source_headers_annotate_each_record_but_not_the_warcinfo(warc_path, metadata_zip, tmp_path):
+    rows = manifest_rows(metadata_zip)
+    subset = write_subset(tmp_path / "subset.csv", [rows[1]])
+    out = tmp_path / "subset.warc.gz"
+
+    assert fetch_main(str(subset), str(out), source_headers=True) == 0
+
+    raw = warc_path.read_bytes()
+    offset, length = warcinfo_range(metadata_zip)
+    assert out.read_bytes().startswith(raw[offset : offset + length])
+    with open(out, "rb") as fh:
+        records = [(r.rec_type, dict(r.rec_headers.headers), r.content_stream().read()) for r in ArchiveIterator(fh)]
+    assert [t for t, _, _ in records] == ["warcinfo", "response"]
+    _, headers, payload = records[1]
+    o, n = int(rows[1]["warc_record_offset"]), int(rows[1]["warc_record_length"])
+    assert headers["WARC-Source-URI"] == str(warc_path)
+    assert headers["WARC-Source-Range"] == f"bytes={o}-{o + n - 1}"
+    assert headers["WARC-Record-ID"] == rows[1]["warc_record_id"]
+    assert headers["WARC-Target-URI"] == CAPTURES[1][0]
+    assert payload == CAPTURES[1][2]
