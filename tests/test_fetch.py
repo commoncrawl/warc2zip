@@ -24,6 +24,7 @@ from warc2zip import (
     FetchLengthMismatch,
     FetchRow,
     RateLimiter,
+    annotate_record_slice,
     cli,
     coalesce_ranges,
     default_fetch_output_path,
@@ -90,6 +91,39 @@ def record_types_and_ids(path):
         return [(r.rec_type, r.rec_headers.get_header("WARC-Record-ID")) for r in ArchiveIterator(fh)]
 
 
+def parsed_records(data):
+    """(rec_type, WARC headers, payload) per record; the payload is read before advancing."""
+    return [
+        (r.rec_type, dict(r.rec_headers.headers), r.content_stream().read())
+        for r in ArchiveIterator(io.BytesIO(data))
+    ]
+
+
+def without_source_headers(headers):
+    return {k: v for k, v in headers.items() if not k.startswith("WARC-Source-")}
+
+
+def raw_blocks(data):
+    """Each record's content block as written, HTTP headers and body, without warcio's HTTP parse."""
+    return [r.content_stream().read() for r in ArchiveIterator(io.BytesIO(data), no_record_parse=True)]
+
+
+def assert_is_stamped_copy(fetched, original, source_uri, row):
+    """A fetched record is the original plus the two provenance headers, same payload."""
+    rec_type, headers, payload = fetched
+    o, n = int(row["warc_record_offset"]), int(row["warc_record_length"])
+    assert rec_type == "response"
+    assert without_source_headers(headers) == original[1]
+    assert headers["WARC-Source-URI"] == source_uri
+    assert headers["WARC-Source-Range"] == f"bytes={o}-{o + n - 1}"
+    assert payload == original[2]
+
+
+def assert_blocks_untouched(fetched_member, original_member):
+    """The stamped record's content block is the wire bytes: obs-folds, NULs and all."""
+    assert raw_blocks(fetched_member) == raw_blocks(original_member)
+
+
 def write_warc_without_warcinfo(path):
     with open(path, "wb") as fh:
         writer = WARCWriter(fh, gzip=True)
@@ -116,8 +150,8 @@ def metadata_zip(warc_path, tmp_path):
 # --- end to end ---------------------------------------------------------------------------
 
 
-def test_fetch_rebuilds_the_subset_byte_for_byte(warc_path, metadata_zip, tmp_path):
-    """The output is the source's warcinfo member followed by each kept row's member, verbatim."""
+def test_fetch_rebuilds_the_subset(warc_path, metadata_zip, tmp_path):
+    """The source's warcinfo member verbatim, then each kept row's record stamped with its origin."""
     rows = manifest_rows(metadata_zip)
     kept = [rows[0], rows[2]]
     subset = write_subset(tmp_path / "subset.csv", kept)
@@ -127,13 +161,15 @@ def test_fetch_rebuilds_the_subset_byte_for_byte(warc_path, metadata_zip, tmp_pa
 
     raw = warc_path.read_bytes()
     offset, length = warcinfo_range(metadata_zip)
-    assert out.read_bytes() == raw[offset : offset + length] + b"".join(slice_of(raw, row) for row in kept)
-    assert record_types_and_ids(out) == [("warcinfo", record_types_and_ids(warc_path)[0][1])] + [
-        ("response", row["warc_record_id"]) for row in kept
-    ]
+    fetched = out.read_bytes()
+    assert fetched.startswith(raw[offset : offset + length])
+    records = parsed_records(fetched)
+    assert [t for t, _, _ in records] == ["warcinfo", "response", "response"]
+    for record, row in zip(records[1:], kept):
+        assert_is_stamped_copy(record, parsed_records(slice_of(raw, row))[0], str(warc_path), row)
 
 
-def test_fetched_subset_reconverts_and_still_names_the_original_warc(metadata_zip, tmp_path):
+def test_fetched_subset_reconverts_and_still_names_the_original_warc(warc_path, metadata_zip, tmp_path):
     """The README caveat: a derived WARC keeps the original's warcinfo, while its offsets index itself."""
     rows = manifest_rows(metadata_zip)
     subset = write_subset(tmp_path / "subset.csv", [rows[1]])
@@ -149,6 +185,11 @@ def test_fetched_subset_reconverts_and_still_names_the_original_warc(metadata_zi
     assert check_rows[0]["source_uri"] == str(out)
     record = next(iter(ArchiveIterator(io.BytesIO(slice_of(out.read_bytes(), check_rows[0])))))
     assert record.rec_headers.get_header("WARC-Record-ID") == rows[1]["warc_record_id"]
+    # ...and the CSV now says where the record sat in the original.
+    o, n = int(rows[1]["warc_record_offset"]), int(rows[1]["warc_record_length"])
+    provenance = {name: value for _, name, value in zip_csv(check, "response_warc_headers.csv")[1:]}
+    assert provenance["warc_source_uri"] == str(warc_path)
+    assert provenance["warc_source_range"] == f"bytes={o}-{o + n - 1}"
 
 
 def test_rows_are_grouped_by_source_and_ordered_by_offset(warc_path, metadata_zip, tmp_path):
@@ -392,7 +433,6 @@ def test_default_fetch_output_path():
         ["subset.csv", "--fetch", "--format", "sidecar"],
         ["x.warc.gz", "--rate", "1"],
         ["x.warc.gz", "--retries", "2"],
-        ["x.warc.gz", "--source-headers"],
         ["subset.csv", "--fetch", "--dry-run"],
     ],
 )
@@ -460,7 +500,12 @@ def test_https_sources_go_through_cdx_toolkit(warc_path, metadata_zip, tmp_path,
 
     raw = warc_path.read_bytes()
     offset, length = warcinfo_range(metadata_zip)
-    assert out.read_bytes() == raw[offset : offset + length] + slice_of(raw, rows[0]) + slice_of(raw, rows[2])
+    fetched = out.read_bytes()
+    assert fetched.startswith(raw[offset : offset + length])
+    records = parsed_records(fetched)
+    assert [t for t, _, _ in records] == ["warcinfo", "response", "response"]
+    for record, row in zip(records[1:], [rows[0], rows[2]]):
+        assert_is_stamped_copy(record, parsed_records(slice_of(raw, row))[0], uri, row)
     # One probe plus one coalesced span, both Range requests to cdx_toolkit's transport.
     assert [(u, r) for u, r, _ in log] == [
         (uri, "bytes=0-65535"),
@@ -517,23 +562,20 @@ def test_set_host_interval_maps_rate_onto_cdx_toolkit(monkeypatch):
     assert retry_info["data.commoncrawl.org"]["minimum_interval"] == 0.55
 
 
-def test_source_headers_annotate_each_record_but_not_the_warcinfo(warc_path, metadata_zip, tmp_path):
+def test_stamping_keeps_every_original_header_and_the_payload(warc_path, metadata_zip):
     rows = manifest_rows(metadata_zip)
-    subset = write_subset(tmp_path / "subset.csv", [rows[1]])
-    out = tmp_path / "subset.warc.gz"
-
-    assert fetch_main(str(subset), str(out), source_headers=True) == 0
-
     raw = warc_path.read_bytes()
-    offset, length = warcinfo_range(metadata_zip)
-    assert out.read_bytes().startswith(raw[offset : offset + length])
-    with open(out, "rb") as fh:
-        records = [(r.rec_type, dict(r.rec_headers.headers), r.content_stream().read()) for r in ArchiveIterator(fh)]
-    assert [t for t, _, _ in records] == ["warcinfo", "response"]
-    _, headers, payload = records[1]
-    o, n = int(rows[1]["warc_record_offset"]), int(rows[1]["warc_record_length"])
-    assert headers["WARC-Source-URI"] == str(warc_path)
-    assert headers["WARC-Source-Range"] == f"bytes={o}-{o + n - 1}"
-    assert headers["WARC-Record-ID"] == rows[1]["warc_record_id"]
-    assert headers["WARC-Target-URI"] == CAPTURES[1][0]
-    assert payload == CAPTURES[1][2]
+    row = rows[1]
+    original = parsed_records(slice_of(raw, row))[0]
+
+    stamped = annotate_record_slice(slice_of(raw, row), str(warc_path), int(row["warc_record_offset"]), int(row["warc_record_length"]))
+
+    records = parsed_records(stamped)
+    assert len(records) == 1
+    assert_is_stamped_copy(records[0], original, str(warc_path), row)
+    assert_blocks_untouched(stamped, slice_of(raw, row))
+    # The fixture's obs-folded header is the case a parsed re-serialisation would unfold.
+    folded = annotate_record_slice(slice_of(raw, rows[2]), str(warc_path), 0, 1)
+    assert b"X-Fold: a\r\n b" in raw_blocks(folded)[0]
+    assert records[0][1]["WARC-Target-URI"] == CAPTURES[1][0]
+    assert records[0][2] == CAPTURES[1][2]

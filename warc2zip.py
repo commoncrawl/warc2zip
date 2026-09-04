@@ -1446,13 +1446,20 @@ def fetch_range(fs, path, start, end, exact=True):
 
 
 def annotate_record_slice(data, source_uri, offset, length):
-    """Re-serialise one record with WARC-Source-URI / WARC-Source-Range added (--source-headers).
+    """Re-serialise one record with WARC-Source-URI / WARC-Source-Range added.
 
     The names and values are cdx_toolkit's convention for extracts, so a subset made this way
-    matches one from `cdxt warc`. The record is parsed and rewritten by warcio, so the bytes are
-    no longer the source's; that is why this is opt-in and the default stays verbatim.
+    matches one from `cdxt warc`, and a re-converted subset carries every record's original
+    coordinates in response_warc_headers.csv. The WARC header block is rewritten by warcio and
+    the member recompressed, so it is no longer the source's bytes, but the content block (HTTP
+    headers and body) is copied through untouched (a verbatim switch was tried and dropped: nothing
+    in the workflow needs the wire bytes, and the curl loop in the README gives them anyway).
+    Cost measured on CC records: ~1.4 ms CPU and ~43 bytes of output per record.
     """
-    record = next(iter(open_archive_iterator(io.BytesIO(data))))
+    # no_record_parse=True leaves the HTTP layer unparsed, so warcio writes the content block
+    # through byte for byte (a parsed one is re-serialised: obs-folds unfolded, Content-Length
+    # recomputed, WARC-Block-Digest silently wrong). Only the WARC header block is rewritten.
+    record = next(iter(ArchiveIterator(io.BytesIO(data), no_record_parse=True, arc2warc=True)))
     record.rec_headers.replace_header("WARC-Source-URI", source_uri)
     record.rec_headers.replace_header("WARC-Source-Range", f"bytes={offset}-{offset + length - 1}")
     buffer = io.BytesIO()
@@ -1511,14 +1518,16 @@ class _FetchSource:
         )
 
 
-def fetch_main(csv_path, output_path=None, rate=None, retries=None, source_headers=False, sleep=time.sleep):
+def fetch_main(csv_path, output_path=None, rate=None, retries=None, sleep=time.sleep):
     """--fetch: download every manifest row's byte range and concatenate the raw members.
 
     Each source's own warcinfo record is copied first (see leading_warcinfo), then its rows
     in offset order. A span that fails after retries skips all its rows with a warning and
     the run goes on, like the CSV writers: the file is a valid .warc.gz at every member
     boundary, and the return value (skipped rows) makes cli() exit 1. `rate` and `retries`
-    are None by default so each transport keeps its own defaults (see _FetchSource).
+    are None by default so each transport keeps its own defaults (see _FetchSource). Every
+    record is stamped with WARC-Source-URI / WARC-Source-Range (see annotate_record_slice); the
+    warcinfo record is copied as-is.
     """
     rows, skipped = read_fetch_rows(csv_path)
     groups = group_fetch_rows(rows)
@@ -1566,9 +1575,7 @@ def fetch_main(csv_path, output_path=None, rate=None, retries=None, source_heade
                               f"({problem}), skipped", file=sys.stderr)
                         skipped += 1
                     else:
-                        if source_headers:
-                            chunk = annotate_record_slice(chunk, source_uri, row.offset, row.length)
-                        out.write(chunk)
+                        out.write(annotate_record_slice(chunk, source_uri, row.offset, row.length))
                         written += 1
                     pbar.update(1)
 
@@ -1638,12 +1645,6 @@ def cli():
         f"and server errors are retried without limit, as cdx_toolkit does); for s3, retries per request "
         f"(default {FETCH_DEFAULT_RETRIES})",
     )
-    parser.add_argument(
-        "--source-headers",
-        action="store_true",
-        help="--fetch only: add WARC-Source-URI and WARC-Source-Range to every record, as cdx_toolkit does. "
-        "Records are re-serialised, so they are no longer the source's bytes.",
-    )
     args = parser.parse_args()
 
     # Flags that would be silently ignored are refused instead: --format defaults to None so an
@@ -1651,12 +1652,9 @@ def cli():
     if args.fetch:
         if args.limit is not None or args.format is not None:
             parser.error("--limit and --format do not apply to --fetch")
-        skipped = fetch_main(
-            args.input_file, args.output, rate=args.rate, retries=args.retries, source_headers=args.source_headers
-        )
-        return 1 if skipped else 0
-    if args.rate is not None or args.retries is not None or args.source_headers:
-        parser.error("--rate, --retries and --source-headers only apply to --fetch")
+        return 1 if fetch_main(args.input_file, args.output, rate=args.rate, retries=args.retries) else 0
+    if args.rate is not None or args.retries is not None:
+        parser.error("--rate and --retries only apply to --fetch")
 
     # Default output naming lives in main() (see default_output_path).
     skipped = main(
