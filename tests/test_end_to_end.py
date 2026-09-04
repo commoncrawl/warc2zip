@@ -174,22 +174,39 @@ RUN_ID_RE = r"\d{8}T\d{6}_[0-9a-f]{4}"
 
 
 @pytest.mark.parametrize("limit", [None, 2])
-def test_default_output_name_follows_the_root_dirs_partial_rule(warc_path, tmp_path, monkeypatch, limit):
-    """No --output: the zip is {basename}[_partial].zip, with _partial iff --limit was given.
+def test_default_output_name_follows_the_root_dirs_rule(warc_path, tmp_path, monkeypatch, limit):
+    """No --output: the zip is {basename}_{hex}[_partial].zip, with _partial iff --limit was given.
 
-    That is the root directory's rule, so the zip name tells you whether it holds a sample.
+    That is the root directory's rule, so the zip name tells you whether it holds a sample, and
+    the hex is the *same* one the root directory carries, so a zip on disk can be matched to the
+    directory it extracts to.
     """
     monkeypatch.chdir(tmp_path)
 
     main(str(warc_path), output_path=None, limit=limit)
 
     suffix = "_partial" if limit else ""
-    assert [p.name for p in tmp_path.glob("*.zip")] == [f"test{suffix}.zip"]
+    zips = [p.name for p in tmp_path.glob("*.zip")]
+    assert len(zips) == 1
+    zip_match = re.fullmatch(rf"test_([0-9a-f]{{4}}){suffix}\.zip", zips[0])
+    assert zip_match, zips[0]
 
-    with zipfile.ZipFile(tmp_path / f"test{suffix}.zip") as zf:
+    with zipfile.ZipFile(tmp_path / zips[0]) as zf:
         root_dirs = {n.split("/", 1)[0] for n in zf.namelist()}
     assert len(root_dirs) == 1
-    assert re.fullmatch(rf"test_{RUN_ID_RE}{suffix}", next(iter(root_dirs)))
+    dir_match = re.fullmatch(rf"test_\d{{8}}T\d{{6}}_([0-9a-f]{{4}}){suffix}", next(iter(root_dirs)))
+    assert dir_match, root_dirs
+    assert dir_match.group(1) == zip_match.group(1)
+
+
+def test_default_output_names_do_not_collide_for_same_basename(warc_path, tmp_path, monkeypatch):
+    """CC's warc/, crawldiagnostics/ and robotstxt/ files share a basename: two runs, two zips."""
+    monkeypatch.chdir(tmp_path)
+
+    main(str(warc_path), output_path=None)
+    main(str(warc_path), output_path=None)
+
+    assert len(list(tmp_path.glob("test_*.zip"))) == 2
 
 
 @pytest.mark.parametrize(
@@ -211,8 +228,11 @@ def test_default_output_name_follows_the_root_dirs_partial_rule(warc_path, tmp_p
     ],
 )
 def test_default_output_path_handles_every_readme_input_shape(input_file, expected):
-    assert default_output_path(input_file).name == expected
-    assert default_output_path(input_file, partial=True).name == expected[: -len(".zip")] + "_partial.zip"
+    label = expected[: -len(".zip")]
+    assert default_output_path(input_file, run_id="abcd").name == f"{label}_abcd.zip"
+    assert default_output_path(input_file, partial=True, run_id="abcd").name == f"{label}_abcd_partial.zip"
+    # Without a run id one is minted, and it is 4 hex chars like the root directory's
+    assert re.fullmatch(rf"{re.escape(label)}_[0-9a-f]{{4}}\.zip", default_output_path(input_file).name)
     # Always the current directory, never the input's
     assert default_output_path(input_file).parent == Path(".")
 

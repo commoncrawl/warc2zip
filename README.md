@@ -48,7 +48,7 @@ warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 | Flag                      | Description                                                                            | Default                                 |
 |---------------------------|----------------------------------------------------------------------------------------|-----------------------------------------|
 | `input_file`              | Path or URI to a `.warc.gz` file (positional, required)                                |                                         |
-| `--output`                | Path to the output zip file                                                            | Replace `.warc.gz` with `.zip`, in the current directory (`_partial` appended with `--limit`, like the root directory inside) |
+| `--output`                | Path to the output zip file                                                            | `{basename}_{hex}.zip` in the current directory, same hex and `_partial` rule as the root directory inside |
 | `--dry-run`               | Print summary without creating output. The scan always stops after at most 10 capture records, so it never streams the whole file; a lower `--limit` is respected |                                         |
 | `--limit <N>`             | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
 | `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
@@ -96,7 +96,7 @@ Every CSV, manifest, warcinfo file and sidecar is written exactly as it would be
 
 ## Output Formats
 
-All files are placed under a unique root directory inside the zip to prevent collisions when extracting multiple archives into the same folder. The directory name is derived from the WARC-Filename header (in the `warcinfo` record), the current timestamp, and a random suffix: `{crawl_name}_{YYYYMMDDTHHMMSS}_{hex}`. A `--limit` run appends `_partial`, to the directory and — when `--output` is not given — to the zip name too (`archive_partial.zip`), so the zip name alone tells you it holds a sample of the WARC rather than the whole thing.
+All files are placed under a unique root directory inside the zip to prevent collisions when extracting multiple archives into the same folder. The directory name is derived from the WARC-Filename header (in the `warcinfo` record), the current timestamp, and a random suffix: `{crawl_name}_{YYYYMMDDTHHMMSS}_{hex}`. Without `--output`, the zip carries the same hex (`archive_{hex}.zip`), so same-named inputs such as Common Crawl's `warc/`, `crawldiagnostics/` and `robotstxt/` files never overwrite each other's zip. A `--limit` run appends `_partial` to both names (`archive_{hex}_partial.zip`).
 
 This testing release of the software supports 2 output formats: flat and sidecar.
 Flat puts the metadata into a small number of large files, and sidecar instead
@@ -447,8 +447,6 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/i
 - crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/warc/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
 - crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/crawldiagnostics/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
 - crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/robotstxt/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
-
-FIXME: all 3 of these download to the same zip name
 
 ### End Of Term Archive (https://eotarchive.org/data/)
 

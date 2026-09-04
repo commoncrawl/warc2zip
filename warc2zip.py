@@ -476,15 +476,23 @@ def get_file_size(input_file):
         return None
 
 
-def build_root_dir_name(crawl_name, partial=False):
+def new_run_id():
+    """4-char hex that makes one run's outputs unique: shared by the zip name and the root dir."""
+    return secrets.token_hex(2)
+
+
+def build_root_dir_name(crawl_name, partial=False, run_id=None):
     """Build a unique root directory name from a crawl name.
 
     Format: {crawl_name}_{YYYYMMDDTHHMMSS}_{4-char hex suffix}[_partial]
     The hex suffix doesn't affect sort order since it comes after the timestamp. `partial` is
-    set iff --limit was given.
+    set iff --limit was given. `run_id` is the hex; main() passes the same one it gave
+    default_output_path(), so the zip on disk and the directory inside it carry the same tag.
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    suffix = secrets.token_hex(2) if not partial else secrets.token_hex(2) + "_partial"
+    suffix = run_id or new_run_id()
+    if partial:
+        suffix += "_partial"
 
     return f"{crawl_name}_{timestamp}_{suffix}"
 
@@ -505,16 +513,21 @@ def input_basename(input_file):
     return posixpath.basename(path.rstrip("/"))
 
 
-def default_output_path(input_file, partial=False):
-    """Default zip path when --output is not given: {input_basename}[_partial].zip.
+def default_output_path(input_file, partial=False, run_id=None):
+    """Default zip path when --output is not given: {input_basename}_{hex}[_partial].zip.
 
-    The .warc.gz / .warc / .arc.gz / .arc suffix is stripped and .zip appended; `_partial`
-    follows the same rule as the root directory inside the zip (set iff --limit was given).
-    Written to the current directory.
+    The .warc.gz / .warc / .arc.gz / .arc suffix is stripped and .zip appended. The hex is the
+    run id (see new_run_id) — without it Common Crawl's `warc/`, `crawldiagnostics/` and
+    `robotstxt/` files, which share a basename and differ only by directory, overwrite each
+    other's zip. `_partial` follows the same rule as the root directory inside the zip (set iff
+    --limit was given). Written to the current directory.
     """
     basename = input_basename(input_file)
     label = extract_crawl_name(basename) if basename else "unknown"
-    return Path(label + ("_partial" if partial else "") + ".zip")
+    suffix = run_id or new_run_id()
+    if partial:
+        suffix += "_partial"
+    return Path(f"{label}_{suffix}.zip")
 
 
 def extract_crawl_name(warc_filename):
@@ -752,9 +765,12 @@ def main(input_file, output_path=None, dry_run=False, limit=None, output_format=
     metadata_count = 0
     limit_reached = False
 
-    # An explicit --output is used verbatim; the default shares the root directory's _partial rule.
+    # One run id for the zip name and the root directory, so the two can be matched on disk.
+    # An explicit --output is used verbatim; the default shares the root directory's hex and
+    # _partial rule.
+    run_id = new_run_id()
     if output_path is None:
-        output_path = str(default_output_path(input_file, partial))
+        output_path = str(default_output_path(input_file, partial, run_id))
 
     # response -> Record id  <-> metadata -
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as outer_zip:
@@ -786,13 +802,13 @@ def main(input_file, output_path=None, dry_run=False, limit=None, output_format=
                     if root_dir is None:
                         warc_filename = record.rec_headers.get_header("WARC-Filename") or ""
                         crawl_name = extract_crawl_name(warc_filename) if warc_filename else fallback_crawl_name
-                        root_dir = build_root_dir_name(crawl_name, partial)
+                        root_dir = build_root_dir_name(crawl_name, partial, run_id)
                     pbar.update(stream.tell() - pbar.n)
                     continue
 
                 # Resolve root_dir before first payload write if no warcinfo appeared
                 if root_dir is None:
-                    root_dir = build_root_dir_name(fallback_crawl_name, partial)
+                    root_dir = build_root_dir_name(fallback_crawl_name, partial, run_id)
 
                 if rec_type == "response":
                     record_id = record.rec_headers.get_header("WARC-Record-ID")
