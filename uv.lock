@@ -961,6 +961,7 @@ name = "warc2zip"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "fsspec" },
     { name = "tqdm" },
     { name = "warcio", extra = ["s3"] },
 ]
@@ -973,6 +974,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "fsspec" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "tqdm", specifier = ">=4.67.3" },
