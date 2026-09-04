@@ -419,11 +419,11 @@ below read directly from that bucket. These examples are `--format flat` ... you
 
 Details:
 
-- Example WARC from CC-MAIN-2026-25 with 500 records (response, request and metadata, 13 MBytes) [CC-MAIN-2026-30-500_records.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true)
+- Example WARC from CC-MAIN-2026-25 with 500 records (response, request and metadata, 13 MBytes) [500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz?download=true)
 
   - make the zip
 ```
-  warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true' --format flat
+  warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz?download=true' --format flat
 ```
   - here is the warcinfo
 
@@ -439,10 +439,10 @@ Details:
   conformsTo: https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.1/
   ```
 
-- Homepages extracted from CC-MAIN-2026-21 (response records only, 1 GByte) [homepages_CC-MAIN-2026-21.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true)
+- Homepages extracted from CC-MAIN-2026-21 (response records only, 1 GByte) [HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz?download=true)
   - make the zip, note the limit
 ```
-warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true' --format flat --limit 1000
+warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz?download=true' --format flat --limit 1000
 ```
   - here is the warcinfo
 ```
@@ -453,10 +453,10 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/h
   creator: Common Crawl Foundation <https://commoncrawl.org>
   operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
   ```
-- URLs of federal institutions (response records only, 1/2 GByte), as part of the [End Of Term Archive](https://eotarchive.org/) project: [is_us_federal_CC-MAIN-2025-13.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true)
+- URLs of federal institutions (response records only, 1/2 GByte), as part of the [End Of Term Archive](https://eotarchive.org/) project: [IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz?download=true)
   - make the zip, note the limit
 ```
-warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true' --format flat --limit 1000
+warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz?download=true' --format flat --limit 1000
   ```
   - here is the warcinfo
 ```
@@ -469,6 +469,10 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/i
   ```
 
 ## Many more WARC examples for testing
+
+Every archive in this section and the previous one is a test case in `tests/test_readme_warcs.py`:
+`pytest` converts the first 20 captures of each (this is what CI runs), `pytest -m long` converts
+the whole files.
 
 ### Common Crawl style repackaged WARCs (intended for testing)
 
@@ -496,7 +500,7 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/i
 
 #### Heretrix/IA style warcs from EOT 2024
 
-- crawl-data/EOT-2024/segments/IA-000/EOT24PRE-20240926172119-crawl804_EOT24PRE-20240926172119-00000.warc.gz
+- crawl-data/EOT-2024/segments/IA-000/warc/EOT24PRE-20240926172119-crawl804_EOT24PRE-20240926172119-00000.warc.gz
 
 #### Nutch/CCF style warcs from EOT 2024
 
