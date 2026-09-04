@@ -472,7 +472,7 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/I
 
 Every archive in this section and the previous one is a test case in `tests/test_readme_warcs.py`:
 `pytest` converts the first 20 captures of each (this is what CI runs), `pytest -m long` converts
-the whole files.
+the whole files (also available as the manual "Long tests" workflow under Actions).
 
 ### Common Crawl style repackaged WARCs (intended for testing)
 

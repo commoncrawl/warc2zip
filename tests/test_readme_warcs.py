@@ -149,7 +149,7 @@ FORMATS = ["flat", "sidecar"]
 
 pytestmark = [
     pytest.mark.network,
-    pytest.mark.skipif(os.environ.get("WARC2ZIP_OFFLINE"), reason="WARC2ZIP_OFFLINE is set"),
+    pytest.mark.skipif(bool(os.environ.get("WARC2ZIP_OFFLINE")), reason="WARC2ZIP_OFFLINE is set"),
 ]
 
 
