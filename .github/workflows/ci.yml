@@ -24,6 +24,9 @@ jobs:
         run: |
           uv venv
           uv pip install -e ".[dev]"
+          # ia:// lives in fsspec's ia module, unreleased; installed on top of the released fsspec
+          # (a git dependency cannot resolve against s3fs's exact fsspec pin). Drop once fsspec ships it.
+          uv pip install "fsspec[http] @ git+https://github.com/lfoppiano/filesystem_spec@ia-filesystem"
 
       - name: Smoke test
         run: |

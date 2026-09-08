@@ -172,7 +172,7 @@ def ia_server(tmp_path, monkeypatch):
     """A local archive.org: `download_url` and `cookie_domain` of InternetArchiveFileSystem are
     pointed at it for the test. `.add(item, path)` publishes a file; `.require_cookie` gates the
     data-node route; `.hits` records every request."""
-    from warc2zip import InternetArchiveFileSystem
+    from fsspec.implementations.ia import InternetArchiveFileSystem
 
     directory = tmp_path / "items"
     directory.mkdir()
