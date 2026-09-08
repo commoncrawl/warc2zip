@@ -1,10 +1,12 @@
 import argparse
 import asyncio
+import configparser
 import csv
 import functools
 import io
 import json
 import mimetypes
+import os
 import posixpath
 import random
 import re
@@ -16,16 +18,243 @@ import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+import aiohttp
+import yarl
 from cdx_toolkit.myrequests import get_retries, myrequests_get, retry_info
 from fsspec.core import url_to_fs
+from fsspec.implementations.http import HTTPFileSystem
+from fsspec.implementations.http import get_client as http_get_client
+from fsspec.registry import register_implementation
+from fsspec.utils import stringify_path
 from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
 from warcio.recordloader import ARC2WARCHeadersParser
 from warcio.utils import fsspec_open
 from warcio.warcwriter import WARCWriter
+
+# --- Internet Archive input: ia://<identifier>/<filename> ------------------------------------------
+#
+# Read over https://archive.org/download/, not over IA's S3-like API (s3.us.archive.org): that
+# endpoint ignores Range headers and answers GET with a 307 to a plain-http data node, so neither
+# fsspec's block reads nor --fetch could use it (a 100-byte read pulled the whole 1.6 GB file). The
+# download URL 302s to a data node that honours Range; it is also what the `internetarchive`
+# package itself downloads from. So ia:// is HTTPFileSystem plus a path mapping and credentials.
+#
+# The class is written to be lifted verbatim into fsspec (fsspec/implementations/ia.py). Once a
+# fsspec release ships it, delete everything down to the register_implementation() call.
+
+IA_DOWNLOAD_URL = "https://archive.org/download/"
+IA_COOKIE_DOMAIN = ".archive.org"
+# The internetarchive package's own names (not the shorter ones one might guess).
+IA_ENV_ACCESS_KEY = "IA_ACCESS_KEY_ID"
+IA_ENV_SECRET_KEY = "IA_SECRET_ACCESS_KEY"
+IA_ENV_CONFIG_FILE = "IA_CONFIG_FILE"
+
+
+def ia_config_path():
+    """The ia.ini that `ia configure` wrote, or None.
+
+    Searched the way the internetarchive package searches: $IA_CONFIG_FILE, then
+    $XDG_CONFIG_HOME/internetarchive/ia.ini (XDG_CONFIG_HOME defaulting to ~/.config), then
+    ~/.config/ia.ini, then ~/.ia. The first existing file wins.
+    """
+    home = os.path.expanduser("~")
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    candidates = [
+        os.environ.get(IA_ENV_CONFIG_FILE),
+        os.path.join(xdg, "internetarchive", "ia.ini"),
+        os.path.join(home, ".config", "ia.ini"),
+        os.path.join(home, ".ia"),
+    ]
+    return next((path for path in candidates if path and os.path.isfile(path)), None)
+
+
+@dataclass(frozen=True)
+class IACredentials:
+    """What logs a request in at archive.org; all-empty means anonymous."""
+
+    access_key: str | None = None
+    secret_key: str | None = None
+    cookies: dict = field(default_factory=dict)  # {"logged-in-user": ..., "logged-in-sig": ...}
+    config_file: str | None = None  # where they were read from, for messages
+
+    @property
+    def anonymous(self):
+        return not (self.access_key or self.cookies)
+
+
+def load_ia_credentials(config_file=None):
+    """Credentials from ia.ini and the environment; anonymous when there are none.
+
+    `[s3] access/secret` and `[cookies] logged-in-user/logged-in-sig` are read from `config_file`
+    (default: ia_config_path()). Cookie values in the file carry their attributes
+    (`x; expires=...; path=/; domain=.archive.org`), which are parsed off. IA_ACCESS_KEY_ID /
+    IA_SECRET_ACCESS_KEY override the file's keys and must be set together. A missing file or
+    section is not an error: public items need nothing.
+    """
+    path = config_file or ia_config_path()
+    access_key = secret_key = None
+    cookies = {}
+    if path and os.path.isfile(path):
+        # RawConfigParser: the cookie values contain '%' (URL-encoded emails), which the default
+        # interpolation would reject.
+        parser = configparser.RawConfigParser()
+        parser.read(path, encoding="utf-8")
+        access_key = parser.get("s3", "access", fallback="").strip() or None
+        secret_key = parser.get("s3", "secret", fallback="").strip() or None
+        if parser.has_section("cookies"):
+            for name, raw in parser.items("cookies"):
+                morsels = SimpleCookie()
+                morsels.load(f"{name}={raw}")
+                if name in morsels and morsels[name].value:
+                    cookies[name] = morsels[name].value
+
+    env_access, env_secret = os.environ.get(IA_ENV_ACCESS_KEY), os.environ.get(IA_ENV_SECRET_KEY)
+    if bool(env_access) != bool(env_secret):
+        raise ValueError(f"{IA_ENV_ACCESS_KEY} and {IA_ENV_SECRET_KEY} must be set together")
+    if env_access:
+        access_key, secret_key = env_access, env_secret
+    if not (access_key and secret_key):
+        access_key = secret_key = None
+    return IACredentials(access_key, secret_key, cookies, path if path and os.path.isfile(path) else None)
+
+
+class InternetArchiveFileSystem(HTTPFileSystem):
+    """Files in Internet Archive items, addressed as ``ia://<identifier>/<filename>``.
+
+    Every path is read from ``https://archive.org/download/<identifier>/<filename>``, which
+    redirects to a data node that honours HTTP Range requests, so this is ``HTTPFileSystem``
+    with a path mapping and archive.org credentials. Public items need no credentials.
+    Restricted items need the account's cookies (and, optionally, its S3 keys) as written by
+    ``ia configure`` from the ``internetarchive`` package to ``ia.ini``; that file is found the
+    way the package finds it (``$IA_CONFIG_FILE``, ``$XDG_CONFIG_HOME/internetarchive/ia.ini``,
+    ``~/.config/ia.ini``, ``~/.ia``). Explicit arguments win over the file.
+
+    Parameters
+    ----------
+    access_key, secret_key: str, optional
+        IA S3 keys, sent as ``Authorization: LOW <access>:<secret>`` on the first request.
+        ``IA_ACCESS_KEY_ID`` / ``IA_SECRET_ACCESS_KEY`` in the environment override ``ia.ini``.
+    cookies: dict, optional
+        ``{"logged-in-user": ..., "logged-in-sig": ...}``. They go into the session's cookie jar
+        for ``.archive.org`` rather than into a ``Cookie`` header: every download is a redirect
+        to another origin, and aiohttp drops ``Cookie`` and ``Authorization`` headers when a
+        redirect changes origin, while the jar re-attaches its cookies to any archive.org host.
+    config_file: str, optional
+        Path to an ``ia.ini`` to read credentials from instead of the default lookup.
+    kwargs:
+        Passed to ``HTTPFileSystem``.
+    """
+
+    protocol = "ia"
+    download_url = IA_DOWNLOAD_URL
+    cookie_domain = IA_COOKIE_DOMAIN
+
+    def __init__(self, access_key=None, secret_key=None, cookies=None, config_file=None, **kwargs):
+        if access_key is None and secret_key is None and cookies is None:
+            credentials = load_ia_credentials(config_file)
+            access_key, secret_key, cookies = credentials.access_key, credentials.secret_key, credentials.cookies
+        self.access_key = access_key
+        self.cookies = dict(cookies or {})
+        headers = dict(kwargs.pop("headers", None) or {})
+        if access_key and secret_key:
+            headers["Authorization"] = f"LOW {access_key}:{secret_key}"
+        if headers:
+            kwargs["headers"] = headers
+        get_client = kwargs.pop("get_client", http_get_client)
+        super().__init__(
+            get_client=functools.partial(self._client_with_cookies, get_client, self.cookies, self.cookie_domain),
+            **kwargs,
+        )
+
+    @staticmethod
+    async def _client_with_cookies(get_client, cookies, domain, **kwargs):
+        session = await get_client(**kwargs)
+        if cookies:
+            morsels = SimpleCookie()
+            for name, value in cookies.items():
+                morsels[name] = value
+                morsels[name]["domain"] = domain
+                morsels[name]["path"] = "/"
+            session.cookie_jar.update_cookies(morsels, yarl.URL(f"https://{domain.lstrip('.')}/"))
+        return session
+
+    @classmethod
+    def _strip_protocol(cls, path):
+        """``ia://item/file`` (or a bare ``item/file``) becomes the download URL; URLs pass through."""
+        if isinstance(path, list):
+            return [cls._strip_protocol(p) for p in path]
+        path = stringify_path(path)
+        if path.startswith("ia://"):
+            path = path[5:]
+        elif "://" in path:
+            return path
+        return cls.download_url + path.lstrip("/")
+
+    def unstrip_protocol(self, name):
+        if name.startswith(self.download_url):
+            return "ia://" + name[len(self.download_url) :]
+        if name.startswith("ia://"):
+            return name
+        return "ia://" + name.lstrip("/")
+
+    # archive.org answers a restricted item with 403 (401 for a bad LOW key). HTTPFileSystem
+    # reports every failed HEAD/GET as FileNotFoundError and every other status through
+    # raise_for_status(); both are turned into PermissionError so callers can tell "no such
+    # file" from "log in".
+    # HTTPFileSystem's methods take the path as the URL verbatim; the two that callers reach
+    # with an ia:// path directly (open() strips before _open) map it here.
+    async def _info(self, url, **kwargs):
+        url = self._strip_protocol(url)
+        try:
+            return await super()._info(url, **kwargs)
+        except FileNotFoundError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, aiohttp.ClientResponseError) and cause.status in (401, 403):
+                raise PermissionError(url) from cause
+            raise
+
+    async def _cat_file(self, url, start=None, end=None, **kwargs):
+        return await super()._cat_file(self._strip_protocol(url), start=start, end=end, **kwargs)
+
+    def _raise_not_found_for_status(self, response, url):
+        if response.status in (401, 403):
+            raise PermissionError(url)
+        super()._raise_not_found_for_status(response, url)
+
+
+# clobber=True: if a fsspec release ever lists its own "ia" implementation, ours must still win
+# until this inline copy is deleted, rather than fail at import.
+register_implementation("ia", InternetArchiveFileSystem, clobber=True)
+
+
+def format_ia_permission_error(input_file, credentials=None):
+    """The stderr message for a 401/403 from archive.org on an ia:// input."""
+    credentials = credentials or load_ia_credentials()
+    item = urlparse(input_file).netloc
+    if credentials.anonymous:
+        where = credentials.config_file or "no ia.ini found"
+        how = f"no archive.org credentials ({where}), so the request was anonymous"
+    else:
+        where = credentials.config_file or "the environment"
+        how = f"the credentials from {where} were refused (expired cookies look the same)"
+    return "\n".join(
+        [
+            f"Error: archive.org refused access to item '{item}': {how}.",
+            "",
+            "A restricted item needs the account that can see it to be logged in:",
+            "",
+            "  pip install internetarchive && ia configure     # writes ~/.config/internetarchive/ia.ini",
+            "",
+            f"or set {IA_ENV_ACCESS_KEY} and {IA_ENV_SECRET_KEY}. Public items need neither; check the item name.",
+            f"Underlying URL: {InternetArchiveFileSystem._strip_protocol(input_file)}",
+        ]
+    )
+
 
 MIME_EXTENSION_OVERRIDES = {
     "text/html": ".html",
@@ -1657,14 +1886,22 @@ def cli():
         parser.error("--rate and --retries only apply to --fetch")
 
     # Default output naming lives in main() (see default_output_path).
-    skipped = main(
-        args.input_file,
-        args.output,
-        dry_run=args.dry_run,
-        limit=args.limit,
-        output_format=args.format or "flat",
-        metadata_only=args.metadata_only,
-    )
+    try:
+        skipped = main(
+            args.input_file,
+            args.output,
+            dry_run=args.dry_run,
+            limit=args.limit,
+            output_format=args.format or "flat",
+            metadata_only=args.metadata_only,
+        )
+    except PermissionError as exc:
+        # archive.org's 401/403 (see InternetArchiveFileSystem); other inputs keep the traceback.
+        if urlparse(args.input_file).scheme != "ia":
+            raise
+        print(format_ia_permission_error(args.input_file), file=sys.stderr)
+        print(f"Underlying error: {exc!r}", file=sys.stderr)
+        return 1
 
     return 1 if skipped else 0
 

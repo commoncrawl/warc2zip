@@ -1,6 +1,7 @@
 """Shared fixtures: the synthetic three-capture WARC used by the end-to-end and --fetch tests."""
 
 import io
+from pathlib import Path
 
 import pytest
 from warcio.statusandheaders import StatusAndHeaders
@@ -90,3 +91,108 @@ def warc_path(tmp_path):
                 )
             )
     return path
+
+
+# --- a stand-in for archive.org ----------------------------------------------------------------
+#
+# ia:// reads go to https://archive.org/download/<item>/<file>, which 302s to a data node on
+# another origin that honours Range. This server reproduces exactly that: /download/... on
+# 127.0.0.1 redirects to /items/... on `localhost` (same server, different origin, so aiohttp
+# applies its cross-origin rule and drops any Cookie/Authorization *headers*), and the item route
+# serves byte ranges — optionally only to requests carrying a login cookie.
+
+import shutil
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+
+
+class _IAHandler(BaseHTTPRequestHandler):
+    state = None  # set per server: directory, require_cookie, hits
+
+    def log_message(self, *args):  # keep pytest output clean
+        pass
+
+    def _serve(self, send_body):
+        path = urlsplit(self.path).path
+        self.state.hits.append(SimpleNamespace(path=path, headers=dict(self.headers)))
+        if path.startswith("/download/"):
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{self.server.server_port}/items/{path[len('/download/'):]}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if not path.startswith("/items/"):
+            self.send_error(404)
+            return
+        required = self.state.require_cookie
+        if required and f"{required[0]}={required[1]}" not in self.headers.get("Cookie", ""):
+            self.send_error(403)
+            return
+        target = self.state.directory / path[len("/items/") :]
+        if not target.is_file():
+            self.send_error(404)
+            return
+        data = target.read_bytes()
+        start, end = 0, len(data) - 1
+        status = 200
+        range_header = self.headers.get("Range")
+        if range_header and range_header.startswith("bytes="):
+            first, _, last = range_header[len("bytes=") :].partition("-")
+            start = int(first)
+            end = min(int(last), len(data) - 1) if last else len(data) - 1
+            if start >= len(data):
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{len(data)}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = 206
+        body = data[start : end + 1]
+        self.send_response(status)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(len(body)))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._serve(send_body=True)
+
+    def do_HEAD(self):
+        self._serve(send_body=False)
+
+
+@pytest.fixture
+def ia_server(tmp_path, monkeypatch):
+    """A local archive.org: `download_url` and `cookie_domain` of InternetArchiveFileSystem are
+    pointed at it for the test. `.add(item, path)` publishes a file; `.require_cookie` gates the
+    data-node route; `.hits` records every request."""
+    from warc2zip import InternetArchiveFileSystem
+
+    directory = tmp_path / "items"
+    directory.mkdir()
+    state = SimpleNamespace(directory=directory, require_cookie=None, hits=[])
+    handler = type("Handler", (_IAHandler,), {"state": state})
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def add(item, path):
+        (directory / item).mkdir(exist_ok=True)
+        shutil.copy(path, directory / item / Path(path).name)
+        return f"ia://{item}/{Path(path).name}"
+
+    state.add = add
+    state.download_url = f"http://127.0.0.1:{server.server_port}/download/"
+    monkeypatch.setattr(InternetArchiveFileSystem, "download_url", state.download_url)
+    monkeypatch.setattr(InternetArchiveFileSystem, "cookie_domain", "localhost")
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()

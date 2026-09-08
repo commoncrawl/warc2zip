@@ -24,7 +24,7 @@ Metadata (both WARC and http) from the request, response, and metadata records a
 pip install .
 ```
 
-By default, pip will install remote access tools, namely `fsspec` configured to talk to https and s3 remote files.
+By default, pip will install remote access tools, namely `fsspec` configured to talk to https, s3, and Internet Archive (`ia://`) remote files.
 
 ## Usage
 
@@ -32,12 +32,20 @@ By default, pip will install remote access tools, namely `fsspec` configured to 
 warc2zip <path/to/file.warc.gz>
 ```
 
-Input can be a local path or a remote URI (S3, HTTP, etc.):
+Input can be a local path or a remote URI (S3, HTTP, an Internet Archive item, etc.):
 
 ```bash
 warc2zip s3://commoncrawl/crawl-data/.../CC-MAIN-....warc.gz
 warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
+warc2zip ia://EOT24PRE-20240926175758-crawl808/EOT24PRE-20240926175758-00032.warc.gz
 ```
+
+`ia://<identifier>/<filename>` names a file in an [archive.org](https://archive.org) item; it is read from
+`https://archive.org/download/<identifier>/<filename>`, so the two spellings are interchangeable. Public items
+need no account. For a restricted item, log in once with the `internetarchive` package — `pip install
+internetarchive && ia configure` writes `~/.config/internetarchive/ia.ini`, which `warc2zip` reads the way `ia`
+does (`$IA_CONFIG_FILE` first) — or set `IA_ACCESS_KEY_ID` and `IA_SECRET_ACCESS_KEY`. A refused item says which
+of those it tried.
 
 **Note**: Please use s3 inside of AWS and https outside.
 
@@ -47,15 +55,15 @@ warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 
 | Flag                      | Description                                                                            | Default                                 |
 |---------------------------|----------------------------------------------------------------------------------------|-----------------------------------------|
-| `input_file`              | Path or URI to a `.warc.gz` file (positional, required)                                |                                         |
+| `input_file`              | Path or URI to a `.warc.gz` file: local, `s3://`, `http(s)://` or `ia://<item>/<file>` (positional, required) |                                         |
 | `--output`                | Path to the output zip file (the output `.warc.gz` with `--fetch`)                     | `{basename}_{hex}.zip` in the current directory, same hex and `_partial` rule as the root directory inside (`{basename}_{hex}.warc.gz` with `--fetch`) |
 | `--dry-run`               | Print summary without creating output. The scan always stops after at most 10 capture records, so it never streams the whole file; a lower `--limit` is respected |                                         |
 | `--limit <N>`             | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
 | `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
 | `--metadata-only`         | Write every CSV, manifest and sidecar but no payload files                             | Off, payloads are written               |
 | `--fetch`                 | Treat `input_file` as a `manifest.csv` and download every row's byte range into one `.warc.gz` (see [Building and downloading a subset](#building-and-downloading-a-subset)). Not combinable with `--limit` or `--format` | Off |
-| `--rate <N>`              | `--fetch` only: requests per second per host, `0` for unlimited                        | [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s per-host pacing for http(s), `2` for s3 |
-| `--retries <N>`           | `--fetch` only: connection failures tolerated per request (http(s), throttling is retried without limit) or retries per request (s3) | `100` / `8`                            |
+| `--rate <N>`              | `--fetch` only: requests per second per host, `0` for unlimited                        | [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s per-host pacing for http(s), `2` for s3 and ia |
+| `--retries <N>`           | `--fetch` only: connection failures tolerated per request (http(s), throttling is retried without limit) or retries per request (s3, ia) | `100` / `8`                            |
 
 ### Small Examples
 
@@ -403,7 +411,7 @@ mlr --csv filter '$http_status_code == 200' manifest.csv > subset.csv
 warc2zip subset.csv --fetch --output subset.warc.gz
 ```
 
-Every row is fetched by byte range from its own `source_uri` (https, s3 or a local file). Nearby rows share one request, http(s) requests go through [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s Common Crawl-aware retry and pacing (`--rate`, `--retries`), and each source's own `warcinfo` record leads the output. Each record is stamped with `WARC-Source-URI` and `WARC-Source-Range`, cdx_toolkit's convention, so a re-converted subset says on every row where the record sat in the original. `subset.warc.gz` goes straight back into `warc2zip` — or into any other WARC tool.
+Every row is fetched by byte range from its own `source_uri` (https, s3, ia or a local file). Nearby rows share one request, http(s) requests go through [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s Common Crawl-aware retry and pacing (`--rate`, `--retries`), and each source's own `warcinfo` record leads the output. Each record is stamped with `WARC-Source-URI` and `WARC-Source-Range`, cdx_toolkit's convention, so a re-converted subset says on every row where the record sat in the original. `subset.warc.gz` goes straight back into `warc2zip` — or into any other WARC tool.
 
 Three caveats:
 
@@ -519,6 +527,14 @@ the whole files (also available as the manual "Long tests" workflow under Action
 #### Heretrix-style arcs from EOT 2004 (arc is the predecessor to warc)
 
 - crawl-data/EOT-2004/segments/NARA-000/warc/NARA-PEOT-2004-20041014205819-00000-crawling009-c_NARA-PEOT-2004-20041014205819-00000-crawling009.archive.org.arc.gz
+
+### Internet Archive items (`ia://`)
+
+A public archive.org item holding an EOT 2024 Heritrix WARC (1.6 GBytes). The two spellings read the same bytes;
+the `ia://` one also works for restricted items once you are logged in (see [Usage](#usage)):
+
+- https://archive.org/download/EOT24PRE-20240926175758-crawl808/EOT24PRE-20240926175758-00032.warc.gz
+- ia://EOT24PRE-20240926175758-crawl808/EOT24PRE-20240926175758-00032.warc.gz
 
 ## Old CCF ARCs
 
