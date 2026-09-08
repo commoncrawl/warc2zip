@@ -154,7 +154,7 @@ creates a lot of metadata files, one for each payload.
 
 To see real output before installing anything, download one of the ready-made zips
 listed under [WARC examples for testing](#warc-examples-for-testing): each example WARC
-sits next to its full conversion and its `--metadata-only` conversion.
+sits next to its `--format flat` conversion, its `--format sidecar` conversion and its `--metadata-only` conversion.
 
 ### Flat format (`--format flat`, default)
 
@@ -427,9 +427,10 @@ Three caveats:
 We prepared some smaller (~1GBytes or less) and interesting WARC files for testing: US Federal government websites, homepages, etc.
 These files are in a [Huggingface bucket](https://huggingface.co/buckets/commoncrawl/warc2zip-examples) and the `warc2zip` commands
 below read directly from that bucket. 
-Next to each WARC the bucket also holds the zip `warc2zip` made from it and a
-`--metadata-only` zip (every CSV, no payload files), so you can look at the output without running anything.
-These examples are `--format flat` ... you can also try `--format sidecar`
+Next to each WARC the bucket also holds the zips `warc2zip` made from it: one per output format
+(`--format flat` and `--format sidecar`) and a `--metadata-only` zip (every CSV, no payload files),
+so you can look at the output without running anything.
+The commands below use `--format flat` ... you can also try `--format sidecar`
 
 Details:
 
@@ -439,7 +440,7 @@ Details:
 ```
   warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz?download=true' --format flat
 ```
-  - or download the zip we made: [500_RECORDS-REPACKAGE-CC-MAIN-2026-30.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.zip?download=true) (13 MBytes), metadata only: [500_RECORDS-REPACKAGE-CC-MAIN-2026-30.metadata-only.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.metadata-only.zip?download=true) (0.8 MBytes)
+  - or download the zip we made: [500_RECORDS-REPACKAGE-CC-MAIN-2026-30.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.zip?download=true) (13 MBytes), sidecar format: [500_RECORDS-REPACKAGE-CC-MAIN-2026-30.sidecar.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.sidecar.zip?download=true) (14 MBytes), metadata only: [500_RECORDS-REPACKAGE-CC-MAIN-2026-30.metadata-only.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.metadata-only.zip?download=true) (0.8 MBytes)
   - here is the warcinfo
 
 ```
@@ -459,7 +460,7 @@ Details:
 ```
 warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz?download=true' --format flat --limit 1000
 ```
-  - or download the zip we made, which is the full conversion without the limit: [HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.zip?download=true) (1 GByte), metadata only: [HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.metadata-only.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.metadata-only.zip?download=true) (35 MBytes)
+  - or download the zip we made, which is the full conversion without the limit: [HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.zip?download=true) (1 GByte), sidecar format: [HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.sidecar.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.sidecar.zip?download=true) (1.1 GBytes), metadata only: [HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.metadata-only.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.metadata-only.zip?download=true) (35 MBytes)
   - here is the warcinfo
 ```
   software: pypi_cdx_toolkit/0.9.40.dev89+g53a7ef76c
@@ -474,7 +475,7 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/H
 ```
 warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz?download=true' --format flat --limit 1000
   ```
-  - or download the zip we made, which is the full conversion without the limit: [IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.zip?download=true) (434 MBytes), metadata only: [IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.metdata-only.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.metdata-only.zip?download=true) (36 MBytes)
+  - or download the zip we made, which is the full conversion without the limit: [IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.zip?download=true) (434 MBytes), sidecar format: [IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.sidecar.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.sidecar.zip?download=true) (494 MBytes), metadata only: [IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.metdata-only.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.metdata-only.zip?download=true) (36 MBytes)
   - here is the warcinfo
 ```
   software: pypi_cdx_toolkit/0.9.40.dev91+ga04800ea0
@@ -508,7 +509,7 @@ FIXME: all 3 of these download to the same zip name
 
 - prefixes: https://eotarchive.s3.amazonaws.com/ or s3://eotarchive/
 
-#### Heretrix/IA style warWARCscs from EOT 2024
+#### Heretrix/IA style WARCs from EOT 2024
 
 - crawl-data/EOT-2024/segments/IA-000/EOT24PRE-20240926172119-crawl804_EOT24PRE-20240926172119-00000.warc.gz
 
