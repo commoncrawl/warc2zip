@@ -1,12 +1,15 @@
 import argparse
+import asyncio
 import csv
 import io
 import json
 import mimetypes
 import posixpath
+import random
 import re
 import secrets
 import sys
+import time
 import zipfile
 from collections import Counter
 from datetime import datetime, timezone
@@ -55,26 +58,120 @@ DRY_RUN_MAX = 10  # hard cap on capture records scanned by --dry-run
 EXTRACTED_RECORD_TYPES = ("warcinfo", "response", "revisit", "request", "metadata")
 
 
+# Transient-failure policy for reading a remote input. Names match the --fetch helpers so the
+# two definitions merge into one.
+FETCH_DEFAULT_RETRIES = 8  # retries after the first attempt
+FETCH_MAX_BACKOFF = 60.0  # seconds; the cap on one exponential-backoff wait
+FETCH_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def error_status(exc):
+    """HTTP status carried by an exception (aiohttp's ClientResponseError), else None."""
+    status = getattr(exc, "status", None)
+    return status if isinstance(status, int) else None
+
+
+def retry_after_seconds(exc):
+    """The Retry-After delay the server asked for, in seconds; only the delta-seconds form."""
+    headers = getattr(exc, "headers", None)
+    if not headers:
+        return None
+    try:
+        return max(0.0, float(headers.get("Retry-After")))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_retryable(exc):
+    """Transient failures only: throttling, server errors, timeouts, dropped connections.
+
+    A 404/403 (fsspec raises FileNotFoundError / PermissionError) and any other 4xx are
+    deterministic and re-raised at once. aiohttp's non-OSError exceptions (payload/disconnect)
+    are recognised by module, so aiohttp is not imported here.
+    """
+    status = error_status(exc)
+    if status is not None:
+        return status in FETCH_RETRYABLE_STATUSES
+    if isinstance(exc, (FileNotFoundError, PermissionError)):
+        return False
+    if isinstance(exc, (OSError, TimeoutError, asyncio.TimeoutError)):
+        return True
+    return type(exc).__module__.split(".")[0] == "aiohttp"
+
+
+def fetch_with_retry(fetch, *, retries=FETCH_DEFAULT_RETRIES, label="", sleep=time.sleep, rng=random.random):
+    """Call the zero-argument `fetch` until it returns, retrying transient failures.
+
+    Waits Retry-After when the server sends one, otherwise an exponential backoff (2^attempt
+    seconds, capped at FETCH_MAX_BACKOFF) with jitter in [0.5, 1.5). One stderr line per retry.
+    Re-raises on a non-retryable error or once `retries` retries are used up.
+    """
+    attempts = max(1, retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch()
+        except Exception as exc:
+            if attempt == attempts or not is_retryable(exc):
+                raise
+            delay = retry_after_seconds(exc)
+            if delay is None:
+                delay = min(FETCH_MAX_BACKOFF, 2.0**attempt) * (0.5 + rng())
+            print(
+                f"warning: {label}: attempt {attempt}/{attempts} failed ({exc}), retrying in {delay:.1f} s",
+                file=sys.stderr,
+            )
+            sleep(delay)
+
+
 class CountingStream(io.IOBase):
-    def __init__(self, raw_stream):
+    """Sequential read-through wrapper: counts the bytes handed out and retries transient failures.
+
+    tell() is the count, which is what the progress bar reads (sys.stdin.buffer has a tell()
+    that crashes on a pipe). A read that fails with a transient error — throttling, a 5xx, a
+    connection dropped mid-block — is retried after seeking the underlying stream back to the
+    count, so the caller sees one contiguous byte stream and never a duplicated or missing
+    block. A stream that cannot seek (a pipe) gets no retry: there is nothing to rewind to,
+    so the error propagates as before.
+    """
+
+    def __init__(self, raw_stream, *, label="", retries=FETCH_DEFAULT_RETRIES, sleep=time.sleep):
         self._stream = raw_stream
         self._bytes_read = 0
+        self._label = label
+        self._retries = retries
+        self._sleep = sleep
+        try:
+            self._seekable = bool(raw_stream.seekable())
+        except (AttributeError, OSError, ValueError):
+            self._seekable = False
 
     def tell(self):
         """Acts as the progress tracker for progress bar libraries."""
         return self._bytes_read
 
-    def read(self, size=-1):
-        data = self._stream.read(size)
+    def _read_with_retry(self, method, size):
+        attempts = 0
+
+        def once():
+            nonlocal attempts
+            if attempts:  # a failed attempt may have moved the underlying position
+                self._stream.seek(self._bytes_read)
+            attempts += 1
+            return method(size)
+
+        if self._seekable:
+            data = fetch_with_retry(once, retries=self._retries, label=self._label, sleep=self._sleep)
+        else:
+            data = once()
         if data:
             self._bytes_read += len(data)
         return data
 
+    def read(self, size=-1):
+        return self._read_with_retry(self._stream.read, size)
+
     def readline(self, size=-1):
-        data = self._stream.readline(size)
-        if data:
-            self._bytes_read += len(data)
-        return data
+        return self._read_with_retry(self._stream.readline, size)
 
     # Forward other essential methods to the underlying stream
     def readable(self):
@@ -710,9 +807,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         limit_reached = False
 
         with fsspec_open(input_file, "rb", default_fh=sys.stdin.buffer) as stream:
-            if not hasattr(stream, "tell") or stream == sys.stdin.buffer:
-                # sys.stdin.buffer has a tell() method but it crashes
-                stream = CountingStream(stream)
+            stream = CountingStream(stream, label=input_file)
             with tqdm(total=file_size, unit="B", unit_scale=True, desc="Scanning") as pbar:
                 for record in open_archive_iterator(stream):
                     if limit_reached and record.rec_type in ("response", "revisit"):
@@ -767,7 +862,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             # Count reads ourselves so an early EOF is not mistaken for a complete archive.
             # if we ever decide to add partial-range downloads, this needs to account for that
             expected_size = getattr(raw_stream, "size", None) or file_size
-            stream = CountingStream(raw_stream)
+            stream = CountingStream(raw_stream, label=input_file)
             pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
             # Held by name rather than iterated anonymously: get_record_offset() /
             # get_record_length() hang off the iterator, not the record.
