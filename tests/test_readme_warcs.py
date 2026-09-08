@@ -41,6 +41,8 @@ SHORT_TIMEOUT = 300
 HF = "https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/"
 CC = "https://data.commoncrawl.org/"
 EOT = "https://eotarchive.s3.amazonaws.com/crawl-data/"
+# An archive.org item, through the ia:// scheme (see InternetArchiveFileSystem).
+IA = "ia://"
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,12 @@ EXAMPLES = [
         EOT + "EOT-2024/segments/IA-000/warc/EOT24PRE-20240926172119-crawl804_EOT24PRE-20240926172119-00000.warc.gz",
         "Heritrix / Internet Archive",
         "1 GB",
+    ),
+    Example(
+        "ia-eot24pre-heritrix",
+        IA + "EOT24PRE-20240926175758-crawl808/EOT24PRE-20240926175758-00032.warc.gz",
+        "Heritrix, read from an Internet Archive item over ia://",
+        "1.6 GB",
     ),
     Example(
         "eot2024-nutch-repackage",

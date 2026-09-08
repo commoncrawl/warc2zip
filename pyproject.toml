@@ -9,7 +9,7 @@ description = "Convert gzipped WARC files into zip-of-zips archives"
 requires-python = ">=3.10"
 dependencies = [
     "cdx_toolkit>=0.9.39",
-    "fsspec",
+    "fsspec[http]",
     "tqdm>=4.67.3",
     "warcio[s3]==1.8.1",
 ]
