@@ -9,6 +9,9 @@ description = "Convert gzipped WARC files into zip-of-zips archives"
 requires-python = ">=3.10"
 dependencies = [
     "cdx_toolkit>=0.9.39",
+    # ia:// needs fsspec.implementations.ia, not in a fsspec release yet. It cannot be a git dependency
+    # here: s3fs (via warcio[s3]) pins fsspec to its own exact release, which a branch build never
+    # matches. Until it ships, the branch behind the upstream PR is installed *on top* (README, CI).
     "fsspec[http]",
     "tqdm>=4.67.3",
     "warcio[s3]==1.8.1",

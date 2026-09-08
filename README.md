@@ -26,6 +26,14 @@ pip install .
 
 By default, pip will install remote access tools, namely `fsspec` configured to talk to https, s3, and Internet Archive (`ia://`) remote files.
 
+> [!NOTE]
+> `ia://` relies on `fsspec.implementations.ia`, which is not in a released `fsspec` yet. Until it is, install the
+> branch behind the upstream pull request on top:
+>
+> ```bash
+> pip install "fsspec[http] @ git+https://github.com/lfoppiano/filesystem_spec@ia-filesystem"
+> ```
+
 ## Usage
 
 ```bash
