@@ -757,14 +757,17 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
 
     record_types = Counter()  # every record read, by WARC-Type — extracted or not
     limit_reached = False
+    download_size_mismatch = False
 
     # response -> Record id  <-> metadata -
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as outer_zip:
         # Pass 1: Read WARC, write payloads immediately, buffer only headers
-        with fsspec_open(input_file, "rb", default_fh=sys.stdin.buffer) as stream:
-            if not hasattr(stream, "tell") or stream == sys.stdin.buffer:
-                # sys.stdin.buffer has a tell() method but it crashes
-                stream = CountingStream(stream)
+        with fsspec_open(input_file, "rb", default_fh=sys.stdin.buffer) as raw_stream:
+            # fsspec HTTP/S3 handles expose the response size when the server provides one.
+            # Count reads ourselves so an early EOF is not mistaken for a complete archive.
+            # if we ever decide to add partial-range downloads, this needs to account for that
+            expected_size = getattr(raw_stream, "size", None) or file_size
+            stream = CountingStream(raw_stream)
             pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
             # Held by name rather than iterated anonymously: get_record_offset() /
             # get_record_length() hang off the iterator, not the record.
@@ -895,6 +898,13 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
 
                 pbar.update(stream.tell() - pbar.n)
             pbar.close()
+
+            if limit is None and expected_size is not None and stream.tell() != expected_size:
+                download_size_mismatch = True
+                print(
+                    f"Warning: read {stream.tell()} bytes; expected {expected_size} bytes",
+                    file=sys.stderr,
+                )
 
         # Link pending requests to their capture groups. A response names its request in
         # WARC-Concurrent-To; a CC revisit names it in WARC-Refers-To instead, so both are
@@ -1027,7 +1037,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     if skipped:
         print(f"warning: {skipped} CSV row(s) could not be written (see warnings above)", file=sys.stderr)
 
-    return skipped
+    return skipped + int(download_size_mismatch)
 
 
 def cli():

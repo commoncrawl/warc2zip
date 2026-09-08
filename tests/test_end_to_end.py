@@ -519,3 +519,19 @@ def test_limit_counts_revisit_captures(warc_path, tmp_path):
         manifest = [dict(zip(MANIFEST_COLUMNS, row)) for row in read_rows(zf, "manifest.csv")]
     assert len(manifest) == 4
     assert manifest[-1]["warc_type"] == "revisit"
+
+
+def test_short_download_is_reported(warc_path, tmp_path, monkeypatch, capsys):
+    class SizedBytesIO(io.BytesIO):
+        def __init__(self, data, size):
+            super().__init__(data)
+            self.size = size
+
+    data = warc_path.read_bytes()
+    monkeypatch.setattr(
+        "warc2zip.fsspec_open",
+        lambda *_args, **_kwargs: SizedBytesIO(data, len(data) + 1),
+    )
+
+    assert main("https://example.test/test.warc.gz", str(tmp_path / "out.zip")) == 1
+    assert f"read {len(data)} bytes; expected {len(data) + 1} bytes" in capsys.readouterr().err
