@@ -152,6 +152,10 @@ This testing release of the software supports 2 output formats: flat and sidecar
 Flat puts the metadata into a small number of large files, and sidecar instead
 creates a lot of metadata files, one for each payload.
 
+To see real output before installing anything, download one of the ready-made zips
+listed under [WARC examples for testing](#warc-examples-for-testing): each example WARC
+sits next to its full conversion and its `--metadata-only` conversion.
+
 ### Flat format (`--format flat`, default)
 
 Counter-named payload files with global CSV/JSONL metadata. Optimized for bulk analysis.
@@ -422,16 +426,20 @@ Three caveats:
 
 We prepared some smaller (~1GBytes or less) and interesting WARC files for testing: US Federal government websites, homepages, etc.
 These files are in a [Huggingface bucket](https://huggingface.co/buckets/commoncrawl/warc2zip-examples) and the `warc2zip` commands
-below read directly from that bucket. These examples are `--format flat` ... you can also try `--format sidecar`
+below read directly from that bucket. 
+Next to each WARC the bucket also holds the zip `warc2zip` made from it and a
+`--metadata-only` zip (every CSV, no payload files), so you can look at the output without running anything.
+These examples are `--format flat` ... you can also try `--format sidecar`
 
 Details:
 
-- Example WARC from CC-MAIN-2026-25 with 500 records (response, request and metadata, 13 MBytes) [CC-MAIN-2026-30-500_records.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true)
+- Example WARC from CC-MAIN-2026-25 with 500 records (response, request and metadata, 13 MBytes) [500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz?download=true)
 
   - make the zip
 ```
-  warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true' --format flat
+  warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz?download=true' --format flat
 ```
+  - or download the zip we made: [500_RECORDS-REPACKAGE-CC-MAIN-2026-30.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.zip?download=true) (13 MBytes), metadata only: [500_RECORDS-REPACKAGE-CC-MAIN-2026-30.metadata-only.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.metadata-only.zip?download=true) (0.8 MBytes)
   - here is the warcinfo
 
 ```
@@ -446,11 +454,12 @@ Details:
   conformsTo: https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.1/
   ```
 
-- Homepages extracted from CC-MAIN-2026-21 (response records only, 1 GByte) [homepages_CC-MAIN-2026-21.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true)
+- Homepages extracted from CC-MAIN-2026-21 (response records only, 1 GByte) [HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz?download=true)
   - make the zip, note the limit
 ```
-warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true' --format flat --limit 1000
+warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz?download=true' --format flat --limit 1000
 ```
+  - or download the zip we made, which is the full conversion without the limit: [HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.zip?download=true) (1 GByte), metadata only: [HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.metadata-only.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.metadata-only.zip?download=true) (35 MBytes)
   - here is the warcinfo
 ```
   software: pypi_cdx_toolkit/0.9.40.dev89+g53a7ef76c
@@ -460,11 +469,12 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/h
   creator: Common Crawl Foundation <https://commoncrawl.org>
   operator: Malte Ostendorff <mailto:malte@commoncrawl.org>
   ```
-- URLs of federal institutions (response records only, 1/2 GByte), as part of the [End Of Term Archive](https://eotarchive.org/) project: [is_us_federal_CC-MAIN-2025-13.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true)
+- URLs of federal institutions (response records only, 1/2 GByte), as part of the [End Of Term Archive](https://eotarchive.org/) project: [IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz?download=true)
   - make the zip, note the limit
 ```
-warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true' --format flat --limit 1000
+warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz?download=true' --format flat --limit 1000
   ```
+  - or download the zip we made, which is the full conversion without the limit: [IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.zip?download=true) (434 MBytes), metadata only: [IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.metdata-only.zip](https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.metdata-only.zip?download=true) (36 MBytes)
   - here is the warcinfo
 ```
   software: pypi_cdx_toolkit/0.9.40.dev91+ga04800ea0
@@ -477,15 +487,15 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/i
 
 ## Many more WARC examples for testing
 
-### Common Crawl style repackaged warcs (intended for testing)
+### Common Crawl style repackaged WARCs (intended for testing)
 
-- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true (13 MBytes)
-- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true (1 GByte)
-- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true (1/2 GByte)
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz?download=true (13 MBytes)
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz?download=true (1 GByte)
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz?download=true (1/2 GByte)
 
-FIXME REPACKAGE should be in the name. Are these also on s3://commoncrawl/ ? projects/warc2zip-examples ?
+FIXME: are these also on s3://commoncrawl/ ? projects/warc2zip-examples ?
 
-### Normal Common Crawl CC-MAIN warcs
+### Normal Common Crawl CC-MAIN WARCs
 
 - prefixes: https://data.commoncrawl.org/ or s3://commoncrawl/
 - crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/warc/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
@@ -498,11 +508,11 @@ FIXME: all 3 of these download to the same zip name
 
 - prefixes: https://eotarchive.s3.amazonaws.com/ or s3://eotarchive/
 
-#### Heretrix/IA style warcs from EOT 2024
+#### Heretrix/IA style warWARCscs from EOT 2024
 
 - crawl-data/EOT-2024/segments/IA-000/EOT24PRE-20240926172119-crawl804_EOT24PRE-20240926172119-00000.warc.gz
 
-#### Nutch/CCF style warcs from EOT 2024
+#### Nutch/CCF style WARCs from EOT 2024
 
 - crawl-data/EOT-2024/segments/CC-000/warc/EOT-2024-REPACKAGE-CC-MAIN-2024-42-GOV-000000-001.warc.gz
 
@@ -512,11 +522,11 @@ FIXME: all 3 of these download to the same zip name
 - crawl-data/EOT-2024/segments/WR-000/warc/EOT24WR-0015_20250114215650265-8c53efcc-e2d-0_eot-http-energy-gov-eere-office-energy-efficiency-renewable-energy-manual-20250114215335-8c53efcc-e2d-screenshots-20250114215649547.warc.gz
 - crawl-data/EOT-2024/segments/WR-000/warc/EOT24WR-0015_20250114215650265-8c53efcc-e2d-0_eot-http-energy-gov-eere-office-energy-efficiency-renewable-energy-manual-20250114215335-8c53efcc-e2d-text-20250114215649747.warc.gz
 
-#### ArchiveTeam style megawarcs, EOT 2024 (warning: 10 gigabytes)
+#### ArchiveTeam style megaWARCs, EOT 2024 (warning: 10 gigabytes)
 
 - crawl-data/EOT-2024/segments/AT-000/warc/archiveteam_usgovernment_20250131232111_96ad506d_usgovernment_20250131232111_96ad506d.1738361595.megawarc.warc.gz
 
-#### Heretrix-style arcs from EOT 2004 (arc is the predecessor to warc)
+#### Heretrix-style ARCs from EOT 2004 (arc is the predecessor to warc)
 
 - crawl-data/EOT-2004/segments/NARA-000/warc/NARA-PEOT-2004-20041014205819-00000-crawling009-c_NARA-PEOT-2004-20041014205819-00000-crawling009.archive.org.arc.gz
 
@@ -533,5 +543,5 @@ FIXME: all 3 of these download to the same zip name
 ## TODO
 
 - CC-NEWS - old, pre-upgrade, post-upgrade
-- ArchiveTeam warcs (not megawarcs)
+- ArchiveTeam WARCs (not megaWARCs)
 - ArchiveIt old and new, for various flavors
