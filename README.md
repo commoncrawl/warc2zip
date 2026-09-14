@@ -555,3 +555,6 @@ the whole files (also available as the manual "Long tests" workflow under Action
 - CC-NEWS - old, pre-upgrade, post-upgrade
 - ArchiveTeam WARCs (not megaWARCs)
 - ArchiveIt old and new, for various flavors
+- wget generates WARCs
+- HTTrack used to make ARC files ?
+- https://github.com/arquivo/roteiro2arc ? no examples in the repo
