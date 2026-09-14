@@ -145,6 +145,15 @@ Causes:
 
 Warnings never change the exit status; warc2zip exits 1 only when a CSV row could not be written.
 
+```
+warning: <input>: attempt 1/9 failed (503, message='Service Unavailable', ...), retrying in 2.6 s
+```
+
+A transient failure while reading a remote input — throttling, a 5xx, a connection dropped
+mid-block. The read resumes exactly where it stopped, so nothing is duplicated or lost. Up to
+8 retries with exponential backoff (capped at 60 s, `Retry-After` honoured); after that the
+error is raised. A pipe (`-` on stdin) cannot be rewound, so it is not retried.
+
 ## Output Formats
 
 All files are placed under a unique root directory inside the zip to prevent collisions when extracting multiple archives into the same folder. The directory name is derived from the WARC-Filename header (in the `warcinfo` record), the current timestamp, and a random suffix: `{crawl_name}_{YYYYMMDDTHHMMSS}_{hex}`. Without `--output`, the zip carries the same hex (`archive_{hex}.zip`), so same-named inputs such as Common Crawl's `warc/`, `crawldiagnostics/` and `robotstxt/` files never overwrite each other's zip. A `--limit` run appends `_partial` to both names (`archive_{hex}_partial.zip`).
