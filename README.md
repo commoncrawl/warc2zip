@@ -8,8 +8,6 @@ collection, perhaps a repackage of Common Crawl containing just webpages labeled
 Swahili. `warc2zip` then converts these WARCs into zip files containing the web capture payloads,
 with metadata stored as csv (spreadsheet) files.
 
-FIXME: should we always write WARC (all caps) other than filenames?
-
 Each response record's payload is stored as a individual file with a proper extension, derived from its Content-Type.
 Metadata (both WARC and http) from the request, response, and metadata records are  written to CSV (spreadsheet) files.
 
@@ -50,11 +48,14 @@ warc2zip https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz
 | Flag                      | Description                                                                            | Default                                 |
 |---------------------------|----------------------------------------------------------------------------------------|-----------------------------------------|
 | `input_file`              | Path or URI to a `.warc.gz` file (positional, required)                                |                                         |
-| `--output`                | Path to the output zip file                                                            | Replace `.warc.gz` with `.zip`          |
+| `--output`                | Path to the output zip file (the output `.warc.gz` with `--fetch`)                     | `{basename}_{hex}.zip` in the current directory, same hex and `_partial` rule as the root directory inside (`{basename}_{hex}.warc.gz` with `--fetch`) |
 | `--dry-run`               | Print summary without creating output. The scan always stops after at most 10 capture records, so it never streams the whole file; a lower `--limit` is respected |                                         |
 | `--limit <N>`             | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
 | `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
 | `--metadata-only`         | Write every CSV, manifest and sidecar but no payload files                             | Off, payloads are written               |
+| `--fetch`                 | Treat `input_file` as a `manifest.csv` and download every row's byte range into one `.warc.gz` (see [Building and downloading a subset](#building-and-downloading-a-subset)). Not combinable with `--limit` or `--format` | Off |
+| `--rate <N>`              | `--fetch` only: requests per second per host, `0` for unlimited                        | [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s per-host pacing for http(s), `2` for s3 |
+| `--retries <N>`           | `--fetch` only: connection failures tolerated per request (http(s), throttling is retried without limit) or retries per request (s3) | `100` / `8`                            |
 
 ### Small Examples
 
@@ -146,7 +147,7 @@ Warnings never change the exit status; warc2zip exits 1 only when a CSV row coul
 
 ## Output Formats
 
-All files are placed under a unique root directory inside the zip to prevent collisions when extracting multiple archives into the same folder. The directory name is derived from the WARC-Filename header (in the `warcinfo` record), the current timestamp, and a random suffix: `{crawl_name}_{YYYYMMDDTHHMMSS}_{hex}`.
+All files are placed under a unique root directory inside the zip to prevent collisions when extracting multiple archives into the same folder. The directory name is derived from the WARC-Filename header (in the `warcinfo` record), the current timestamp, and a random suffix: `{crawl_name}_{YYYYMMDDTHHMMSS}_{hex}`. Without `--output`, the zip carries the same hex (`archive_{hex}.zip`), so same-named inputs such as Common Crawl's `warc/`, `crawldiagnostics/` and `robotstxt/` files never overwrite each other's zip. A `--limit` run appends `_partial` to both names (`archive_{hex}_partial.zip`).
 
 This testing release of the software supports 2 output formats: flat and sidecar.
 Flat puts the metadata into a small number of large files, and sidecar instead
@@ -185,7 +186,7 @@ FOO.zip
 - **Denormalized CSVs** (`*_headers.csv`, `metadata.csv`, `warcinfo.csv`): multiple rows per file — columns: `filename, header_name, header_value`. Header names are normalized to lowercase with `-` replaced by `_`.
 - **Multiline CSVs** (`*_multi.csv`): one row per file — columns: `filename, headers` (headers as a multiline string)
 - **`manifest.csv`**: the wide mirror of `manifest.jsonl` — one row per response, one column per key. Both are written from the same entries, so they cannot drift.
-- **`warcinfo.*`**: crawl-level provenance (`isPartOf`, `publisher`, `software`, `hostname`, `conformsTo`, …). The `filename` column carries the synthetic key `warcinfo`, since the record belongs to no payload file; a concatenated WARC with several warcinfo records numbers the extras `warcinfo.1`, `warcinfo.2`, ….
+- **`warcinfo.*`**: crawl-level provenance (`isPartOf`, `publisher`, `software`, `hostname`, `conformsTo`, …). The `filename` column carries the synthetic key `warcinfo`, since the record belongs to no payload file; a concatenated WARC with several `warcinfo` records numbers the extras `warcinfo.1`, `warcinfo.2`, ….
 
 ### Sidecar format (`--format sidecar`)
 
@@ -333,13 +334,13 @@ A `revisit` row names no file in the zip (its `filename` is a synthetic join key
 
 The last four columns are what make a row re-fetchable on its own, and they are repeated on every row on purpose — no join against another file, no knowledge of the zip they came from:
 
-| Column | Meaning |
-|---|---|
-| `warc_filename` | What the WARC **calls itself** (the warcinfo record's `WARC-Filename`), falling back to the input's basename. A label — for Common Crawl it is a bare basename, not a fetchable path. |
-| `source_uri` | Where warc2zip **read the file from** — the `input_file` argument, verbatim. **This is the fetch target.** |
-| `warc_record_offset` / `warc_record_length` | Byte range of the record. The same triple a CDX index carries. |
+| Column                                      | Meaning                                                                                                                                                                               |
+|---------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `warc_filename`                             | What the WARC **calls itself** (the `warcinfo` record's `WARC-Filename`), falling back to the input's basename. A label — for Common Crawl it is a bare basename, not a fetchable path. |
+| `source_uri`                                | Where warc2zip **read the file from** — the `input_file` argument, verbatim. **This is the fetch target.**                                                                            |
+| `warc_record_offset` / `warc_record_length` | Byte range of the record. The same triple a CDX index carries.                                                                                                                        |
 
-The offsets are positions in the file named by `source_uri` — that is the only file they are guaranteed to address. `warc_filename` may name a *different* file: a derived WARC (an extract, or the output of `tools/warc_limit.py`) copies the original warcinfo record, so it keeps advertising the original WARC's name while its byte offsets refer to the derived file. Use `source_uri` to fetch, `warc_filename` to say where the records originated. See [Building and downloading a subset](#building-and-downloading-a-subset).
+The offsets are positions in the file named by `source_uri` — that is the only file they are guaranteed to address. `warc_filename` may name a *different* file: a derived WARC (an extract, or the output of `tools/warc_limit.py`) copies the original `warcinfo` record, so it keeps advertising the original WARC's name while its byte offsets refer to the derived file. Use `source_uri` to fetch, `warc_filename` to say where the records originated. See [Building and downloading a subset](#building-and-downloading-a-subset).
 
 ### warcinfo.csv
 
@@ -360,7 +361,7 @@ Crawl-level provenance, with the record body flattened the same way as `metadata
 
 `warcinfo.warc` and `warcinfo.warc-fields` hold the same record as raw wire bytes.
 
-`source_uri` is the input this zip was converted from. It is also a column on every `manifest.csv` row; the copy here is the crawl-level one, written even when the WARC carries no warcinfo record at all, so the provenance is never lost.
+`source_uri` is the input this zip was converted from. It is also a column on every `manifest.csv` row; the copy here is the crawl-level one, written even when the WARC carries no `warcinfo` record at all, so the provenance is never lost.
 
 Both `source_uri` and the `warc_record_*` fields are pseudo-headers — computed while streaming, not read off the wire. A real warcinfo header named `Source-URI` would normalize to the same name; none exists in practice, but the collision is worth knowing about, same as for `status_code`.
 
@@ -372,50 +373,42 @@ The point of `warc_filename` + `warc_record_offset` + `warc_record_length` is th
 
 The intended workflow is: convert once with `--metadata-only` (a few tens of KB instead of gigabytes), filter the CSV however you like, then pull only the captures you kept.
 
+### Get metadata only — no payloads
 ```bash
-# 1. metadata only — no payloads
 warc2zip 'https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz' --metadata-only --output meta.zip
 unzip -p meta.zip '*/manifest.csv' > manifest.csv
 ```
 
-FIXME: replace 2. with grep and csv sorts of instructions
+### Filter it with whatever you already use
 
-```
-# 2. filter it with whatever you already use — here, everything that came back 200
-python - <<'EOF'
-import csv
-with open("manifest.csv") as fh:
-    rows = [r for r in csv.DictReader(fh) if r["http_status_code"] == "200"]
-with open("subset.csv", "w", newline="") as fh:
-    w = csv.DictWriter(fh, fieldnames=rows[0].keys(), quoting=csv.QUOTE_ALL)
-    w.writeheader()
-    w.writerows(rows)
-EOF
+List the column names: 
+```bash
+head -1 manifest.csv | tr ',' '\n' | tr -d '"\r' | nl
 ```
 
-FIXME: replace 3. by expending warc2zip to do this download, with
-appropriate retrying and rate limits. That might mean installing
-cdx_toolkit and using it for this step.
-
+Filter by column name and value, e.g. get all the `200` responses from the column `http_status_code`:
+```bash
+awk -F'","' -v col="http_status_code" -v val="200" '
+NR==1 { for (i=1; i<=NF; i++) { h=$i; gsub(/["\r]/,"",h); if (h==col) c=i } print; next }
+{ v=$c; gsub(/["\r]/,"",v) } v==val
+' manifest.csv > subset.csv
+````
+or with [miller](https://miller.readthedocs.io/en/latest/): 
 ```
-# 3. fetch each surviving row — every row already knows where it came from
-python - <<'EOF'
-import csv, urllib.request
-with open("subset.csv") as fh, open("subset.warc.gz", "wb") as out:
-    for row in csv.DictReader(fh):
-        start = int(row["warc_record_offset"])
-        end = start + int(row["warc_record_length"]) - 1
-        req = urllib.request.Request(row["source_uri"], headers={"Range": f"bytes={start}-{end}"})
-        out.write(urllib.request.urlopen(req).read())
-EOF
+mlr --csv filter '$http_status_code == 200' manifest.csv > subset.csv
 ```
 
-Concatenated gzip members are themselves a valid `.warc.gz`, so appending the fetched ranges into one file produces a WARC you can feed straight back into `warc2zip` — or into any other WARC tool.
+### Fetch what survived
+```bash
+warc2zip subset.csv --fetch --output subset.warc.gz
+```
+
+Every row is fetched by byte range from its own `source_uri` (https, s3 or a local file). Nearby rows share one request, http(s) requests go through [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s Common Crawl-aware retry and pacing (`--rate`, `--retries`), and each source's own `warcinfo` record leads the output. Each record is stamped with `WARC-Source-URI` and `WARC-Source-Range`, cdx_toolkit's convention, so a re-converted subset says on every row where the record sat in the original. `subset.warc.gz` goes straight back into `warc2zip` — or into any other WARC tool.
 
 Three caveats:
 
 - Fetch with `source_uri`, not `warc_filename`. For Common Crawl the latter is a bare basename like `CC-MAIN-20260618163205-20260618193205-00999.warc.gz`; the full path is `crawl-data/{crawl}/segments/{segment}/warc/{basename}`, and **the segment is not recorded anywhere in the WARC** — `warcinfo.csv` gives you the crawl (`_body.ispartof`) but you would need the crawl's `warc.paths.gz` to resolve the rest.
-- Offsets address the file named by `source_uri`, nothing else. A derived WARC keeps the original's warcinfo record, so its `warc_filename` names a file its offsets do not index.
+- Offsets address the file named by `source_uri`, nothing else. A fetched subset keeps the original's `warcinfo` record, so its `warc_filename` names the original while its offsets index the subset.
 - Offsets stay valid under `--limit`: limiting only stops the read early, it never rewrites them.
 
 ## WARC examples for testing
@@ -477,26 +470,29 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/i
 
 ## Many more WARC examples for testing
 
-### Common Crawl style repackaged warcs (intended for testing)
+### Common Crawl style repackaged WARCs (intended for testing)
 
-- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/CC-MAIN-2026-30-500_records.warc.gz?download=true (13 MBytes)
-- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/homepages_CC-MAIN-2026-21.warc.gz?download=true (1 GByte)
-- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/is_us_federal_CC-MAIN-2025-13.warc.gz?download=true (1/2 GByte)
+#### HuggingFace: 
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz?download=true
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz?download=true
+- https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz?download=true
 
-FIXME REPACKAGE should be in the name. Are these also on s3://commoncrawl/ ? projects/warc2zip-examples ?
+#### AWS:
+**Prefixes**: https://data.commoncrawl.org/ or `s3://commoncrawl/`:
+- /projects/warc2zip-examples/500_RECORDS-REPACKAGE-CC-MAIN-2026-30.warc.gz (13 MBytes)
+- /projects/warc2zip-examples/HOMEPAGES-REPACKAGE-CC-MAIN-2026-21.warc.gz (1 GByte)
+- /projects/warc2zip-examples/IS_US_FEDERAL-REPACKAGE-CC-MAIN-2025-13.warc.gz (1/2 GByte)
 
-### Normal Common Crawl CC-MAIN warcs
+### Normal Common Crawl CC-MAIN WARCs
 
-- prefixes: https://data.commoncrawl.org/ or s3://commoncrawl/
+**Prefixes**: https://data.commoncrawl.org/ or `s3://commoncrawl/`: 
 - crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/warc/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
 - crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/crawldiagnostics/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
 - crawl-data/CC-MAIN-2026-34/segments/1786091384908.68/robotstxt/CC-MAIN-20260807101845-20260807131845-00000.warc.gz
 
-FIXME: all 3 of these download to the same zip name
-
 ### End Of Term Archive (https://eotarchive.org/data/)
 
-- prefixes: https://eotarchive.s3.amazonaws.com/ or s3://eotarchive/
+**Prefixes**: https://eotarchive.s3.amazonaws.com/ or `s3://eotarchive/`: 
 
 #### Heretrix/IA style warcs from EOT 2024
 
