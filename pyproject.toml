@@ -23,3 +23,12 @@ warc2zip = "warc2zip:cli"
 [tool.ruff]
 target-version = "py310"
 line-length = 120
+
+[tool.pytest.ini_options]
+# `long` streams every README example WARC end to end (0.4–10 GB each) and is opt-in:
+# `pytest -m long`. The default run keeps the `--limit` tier, which CI runs.
+addopts = "-m 'not long'"
+markers = [
+    "network: downloads real archives listed in the README (WARC2ZIP_OFFLINE=1 skips)",
+    "long: full-file conversions of the README archives; hours, never in CI",
+]
