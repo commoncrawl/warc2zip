@@ -1,6 +1,7 @@
 """Shared fixtures: the synthetic three-capture WARC used by the end-to-end and --fetch tests."""
 
 import io
+from pathlib import Path
 
 import pytest
 from warcio.statusandheaders import StatusAndHeaders
@@ -90,3 +91,113 @@ def warc_path(tmp_path):
                 )
             )
     return path
+
+
+# --- a stand-in for archive.org ----------------------------------------------------------------
+#
+# ia:// reads go to https://archive.org/download/<item>/<file>, which 302s to a data node on
+# another origin that honours Range. Two servers reproduce exactly that: /download/... on the
+# front server redirects to /items/... on the data node, a second port and so another origin,
+# where aiohttp applies its cross-origin rule and drops the Authorization *header*; the item
+# route serves byte ranges — optionally only to requests carrying a given Authorization value.
+
+import shutil
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+
+
+class _IAHandler(BaseHTTPRequestHandler):
+    state = None  # set per fixture: directory, data_node, require_auth, hits
+
+    def log_message(self, *args):  # keep pytest output clean
+        pass
+
+    def _serve(self, send_body):
+        path = urlsplit(self.path).path
+        self.state.hits.append(SimpleNamespace(path=path, headers=dict(self.headers)))
+        if path.startswith("/download/"):
+            self.send_response(302)
+            self.send_header("Location", f"{self.state.data_node}/items/{path[len('/download/'):]}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if not path.startswith("/items/"):
+            self.send_error(404)
+            return
+        if self.state.require_auth and self.headers.get("Authorization") != self.state.require_auth:
+            self.send_error(403)
+            return
+        target = self.state.directory / path[len("/items/") :]
+        if not target.is_file():
+            self.send_error(404)
+            return
+        data = target.read_bytes()
+        start, end = 0, len(data) - 1
+        status = 200
+        range_header = self.headers.get("Range")
+        if range_header and range_header.startswith("bytes="):
+            first, _, last = range_header[len("bytes=") :].partition("-")
+            start = int(first)
+            end = min(int(last), len(data) - 1) if last else len(data) - 1
+            if start >= len(data):
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{len(data)}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = 206
+        body = data[start : end + 1]
+        self.send_response(status)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(len(body)))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._serve(send_body=True)
+
+    def do_HEAD(self):
+        self._serve(send_body=False)
+
+
+@pytest.fixture
+def ia_server(tmp_path, monkeypatch):
+    """A local archive.org on `localhost`: `download_url` and `auth_domain` of
+    InternetArchiveFileSystem are pointed at it for the test, the front server redirecting to a
+    data node on a second port. `.add(item, path)` publishes a file; `.require_auth` gates the
+    data-node route on an exact Authorization value; `.hits` records every request on both
+    servers; setting `.data_node` to a `127.0.0.1` URL moves the node out of the auth domain."""
+    from warc2zip import InternetArchiveFileSystem
+
+    directory = tmp_path / "items"
+    directory.mkdir()
+    state = SimpleNamespace(directory=directory, require_auth=None, hits=[])
+    handler = type("Handler", (_IAHandler,), {"state": state})
+    servers = [HTTPServer(("127.0.0.1", 0), handler) for _ in range(2)]
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    front, node = servers
+
+    def add(item, path):
+        (directory / item).mkdir(exist_ok=True)
+        shutil.copy(path, directory / item / Path(path).name)
+        return f"ia://{item}/{Path(path).name}"
+
+    state.add = add
+    state.node_port = node.server_port
+    state.data_node = f"http://localhost:{node.server_port}"
+    state.download_url = f"http://localhost:{front.server_port}/download/"
+    monkeypatch.setattr(InternetArchiveFileSystem, "download_url", state.download_url)
+    monkeypatch.setattr(InternetArchiveFileSystem, "auth_domain", "localhost")
+    try:
+        yield state
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()

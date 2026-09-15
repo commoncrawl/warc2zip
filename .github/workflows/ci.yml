@@ -36,6 +36,30 @@ jobs:
           source .venv/bin/activate
           pytest -q
 
+  # The README's real archives (Hugging Face, data.commoncrawl.org, the EOT bucket, archive.org),
+  # `--limit 20` each. Its own job so a remote outage fails here, by name, and not the unit matrix.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+
+      - name: Integration tests
+        run: |
+          source .venv/bin/activate
+          pytest -q -m integration --durations=10
+
       # Ruff linting/formatting — uncomment when ready to enforce in CI
       # - name: Lint
       #   run: |
