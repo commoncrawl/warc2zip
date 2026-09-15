@@ -18,16 +18,14 @@ import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
-import yarl
+from aiohttp import hdrs
 from cdx_toolkit.myrequests import get_retries, myrequests_get, retry_info
 from fsspec.core import url_to_fs
 from fsspec.implementations.http import HTTPFileSystem
-from fsspec.implementations.http import get_client as http_get_client
 from fsspec.registry import register_implementation
 from fsspec.utils import stringify_path
 from tqdm import tqdm
@@ -48,7 +46,7 @@ from warcio.warcwriter import WARCWriter
 # fsspec release ships it, delete everything down to the register_implementation() call.
 
 IA_DOWNLOAD_URL = "https://archive.org/download/"
-IA_COOKIE_DOMAIN = ".archive.org"
+IA_AUTH_DOMAIN = ".archive.org"
 # The internetarchive package's own names (not the shorter ones one might guess).
 IA_ENV_ACCESS_KEY = "IA_ACCESS_KEY_ID"
 IA_ENV_SECRET_KEY = "IA_SECRET_ACCESS_KEY"
@@ -75,43 +73,41 @@ def ia_config_path():
 
 @dataclass(frozen=True)
 class IACredentials:
-    """What logs a request in at archive.org; all-empty means anonymous."""
+    """The IA-S3 key pair that logs a request in at archive.org; None means anonymous."""
 
     access_key: str | None = None
     secret_key: str | None = None
-    cookies: dict = field(default_factory=dict)  # {"logged-in-user": ..., "logged-in-sig": ...}
     config_file: str | None = None  # where they were read from, for messages
 
     @property
     def anonymous(self):
-        return not (self.access_key or self.cookies)
+        return not self.access_key
+
+    @property
+    def authorization(self):
+        """The ``Authorization`` header value, or None when anonymous."""
+        if self.anonymous:
+            return None
+        return f"LOW {self.access_key}:{self.secret_key}"
 
 
 def load_ia_credentials(config_file=None):
     """Credentials from ia.ini and the environment; anonymous when there are none.
 
-    `[s3] access/secret` and `[cookies] logged-in-user/logged-in-sig` are read from `config_file`
-    (default: ia_config_path()). Cookie values in the file carry their attributes
-    (`x; expires=...; path=/; domain=.archive.org`), which are parsed off. IA_ACCESS_KEY_ID /
-    IA_SECRET_ACCESS_KEY override the file's keys and must be set together. A missing file or
-    section is not an error: public items need nothing.
+    `[s3] access/secret` are read from `config_file` (default: ia_config_path()); the `[cookies]`
+    section `ia configure` also writes is ignored, as the keys log a request in on their own.
+    IA_ACCESS_KEY_ID / IA_SECRET_ACCESS_KEY override the file's keys and must be set together. A
+    missing file or section is not an error: public items need nothing.
     """
     path = config_file or ia_config_path()
     access_key = secret_key = None
-    cookies = {}
     if path and os.path.isfile(path):
-        # RawConfigParser: the cookie values contain '%' (URL-encoded emails), which the default
-        # interpolation would reject.
+        # RawConfigParser: the file's cookie values contain '%' (URL-encoded emails), which the
+        # default interpolation would reject.
         parser = configparser.RawConfigParser()
         parser.read(path, encoding="utf-8")
         access_key = parser.get("s3", "access", fallback="").strip() or None
         secret_key = parser.get("s3", "secret", fallback="").strip() or None
-        if parser.has_section("cookies"):
-            for name, raw in parser.items("cookies"):
-                morsels = SimpleCookie()
-                morsels.load(f"{name}={raw}")
-                if name in morsels and morsels[name].value:
-                    cookies[name] = morsels[name].value
 
     env_access, env_secret = os.environ.get(IA_ENV_ACCESS_KEY), os.environ.get(IA_ENV_SECRET_KEY)
     if bool(env_access) != bool(env_secret):
@@ -120,7 +116,34 @@ def load_ia_credentials(config_file=None):
         access_key, secret_key = env_access, env_secret
     if not (access_key and secret_key):
         access_key = secret_key = None
-    return IACredentials(access_key, secret_key, cookies, path if path and os.path.isfile(path) else None)
+    return IACredentials(access_key, secret_key, path if path and os.path.isfile(path) else None)
+
+
+def in_domain(host, domain):
+    """Whether `host` is `domain` (leading dot optional) or a subdomain of it."""
+    if not host:
+        return False
+    domain = domain.lower().lstrip(".")
+    host = host.lower().rstrip(".")
+    return host == domain or host.endswith("." + domain)
+
+
+def authorized_request_class(authorization, domain, base=aiohttp.ClientRequest):
+    """A ``ClientRequest`` that sends `authorization` to every host in `domain`.
+
+    aiohttp drops ``Authorization`` when a redirect changes origin, and every archive.org download
+    is such a redirect (to a data node). It builds a new request from the session's
+    ``request_class`` for each hop, so setting the header here puts it back on the data-node hop;
+    testing the host keeps it from leaving `domain` should a data node redirect elsewhere.
+    """
+
+    class AuthorizedRequest(base):
+        def update_headers(self, headers):
+            super().update_headers(headers)
+            if in_domain(self.url.host, domain):
+                self.headers[hdrs.AUTHORIZATION] = authorization
+
+    return AuthorizedRequest
 
 
 class InternetArchiveFileSystem(HTTPFileSystem):
@@ -129,21 +152,20 @@ class InternetArchiveFileSystem(HTTPFileSystem):
     Every path is read from ``https://archive.org/download/<identifier>/<filename>``, which
     redirects to a data node that honours HTTP Range requests, so this is ``HTTPFileSystem``
     with a path mapping and archive.org credentials. Public items need no credentials.
-    Restricted items need the account's cookies (and, optionally, its S3 keys) as written by
-    ``ia configure`` from the ``internetarchive`` package to ``ia.ini``; that file is found the
-    way the package finds it (``$IA_CONFIG_FILE``, ``$XDG_CONFIG_HOME/internetarchive/ia.ini``,
-    ``~/.config/ia.ini``, ``~/.ia``). Explicit arguments win over the file.
+    Restricted items need the account's IA-S3 keys, as written by ``ia configure`` from the
+    ``internetarchive`` package to ``ia.ini``; that file is found the way the package finds it
+    (``$IA_CONFIG_FILE``, ``$XDG_CONFIG_HOME/internetarchive/ia.ini``, ``~/.config/ia.ini``,
+    ``~/.ia``). Explicit arguments win over the file.
 
     Parameters
     ----------
     access_key, secret_key: str, optional
-        IA S3 keys, sent as ``Authorization: LOW <access>:<secret>`` on the first request.
-        ``IA_ACCESS_KEY_ID`` / ``IA_SECRET_ACCESS_KEY`` in the environment override ``ia.ini``.
-    cookies: dict, optional
-        ``{"logged-in-user": ..., "logged-in-sig": ...}``. They go into the session's cookie jar
-        for ``.archive.org`` rather than into a ``Cookie`` header: every download is a redirect
-        to another origin, and aiohttp drops ``Cookie`` and ``Authorization`` headers when a
-        redirect changes origin, while the jar re-attaches its cookies to any archive.org host.
+        IA S3 keys, sent as ``Authorization: LOW <access>:<secret>`` to every archive.org host,
+        including the data node the download URL redirects to (aiohttp drops the header on a
+        cross-origin redirect; the session's request class puts it back, and only for
+        ``.archive.org`` hosts). Both or neither; ``IA_ACCESS_KEY_ID`` / ``IA_SECRET_ACCESS_KEY``
+        in the environment override ``ia.ini``. Pass empty strings to stay anonymous despite an
+        ``ia.ini``.
     config_file: str, optional
         Path to an ``ia.ini`` to read credentials from instead of the default lookup.
     kwargs:
@@ -152,36 +174,26 @@ class InternetArchiveFileSystem(HTTPFileSystem):
 
     protocol = "ia"
     download_url = IA_DOWNLOAD_URL
-    cookie_domain = IA_COOKIE_DOMAIN
+    auth_domain = IA_AUTH_DOMAIN
 
-    def __init__(self, access_key=None, secret_key=None, cookies=None, config_file=None, **kwargs):
-        if access_key is None and secret_key is None and cookies is None:
-            credentials = load_ia_credentials(config_file)
-            access_key, secret_key, cookies = credentials.access_key, credentials.secret_key, credentials.cookies
-        self.access_key = access_key
-        self.cookies = dict(cookies or {})
-        headers = dict(kwargs.pop("headers", None) or {})
-        if access_key and secret_key:
-            headers["Authorization"] = f"LOW {access_key}:{secret_key}"
-        if headers:
-            kwargs["headers"] = headers
-        get_client = kwargs.pop("get_client", http_get_client)
-        super().__init__(
-            get_client=functools.partial(self._client_with_cookies, get_client, self.cookies, self.cookie_domain),
-            **kwargs,
-        )
-
-    @staticmethod
-    async def _client_with_cookies(get_client, cookies, domain, **kwargs):
-        session = await get_client(**kwargs)
-        if cookies:
-            morsels = SimpleCookie()
-            for name, value in cookies.items():
-                morsels[name] = value
-                morsels[name]["domain"] = domain
-                morsels[name]["path"] = "/"
-            session.cookie_jar.update_cookies(morsels, yarl.URL(f"https://{domain.lstrip('.')}/"))
-        return session
+    def __init__(self, access_key=None, secret_key=None, config_file=None, **kwargs):
+        if access_key is None and secret_key is None:
+            found = load_ia_credentials(config_file)
+            access_key, secret_key = found.access_key, found.secret_key
+        elif bool(access_key) != bool(secret_key):
+            raise ValueError("access_key and secret_key must be given together")
+        credentials = IACredentials(access_key or None, secret_key or None)
+        self.access_key = credentials.access_key
+        self.authorization = credentials.authorization
+        if self.authorization:
+            client_kwargs = dict(kwargs.pop("client_kwargs", None) or {})
+            client_kwargs["request_class"] = authorized_request_class(
+                self.authorization,
+                self.auth_domain,
+                client_kwargs.get("request_class", aiohttp.ClientRequest),
+            )
+            kwargs["client_kwargs"] = client_kwargs
+        super().__init__(**kwargs)
 
     @classmethod
     def _strip_protocol(cls, path):
@@ -241,7 +253,7 @@ def format_ia_permission_error(input_file, credentials=None):
         how = f"no archive.org credentials ({where}), so the request was anonymous"
     else:
         where = credentials.config_file or "the environment"
-        how = f"the credentials from {where} were refused (expired cookies look the same)"
+        how = f"the IA-S3 keys from {where} were refused (a revoked or mistyped key looks the same)"
     return "\n".join(
         [
             f"Error: archive.org refused access to item '{item}': {how}.",

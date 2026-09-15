@@ -3,7 +3,7 @@ through it (a conversion with main(), a re-fetch with fetch_main()).
 
 Everything runs offline against the `ia_server` fixture, which reproduces archive.org's shape: a
 /download/ URL that 302s to a data node on another origin, serving byte ranges, optionally only
-to a logged-in cookie. The one network test lives in test_readme_warcs.py.
+to the account's IA-S3 keys. The one network test lives in test_readme_warcs.py.
 """
 
 import pytest
@@ -18,11 +18,14 @@ from warc2zip import (
     fetch_main,
     format_ia_permission_error,
     ia_config_path,
+    in_domain,
     input_basename,
     load_ia_credentials,
     main,
 )
 
+# What `ia configure` writes: the [cookies] section is ignored (and must not trip the parser with
+# its '%').
 INI = """[s3]
 access = AKIA-TEST
 secret = s3cr3t
@@ -63,7 +66,7 @@ def test_ia_uri_maps_to_the_download_url_and_back(uri):
     url = InternetArchiveFileSystem._strip_protocol(uri)
     assert url == "https://archive.org/download/EOT24PRE-crawl808/EOT24PRE-00032.warc.gz"
     assert InternetArchiveFileSystem._strip_protocol(url) == url  # idempotent: fsspec strips twice
-    fs = InternetArchiveFileSystem(cookies={})
+    fs = InternetArchiveFileSystem()
     assert fs.unstrip_protocol(url) == "ia://EOT24PRE-crawl808/EOT24PRE-00032.warc.gz"
 
 
@@ -88,9 +91,10 @@ def test_no_ia_ini_means_anonymous():
     credentials = load_ia_credentials()
     assert credentials.anonymous
     assert credentials.config_file is None
+    assert credentials.authorization is None
     fs = InternetArchiveFileSystem()
-    assert fs.cookies == {} and fs.access_key is None
-    assert "Authorization" not in fs.kwargs.get("headers", {})
+    assert fs.access_key is None and fs.authorization is None
+    assert "request_class" not in fs.client_kwargs
 
 
 def test_ia_ini_is_parsed_like_the_internetarchive_package(tmp_path, monkeypatch):
@@ -99,15 +103,12 @@ def test_ia_ini_is_parsed_like_the_internetarchive_package(tmp_path, monkeypatch
     assert ia_config_path() == str(ini)
     credentials = load_ia_credentials()
     assert (credentials.access_key, credentials.secret_key) == ("AKIA-TEST", "s3cr3t")
-    # the cookie attributes in the file are not part of the value
-    assert credentials.cookies == {
-        "logged-in-user": "someone%40example.org",
-        "logged-in-sig": "1756000000-abcdef0123456789",
-    }
+    assert credentials.config_file == str(ini)
     assert not credentials.anonymous
+    assert not hasattr(credentials, "cookies")
     fs = InternetArchiveFileSystem()
-    assert fs.kwargs["headers"]["Authorization"] == "LOW AKIA-TEST:s3cr3t"
-    assert fs.cookies == credentials.cookies
+    assert fs.authorization == "LOW AKIA-TEST:s3cr3t"
+    assert "Authorization" not in fs.kwargs.get("headers", {})  # scoped per request, not global
 
 
 def test_ia_ini_lookup_order(tmp_path, monkeypatch):
@@ -136,7 +137,6 @@ def test_environment_keys_override_the_file_and_come_in_pairs(tmp_path, monkeypa
     monkeypatch.setenv("IA_SECRET_ACCESS_KEY", "ENV-SECRET")
     credentials = load_ia_credentials(str(ini))
     assert (credentials.access_key, credentials.secret_key) == ("ENV-KEY", "ENV-SECRET")
-    assert credentials.cookies  # the file's cookies are still used
     monkeypatch.delenv("IA_SECRET_ACCESS_KEY")
     with pytest.raises(ValueError, match="must be set together"):
         load_ia_credentials(str(ini))
@@ -151,9 +151,20 @@ def test_a_lone_key_in_the_file_is_ignored(tmp_path):
 
 def test_explicit_arguments_win_over_the_file(tmp_path, monkeypatch):
     monkeypatch.setenv("IA_CONFIG_FILE", str(write_ini(tmp_path / "ia.ini")))
-    fs = InternetArchiveFileSystem(cookies={"logged-in-sig": "explicit"})
-    assert fs.cookies == {"logged-in-sig": "explicit"}
-    assert "Authorization" not in fs.kwargs.get("headers", {})
+    fs = InternetArchiveFileSystem(access_key="explicit", secret_key="s")
+    assert fs.authorization == "LOW explicit:s"
+    anonymous = InternetArchiveFileSystem(access_key="", secret_key="")
+    assert anonymous.authorization is None
+    with pytest.raises(ValueError, match="must be given together"):
+        InternetArchiveFileSystem(access_key="only-one")
+
+
+def test_authorization_is_scoped_to_archive_org():
+    """The header goes to archive.org and its data nodes, and nowhere else."""
+    for host in ("archive.org", "dn721904.ca.archive.org", "ARCHIVE.ORG", "s3.us.archive.org."):
+        assert in_domain(host, ".archive.org")
+    for host in ("archive.example.com", "notarchive.org", "example.org", "", None):
+        assert not in_domain(host, ".archive.org")
 
 
 # --- end to end against the stand-in server --------------------------------------------------
@@ -186,12 +197,13 @@ def test_ia_uri_converts_and_refetches(ia_server, warc_path, tmp_path):
         assert_is_stamped_copy(record, parsed_records(slice_of(raw, row))[0], uri, row)
 
 
-def test_login_cookies_survive_the_cross_origin_redirect(ia_server, warc_path, tmp_path, monkeypatch):
-    """The data node is on another origin; aiohttp drops Cookie headers there, the jar does not."""
+def test_authorization_survives_the_cross_origin_redirect(ia_server, warc_path, tmp_path, monkeypatch):
+    """The keys must reach the data node, which sits behind a cross-origin redirect where aiohttp
+    has already dropped the Authorization header; the request class re-adds it on every hop."""
     uri = ia_server.add("restricted", warc_path)
-    ia_server.require_cookie = ("logged-in-sig", "1756000000-abcdef0123456789")
+    ia_server.require_auth = "LOW AKIA-TEST:s3cr3t"
 
-    anonymous = InternetArchiveFileSystem(cookies={}, skip_instance_cache=True)
+    anonymous = InternetArchiveFileSystem(skip_instance_cache=True)
     with pytest.raises(PermissionError):
         anonymous.open(uri, "rb")
     with pytest.raises(PermissionError):
@@ -203,14 +215,28 @@ def test_login_cookies_survive_the_cross_origin_redirect(ia_server, warc_path, t
     out = tmp_path / "out.zip"
     assert main(uri, str(out)) == 0  # credentials picked up from the ini, no arguments passed
     assert len(manifest_rows(out)) == len(CAPTURES)
+    hops = {hit.path.split("/")[1] for hit in ia_server.hits}
+    assert hops == {"download", "items"}
+    assert all(hit.headers.get("Authorization") == "LOW AKIA-TEST:s3cr3t" for hit in ia_server.hits)
+    assert not any("Cookie" in hit.headers for hit in ia_server.hits)
+
+
+def test_authorization_does_not_leave_the_domain(ia_server, warc_path):
+    """A redirect to a host outside `auth_domain` gets no Authorization header."""
+    uri = ia_server.add("public", warc_path)
+    ia_server.data_node = f"http://127.0.0.1:{ia_server.node_port}"  # not `localhost`
+
+    fs = InternetArchiveFileSystem(access_key="k", secret_key="s", skip_instance_cache=True)
+    assert fs.cat_file(uri, start=0, end=2) == b"\x1f\x8b"  # gzip magic, read through the redirect
     first_hop = next(hit for hit in ia_server.hits if hit.path.startswith("/download/"))
-    assert "logged-in-sig" not in first_hop.headers.get("Cookie", "")  # 127.0.0.1 is not `localhost`
-    assert first_hop.headers.get("Authorization") == "LOW AKIA-TEST:s3cr3t"
+    assert first_hop.headers.get("Authorization") == "LOW k:s"
+    data_hop = next(hit for hit in ia_server.hits if hit.path.startswith("/items/"))
+    assert "Authorization" not in data_hop.headers
 
 
 def test_cli_explains_a_refused_ia_item(ia_server, warc_path, tmp_path, monkeypatch, capsys):
     uri = ia_server.add("restricted", warc_path)
-    ia_server.require_cookie = ("logged-in-sig", "nope")
+    ia_server.require_auth = "LOW nope:nope"
     monkeypatch.setattr("sys.argv", ["warc2zip", uri, "--output", str(tmp_path / "out.zip")])
     assert cli() == 1
     err = capsys.readouterr().err
