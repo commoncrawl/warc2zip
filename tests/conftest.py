@@ -96,10 +96,10 @@ def warc_path(tmp_path):
 # --- a stand-in for archive.org ----------------------------------------------------------------
 #
 # ia:// reads go to https://archive.org/download/<item>/<file>, which 302s to a data node on
-# another origin that honours Range. This server reproduces exactly that: /download/... on
-# 127.0.0.1 redirects to /items/... on `localhost` (same server, different origin, so aiohttp
-# applies its cross-origin rule and drops any Cookie/Authorization *headers*), and the item route
-# serves byte ranges — optionally only to requests carrying a login cookie.
+# another origin that honours Range. Two servers reproduce exactly that: /download/... on the
+# front server redirects to /items/... on the data node, a second port and so another origin,
+# where aiohttp applies its cross-origin rule and drops the Authorization *header*; the item
+# route serves byte ranges — optionally only to requests carrying a given Authorization value.
 
 import shutil
 import threading
@@ -109,7 +109,7 @@ from urllib.parse import urlsplit
 
 
 class _IAHandler(BaseHTTPRequestHandler):
-    state = None  # set per server: directory, require_cookie, hits
+    state = None  # set per fixture: directory, data_node, require_auth, hits
 
     def log_message(self, *args):  # keep pytest output clean
         pass
@@ -119,15 +119,14 @@ class _IAHandler(BaseHTTPRequestHandler):
         self.state.hits.append(SimpleNamespace(path=path, headers=dict(self.headers)))
         if path.startswith("/download/"):
             self.send_response(302)
-            self.send_header("Location", f"http://localhost:{self.server.server_port}/items/{path[len('/download/'):]}")
+            self.send_header("Location", f"{self.state.data_node}/items/{path[len('/download/'):]}")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
         if not path.startswith("/items/"):
             self.send_error(404)
             return
-        required = self.state.require_cookie
-        if required and f"{required[0]}={required[1]}" not in self.headers.get("Cookie", ""):
+        if self.state.require_auth and self.headers.get("Authorization") != self.state.require_auth:
             self.send_error(403)
             return
         target = self.state.directory / path[len("/items/") :]
@@ -169,18 +168,21 @@ class _IAHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def ia_server(tmp_path, monkeypatch):
-    """A local archive.org: `download_url` and `cookie_domain` of InternetArchiveFileSystem are
-    pointed at it for the test. `.add(item, path)` publishes a file; `.require_cookie` gates the
-    data-node route; `.hits` records every request."""
+    """A local archive.org on `localhost`: `download_url` and `auth_domain` of
+    InternetArchiveFileSystem are pointed at it for the test, the front server redirecting to a
+    data node on a second port. `.add(item, path)` publishes a file; `.require_auth` gates the
+    data-node route on an exact Authorization value; `.hits` records every request on both
+    servers; setting `.data_node` to a `127.0.0.1` URL moves the node out of the auth domain."""
     from warc2zip import InternetArchiveFileSystem
 
     directory = tmp_path / "items"
     directory.mkdir()
-    state = SimpleNamespace(directory=directory, require_cookie=None, hits=[])
+    state = SimpleNamespace(directory=directory, require_auth=None, hits=[])
     handler = type("Handler", (_IAHandler,), {"state": state})
-    server = HTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    servers = [HTTPServer(("127.0.0.1", 0), handler) for _ in range(2)]
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    front, node = servers
 
     def add(item, path):
         (directory / item).mkdir(exist_ok=True)
@@ -188,11 +190,14 @@ def ia_server(tmp_path, monkeypatch):
         return f"ia://{item}/{Path(path).name}"
 
     state.add = add
-    state.download_url = f"http://127.0.0.1:{server.server_port}/download/"
+    state.node_port = node.server_port
+    state.data_node = f"http://localhost:{node.server_port}"
+    state.download_url = f"http://localhost:{front.server_port}/download/"
     monkeypatch.setattr(InternetArchiveFileSystem, "download_url", state.download_url)
-    monkeypatch.setattr(InternetArchiveFileSystem, "cookie_domain", "localhost")
+    monkeypatch.setattr(InternetArchiveFileSystem, "auth_domain", "localhost")
     try:
         yield state
     finally:
-        server.shutdown()
-        server.server_close()
+        for server in servers:
+            server.shutdown()
+            server.server_close()
