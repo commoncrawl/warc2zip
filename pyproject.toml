@@ -25,10 +25,12 @@ target-version = "py310"
 line-length = 120
 
 [tool.pytest.ini_options]
-# `long` streams every README example WARC end to end (0.4–10 GB each) and is opt-in:
-# `pytest -m long`. The default run keeps the `--limit` tier, which CI runs.
-addopts = "-m 'not long'"
+# The default `pytest` run is offline and self-contained (synthetic WARC/ARC fixtures, a local
+# stand-in for archive.org). The tests that download the README's real archives are opt-in:
+# `pytest -m integration` converts the first 20 captures of each (a separate CI job), and
+# `pytest -m long` streams the whole files (0.4–10 GB each; the manual "Long tests" workflow).
+addopts = "-m 'not long and not integration'"
 markers = [
-    "network: downloads real archives listed in the README (WARC2ZIP_OFFLINE=1 skips)",
-    "long: full-file conversions of the README archives; hours, never in CI",
+    "integration: downloads real archives listed in the README, --limit 20 each (WARC2ZIP_OFFLINE=1 skips)",
+    "long: full-file conversions of the README archives; hours, never in the per-push CI",
 ]

@@ -478,9 +478,10 @@ warc2zip 'https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/I
 
 ## Many more WARC examples for testing
 
-Every archive in this section and the previous one is a test case in `tests/test_readme_warcs.py`:
-`pytest` converts the first 20 captures of each (this is what CI runs), `pytest -m long` converts
-the whole files (also available as the manual "Long tests" workflow under Actions).
+Every archive in this section and the previous one is a test case in `tests/test_readme_warcs.py`.
+They need the network, so a plain `pytest` skips them: `pytest -m integration` converts the first
+20 captures of each (the "integration" CI job), `pytest -m long` converts the whole files (also
+available as the manual "Long tests" workflow under Actions).
 
 ### Common Crawl style repackaged WARCs (intended for testing)
 
