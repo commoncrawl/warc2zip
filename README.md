@@ -26,6 +26,14 @@ pip install .
 
 By default, pip will install remote access tools, namely `fsspec` configured to talk to https, s3, and Internet Archive (`ia://`) remote files.
 
+`botocore[crt]` is also installed, so AWS `aws login` profiles work out of the box (see [Caveats](#caveats)).
+
+For development, install in editable mode with the linter:
+
+```bash
+pip install -e ".[dev]"
+```
+
 ## Usage
 
 ```bash
@@ -49,6 +57,12 @@ of those it tried.
 
 **Note**: Please use s3 inside of AWS and https outside.
 
+S3 access uses your local AWS configuration. Access key/secret, SSO, environment credentials, and `aws login` profiles all work (see [Caveats](#caveats) for why `botocore[crt]` is bundled). To pick a specific profile from your AWS config, pass `--profile <name>`:
+
+```bash
+warc2zip s3://commoncrawl/crawl-data/.../CC-MAIN-....warc.gz --profile myprofile
+```
+
 **Note**: `s3://commoncrawl` does **not** allow anonymous access — requests must be signed with credentials from any AWS account. To fetch Common Crawl data without an AWS account, use the HTTPS endpoint (`https://data.commoncrawl.org/...`) instead.
 
 ### Options
@@ -60,10 +74,25 @@ of those it tried.
 | `--dry-run`               | Print summary without creating output. The scan always stops after at most 10 capture records, so it never streams the whole file; a lower `--limit` is respected |                                         |
 | `--limit <N>`             | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
 | `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
+| `--profile <name>`        | AWS profile for S3 access (s3:// inputs only)                                          | Default AWS credential chain            |
 | `--metadata-only`         | Write every CSV, manifest and sidecar but no payload files                             | Off, payloads are written               |
 | `--fetch`                 | Treat `input_file` as a `manifest.csv` and download every row's byte range into one `.warc.gz` (see [Building and downloading a subset](#building-and-downloading-a-subset)). Not combinable with `--limit` or `--format` | Off |
 | `--rate <N>`              | `--fetch` only: requests per second per host, `0` for unlimited                        | [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s per-host pacing for http(s), `2` for s3 and ia |
 | `--retries <N>`           | `--fetch` only: connection failures tolerated per request (http(s), throttling is retried without limit) or retries per request (s3, ia) | `100` / `8`                            |
+
+### Caveats
+
+#### Why `botocore[crt]` is a dependency
+
+warc2zip depends on `botocore[crt]`, which pulls in `awscrt`. This is needed for the [`aws login` credential provider](https://docs.aws.amazon.com/sdkref/latest/guide/feature-login-credentials.html) — profiles carrying a `login_session` key in `~/.aws/config`. Without it, those profiles fail with:
+
+```
+botocore.exceptions.MissingDependencyException: Missing Dependency: Using the login credential
+provider requires an additional dependency. You will need to pip install "botocore[crt]" ...
+```
+
+Since AWS [recommends `aws login` over long-term access keys](https://aws.amazon.com/blogs/security/simplified-developer-access-to-aws-with-aws-login/), warc2zip includes CRT so those profiles work out of the box. If you see the error above, your environment is missing `awscrt` — check that warc2zip is installed in the virtualenv you are actually running, then reinstall.
+
 
 ### Small Examples
 
