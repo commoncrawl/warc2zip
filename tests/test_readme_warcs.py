@@ -7,16 +7,20 @@ records, one that writes only ``resource`` records, one with four warcinfo recor
 ``dns:`` captures and no HTTP layer. The check is deliberately minimal — exit 0, a valid zip, and
 the manifest agreeing with the zip members — because the files are the point, not the assertions.
 
-Two tiers, chosen with pytest markers (registered in ``pyproject.toml``):
+These are integration tests: they depend on Hugging Face, data.commoncrawl.org, the EOT S3 bucket
+and archive.org being up, so a plain ``pytest`` does not run them (``addopts`` in ``pyproject.toml``
+deselects both markers) and the unit suite cannot be failed by a remote outage. Two tiers, chosen
+with pytest markers:
 
-- **short** — the default and what CI runs. ``--limit`` keeps every run to a few MB over HTTP
-  (~3 s each), so all fourteen archives in both formats finish in about a minute.
+- **integration** — ``pytest -m integration``, a separate CI job. ``--limit`` keeps every run to a
+  few MB over HTTP (~3–10 s each), so all fifteen archives in both formats finish in a few minutes.
 - **long** — ``pytest -m long``. Streams each archive end to end: 0.4–1 GB each, and the
-  ArchiveTeam megawarc is 10 GB, so this is an hour-plus run for a developer's machine, never CI.
-  ``-k flat`` or ``-k sidecar`` halves it. Every zip is deleted once checked, so the disk high-water
-  mark is one output at a time rather than ~20 GB under pytest's tmp dir.
+  ArchiveTeam megawarc is 10 GB, so this is an hour-plus run for a developer's machine or the
+  manual "Long tests" workflow. ``-k flat`` or ``-k sidecar`` halves it. Every zip is deleted once
+  checked, so the disk high-water mark is one output at a time rather than ~20 GB under pytest's
+  tmp dir.
 
-Both tiers need the network. ``WARC2ZIP_OFFLINE=1`` skips them.
+Both tiers need the network. ``WARC2ZIP_OFFLINE=1`` skips them even when selected explicitly.
 """
 
 import csv
@@ -41,6 +45,8 @@ SHORT_TIMEOUT = 300
 HF = "https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/"
 CC = "https://data.commoncrawl.org/"
 EOT = "https://eotarchive.s3.amazonaws.com/crawl-data/"
+# An archive.org item, through the ia:// scheme (see InternetArchiveFileSystem).
+IA = "ia://"
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,12 @@ EXAMPLES = [
         "1 GB",
     ),
     Example(
+        "ia-eot24pre-heritrix",
+        IA + "EOT24PRE-20240926175758-crawl808/EOT24PRE-20240926175758-00032.warc.gz",
+        "Heritrix, read from an Internet Archive item over ia://",
+        "1.6 GB",
+    ),
+    Example(
         "eot2024-nutch-repackage",
         EOT + "EOT-2024/segments/CC-000/warc/EOT-2024-REPACKAGE-CC-MAIN-2024-42-GOV-000000-001.warc.gz",
         "Common Crawl repackage for EOT",
@@ -147,10 +159,9 @@ EXAMPLES = [
 
 FORMATS = ["flat", "sidecar"]
 
-pytestmark = [
-    pytest.mark.network,
-    pytest.mark.skipif(bool(os.environ.get("WARC2ZIP_OFFLINE")), reason="WARC2ZIP_OFFLINE is set"),
-]
+# The tier markers sit on the two test functions, not here: `-m integration` must select the
+# `--limit 20` tier alone, or the integration CI job would stream the 10 GB megawarc.
+pytestmark = pytest.mark.skipif(bool(os.environ.get("WARC2ZIP_OFFLINE")), reason="WARC2ZIP_OFFLINE is set")
 
 
 def run_warc2zip(example, output, output_format, limit=None, timeout=None):
@@ -196,10 +207,11 @@ def check_output(example, proc, output, captures, exact=True):
             assert row["filename"] not in basenames, f"revisit row {row['filename']} has a payload: {context}"
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("output_format", FORMATS)
 @pytest.mark.parametrize("example", EXAMPLES, ids=lambda e: e.name)
 def test_short(example, output_format, tmp_path):
-    """The CI tier: the first SHORT_LIMIT captures of every README archive, both formats."""
+    """The integration tier: the first SHORT_LIMIT captures of every README archive, both formats."""
     output = tmp_path / "out.zip"
     proc = run_warc2zip(example, output, output_format, limit=SHORT_LIMIT, timeout=SHORT_TIMEOUT)
     captures = SHORT_LIMIT if example.captures is None else min(example.captures, SHORT_LIMIT)
