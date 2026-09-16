@@ -1,22 +1,272 @@
 import argparse
+import asyncio
+import configparser
 import csv
+import functools
 import io
 import json
 import mimetypes
 import os
 import posixpath
+import random
 import re
 import secrets
 import sys
+import time
 import zipfile
+import zlib
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
+import aiohttp
+from aiohttp import hdrs
+from cdx_toolkit.myrequests import get_retries, myrequests_get, retry_info
+from fsspec.core import url_to_fs
+from fsspec.implementations.http import HTTPFileSystem
+from fsspec.registry import register_implementation
+from fsspec.utils import stringify_path
 from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
+from warcio.recordloader import ARC2WARCHeadersParser
 from warcio.utils import fsspec_open
+from warcio.warcwriter import WARCWriter
+
+# --- Internet Archive input: ia://<identifier>/<filename> ------------------------------------------
+#
+# Read over https://archive.org/download/, not over IA's S3-like API (s3.us.archive.org): that
+# endpoint ignores Range headers and answers GET with a 307 to a plain-http data node, so neither
+# fsspec's block reads nor --fetch could use it (a 100-byte read pulled the whole 1.6 GB file). The
+# download URL 302s to a data node that honours Range; it is also what the `internetarchive`
+# package itself downloads from. So ia:// is HTTPFileSystem plus a path mapping and credentials.
+#
+# The class is written to be lifted verbatim into fsspec (fsspec/implementations/ia.py). Once a
+# fsspec release ships it, delete everything down to the register_implementation() call.
+
+IA_DOWNLOAD_URL = "https://archive.org/download/"
+IA_AUTH_DOMAIN = ".archive.org"
+# The internetarchive package's own names (not the shorter ones one might guess).
+IA_ENV_ACCESS_KEY = "IA_ACCESS_KEY_ID"
+IA_ENV_SECRET_KEY = "IA_SECRET_ACCESS_KEY"
+IA_ENV_CONFIG_FILE = "IA_CONFIG_FILE"
+
+
+def ia_config_path():
+    """The ia.ini that `ia configure` wrote, or None.
+
+    Searched the way the internetarchive package searches: $IA_CONFIG_FILE, then
+    $XDG_CONFIG_HOME/internetarchive/ia.ini (XDG_CONFIG_HOME defaulting to ~/.config), then
+    ~/.config/ia.ini, then ~/.ia. The first existing file wins.
+    """
+    home = os.path.expanduser("~")
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    candidates = [
+        os.environ.get(IA_ENV_CONFIG_FILE),
+        os.path.join(xdg, "internetarchive", "ia.ini"),
+        os.path.join(home, ".config", "ia.ini"),
+        os.path.join(home, ".ia"),
+    ]
+    return next((path for path in candidates if path and os.path.isfile(path)), None)
+
+
+@dataclass(frozen=True)
+class IACredentials:
+    """The IA-S3 key pair that logs a request in at archive.org; None means anonymous."""
+
+    access_key: str | None = None
+    secret_key: str | None = None
+    config_file: str | None = None  # where they were read from, for messages
+
+    @property
+    def anonymous(self):
+        return not self.access_key
+
+    @property
+    def authorization(self):
+        """The ``Authorization`` header value, or None when anonymous."""
+        if self.anonymous:
+            return None
+        return f"LOW {self.access_key}:{self.secret_key}"
+
+
+def load_ia_credentials(config_file=None):
+    """Credentials from ia.ini and the environment; anonymous when there are none.
+
+    `[s3] access/secret` are read from `config_file` (default: ia_config_path()); the `[cookies]`
+    section `ia configure` also writes is ignored, as the keys log a request in on their own.
+    IA_ACCESS_KEY_ID / IA_SECRET_ACCESS_KEY override the file's keys and must be set together. A
+    missing file or section is not an error: public items need nothing.
+    """
+    path = config_file or ia_config_path()
+    access_key = secret_key = None
+    if path and os.path.isfile(path):
+        # RawConfigParser: the file's cookie values contain '%' (URL-encoded emails), which the
+        # default interpolation would reject.
+        parser = configparser.RawConfigParser()
+        parser.read(path, encoding="utf-8")
+        access_key = parser.get("s3", "access", fallback="").strip() or None
+        secret_key = parser.get("s3", "secret", fallback="").strip() or None
+
+    env_access, env_secret = os.environ.get(IA_ENV_ACCESS_KEY), os.environ.get(IA_ENV_SECRET_KEY)
+    if bool(env_access) != bool(env_secret):
+        raise ValueError(f"{IA_ENV_ACCESS_KEY} and {IA_ENV_SECRET_KEY} must be set together")
+    if env_access:
+        access_key, secret_key = env_access, env_secret
+    if not (access_key and secret_key):
+        access_key = secret_key = None
+    return IACredentials(access_key, secret_key, path if path and os.path.isfile(path) else None)
+
+
+def in_domain(host, domain):
+    """Whether `host` is `domain` (leading dot optional) or a subdomain of it."""
+    if not host:
+        return False
+    domain = domain.lower().lstrip(".")
+    host = host.lower().rstrip(".")
+    return host == domain or host.endswith("." + domain)
+
+
+def authorized_request_class(authorization, domain, base=aiohttp.ClientRequest):
+    """A ``ClientRequest`` that sends `authorization` to every host in `domain`.
+
+    aiohttp drops ``Authorization`` when a redirect changes origin, and every archive.org download
+    is such a redirect (to a data node). It builds a new request from the session's
+    ``request_class`` for each hop, so setting the header here puts it back on the data-node hop;
+    testing the host keeps it from leaving `domain` should a data node redirect elsewhere.
+    """
+
+    class AuthorizedRequest(base):
+        def update_headers(self, headers):
+            super().update_headers(headers)
+            if in_domain(self.url.host, domain):
+                self.headers[hdrs.AUTHORIZATION] = authorization
+
+    return AuthorizedRequest
+
+
+class InternetArchiveFileSystem(HTTPFileSystem):
+    """Files in Internet Archive items, addressed as ``ia://<identifier>/<filename>``.
+
+    Every path is read from ``https://archive.org/download/<identifier>/<filename>``, which
+    redirects to a data node that honours HTTP Range requests, so this is ``HTTPFileSystem``
+    with a path mapping and archive.org credentials. Public items need no credentials.
+    Restricted items need the account's IA-S3 keys, as written by ``ia configure`` from the
+    ``internetarchive`` package to ``ia.ini``; that file is found the way the package finds it
+    (``$IA_CONFIG_FILE``, ``$XDG_CONFIG_HOME/internetarchive/ia.ini``, ``~/.config/ia.ini``,
+    ``~/.ia``). Explicit arguments win over the file.
+
+    Parameters
+    ----------
+    access_key, secret_key: str, optional
+        IA S3 keys, sent as ``Authorization: LOW <access>:<secret>`` to every archive.org host,
+        including the data node the download URL redirects to (aiohttp drops the header on a
+        cross-origin redirect; the session's request class puts it back, and only for
+        ``.archive.org`` hosts). Both or neither; ``IA_ACCESS_KEY_ID`` / ``IA_SECRET_ACCESS_KEY``
+        in the environment override ``ia.ini``. Pass empty strings to stay anonymous despite an
+        ``ia.ini``.
+    config_file: str, optional
+        Path to an ``ia.ini`` to read credentials from instead of the default lookup.
+    kwargs:
+        Passed to ``HTTPFileSystem``.
+    """
+
+    protocol = "ia"
+    download_url = IA_DOWNLOAD_URL
+    auth_domain = IA_AUTH_DOMAIN
+
+    def __init__(self, access_key=None, secret_key=None, config_file=None, **kwargs):
+        if access_key is None and secret_key is None:
+            found = load_ia_credentials(config_file)
+            access_key, secret_key = found.access_key, found.secret_key
+        elif bool(access_key) != bool(secret_key):
+            raise ValueError("access_key and secret_key must be given together")
+        credentials = IACredentials(access_key or None, secret_key or None)
+        self.access_key = credentials.access_key
+        self.authorization = credentials.authorization
+        if self.authorization:
+            client_kwargs = dict(kwargs.pop("client_kwargs", None) or {})
+            client_kwargs["request_class"] = authorized_request_class(
+                self.authorization,
+                self.auth_domain,
+                client_kwargs.get("request_class", aiohttp.ClientRequest),
+            )
+            kwargs["client_kwargs"] = client_kwargs
+        super().__init__(**kwargs)
+
+    @classmethod
+    def _strip_protocol(cls, path):
+        """``ia://item/file`` (or a bare ``item/file``) becomes the download URL; URLs pass through."""
+        if isinstance(path, list):
+            return [cls._strip_protocol(p) for p in path]
+        path = stringify_path(path)
+        if path.startswith("ia://"):
+            path = path[5:]
+        elif "://" in path:
+            return path
+        return cls.download_url + path.lstrip("/")
+
+    def unstrip_protocol(self, name):
+        if name.startswith(self.download_url):
+            return "ia://" + name[len(self.download_url) :]
+        if name.startswith("ia://"):
+            return name
+        return "ia://" + name.lstrip("/")
+
+    # archive.org answers a restricted item with 403 (401 for a bad LOW key). HTTPFileSystem
+    # reports every failed HEAD/GET as FileNotFoundError and every other status through
+    # raise_for_status(); both are turned into PermissionError so callers can tell "no such
+    # file" from "log in".
+    # HTTPFileSystem's methods take the path as the URL verbatim; the two that callers reach
+    # with an ia:// path directly (open() strips before _open) map it here.
+    async def _info(self, url, **kwargs):
+        url = self._strip_protocol(url)
+        try:
+            return await super()._info(url, **kwargs)
+        except FileNotFoundError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, aiohttp.ClientResponseError) and cause.status in (401, 403):
+                raise PermissionError(url) from cause
+            raise
+
+    async def _cat_file(self, url, start=None, end=None, **kwargs):
+        return await super()._cat_file(self._strip_protocol(url), start=start, end=end, **kwargs)
+
+    def _raise_not_found_for_status(self, response, url):
+        if response.status in (401, 403):
+            raise PermissionError(url)
+        super()._raise_not_found_for_status(response, url)
+
+
+# clobber=True: if a fsspec release ever lists its own "ia" implementation, ours must still win
+# until this inline copy is deleted, rather than fail at import.
+register_implementation("ia", InternetArchiveFileSystem, clobber=True)
+
+
+def format_ia_permission_error(input_file, credentials=None):
+    """The stderr message for a 401/403 from archive.org on an ia:// input."""
+    credentials = credentials or load_ia_credentials()
+    item = urlparse(input_file).netloc
+    if credentials.anonymous:
+        where = credentials.config_file or "no ia.ini found"
+        how = f"no archive.org credentials ({where}), so the request was anonymous"
+    else:
+        where = credentials.config_file or "the environment"
+        how = f"the IA-S3 keys from {where} were refused (a revoked or mistyped key looks the same)"
+    return "\n".join(
+        [
+            f"Error: archive.org refused access to item '{item}': {how}.",
+            "",
+            "A restricted item needs the account that can see it to be logged in:",
+            "",
+            "  pip install internetarchive && ia configure     # writes ~/.config/internetarchive/ia.ini",
+            "",
+            f"or set {IA_ENV_ACCESS_KEY} and {IA_ENV_SECRET_KEY}. Public items need neither; check the item name.",
+            f"Underlying URL: {InternetArchiveFileSystem._strip_protocol(input_file)}",
+        ]
+    )
+
 
 # botocore only arrives transitively, via warcio[s3], and LoginTokenLoadError is newer than
 # MissingDependencyException -- import them separately so a botocore predating the `aws login`
@@ -41,9 +291,193 @@ MIME_EXTENSION_OVERRIDES = {
     "text/html": ".html",
     "text/plain": ".txt",
     "image/jpeg": ".jpg",
+    # ARC-era Heritrix wrote DNS lookups as their own records with this type. It has no
+    # registered extension, and ".txt" would say less than the archive knows, so name it after
+    # the type rather than after the fact that the body happens to be readable.
+    "text/dns": ".dns",
 }
 
+# Payload kinds settled by the URL rather than by the Content-Type. Servers hand robots.txt out as
+# text/plain, text/html, application/octet-stream and worse, and none of those say "this is an
+# exclusion file" — the path does. Keyed on urlparse().path exactly: RFC 9309 puts the exclusion
+# file at the site root and nowhere else, so "/help/robots.txt" is an ordinary page.
+#
+# Add other well-known *root* paths here as they come up (e.g. "/sitemap.xml"). Kinds that live at
+# arbitrary URLs cannot be caught this way at all — see choose_extension().
+PATH_EXTENSION_OVERRIDES = {
+    "/robots.txt": ".robots",
+}
+
+# Pseudo-header carrying the content-type the ARC record itself declared. warcio's ARC->WARC
+# mapping overwrites that field with "application/http;msgtype=response" (see _ARC2WARCKeepMime),
+# and for the many ARC records with no HTTP layer at all — dns:, whois:, ntp: — it is the only
+# mime information the archive has. Present on ARC-derived records only; its presence is also
+# how the rest of this module recognises that the input was an ARC.
+ARC_CONTENT_TYPE_HEADER = "ARC-Content-Type"
+
 DRY_RUN_MAX = 10  # hard cap on capture records scanned by --dry-run
+
+# The record types main() actually consumes, in the order the summary table lists them.
+# Anything else (resource, conversion, continuation, ...) is read and discarded, and the
+# table printed by format_record_type_summary() is the only place it shows up at all.
+EXTRACTED_RECORD_TYPES = ("warcinfo", "response", "revisit", "request", "metadata")
+
+
+# Transient-failure policy for reading a remote input. Names match the --fetch helpers so the
+# two definitions merge into one.
+FETCH_DEFAULT_RETRIES = 8  # retries after the first attempt
+FETCH_MAX_BACKOFF = 60.0  # seconds; the cap on one exponential-backoff wait
+FETCH_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def error_status(exc):
+    """HTTP status carried by an exception (aiohttp's ClientResponseError), else None."""
+    status = getattr(exc, "status", None)
+    return status if isinstance(status, int) else None
+
+
+def retry_after_seconds(exc):
+    """The Retry-After delay the server asked for, in seconds; only the delta-seconds form."""
+    headers = getattr(exc, "headers", None)
+    if not headers:
+        return None
+    try:
+        return max(0.0, float(headers.get("Retry-After")))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_retryable(exc):
+    """Transient failures only: throttling, server errors, timeouts, dropped connections.
+
+    A 404/403 (fsspec raises FileNotFoundError / PermissionError) and any other 4xx are
+    deterministic and re-raised at once. aiohttp's non-OSError exceptions (payload/disconnect)
+    are recognised by module, so aiohttp is not imported here.
+    """
+    status = error_status(exc)
+    if status is not None:
+        return status in FETCH_RETRYABLE_STATUSES
+    if isinstance(exc, (FileNotFoundError, PermissionError)):
+        return False
+    if isinstance(exc, (OSError, TimeoutError, asyncio.TimeoutError)):
+        return True
+    return type(exc).__module__.split(".")[0] == "aiohttp"
+
+
+def fetch_with_retry(fetch, *, retries=FETCH_DEFAULT_RETRIES, label="", sleep=time.sleep, rng=random.random):
+    """Call the zero-argument `fetch` until it returns, retrying transient failures.
+
+    Waits Retry-After when the server sends one, otherwise an exponential backoff (2^attempt
+    seconds, capped at FETCH_MAX_BACKOFF) with jitter in [0.5, 1.5). One stderr line per retry.
+    Re-raises on a non-retryable error or once `retries` retries are used up.
+    """
+    attempts = max(1, retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch()
+        except Exception as exc:
+            if attempt == attempts or not is_retryable(exc):
+                raise
+            delay = retry_after_seconds(exc)
+            if delay is None:
+                delay = min(FETCH_MAX_BACKOFF, 2.0**attempt) * (0.5 + rng())
+            print(
+                f"warning: {label}: attempt {attempt}/{attempts} failed ({exc}), retrying in {delay:.1f} s",
+                file=sys.stderr,
+            )
+            sleep(delay)
+
+
+class CountingStream(io.IOBase):
+    """Sequential read-through wrapper: counts the bytes handed out and retries transient failures.
+
+    tell() is the count, which is what the progress bar reads (sys.stdin.buffer has a tell()
+    that crashes on a pipe). A read that fails with a transient error — throttling, a 5xx, a
+    connection dropped mid-block — is retried after seeking the underlying stream back to the
+    count, so the caller sees one contiguous byte stream and never a duplicated or missing
+    block. A stream that cannot seek (a pipe) gets no retry: there is nothing to rewind to,
+    so the error propagates as before.
+    """
+
+    def __init__(self, raw_stream, *, label="", retries=FETCH_DEFAULT_RETRIES, sleep=time.sleep):
+        self._stream = raw_stream
+        self._bytes_read = 0
+        self._label = label
+        self._retries = retries
+        self._sleep = sleep
+        try:
+            self._seekable = bool(raw_stream.seekable())
+        except (AttributeError, OSError, ValueError):
+            self._seekable = False
+
+    def tell(self):
+        """Acts as the progress tracker for progress bar libraries."""
+        return self._bytes_read
+
+    def _read_with_retry(self, method, size):
+        attempts = 0
+
+        def once():
+            nonlocal attempts
+            if attempts:  # a failed attempt may have moved the underlying position
+                self._stream.seek(self._bytes_read)
+            attempts += 1
+            return method(size)
+
+        if self._seekable:
+            data = fetch_with_retry(once, retries=self._retries, label=self._label, sleep=self._sleep)
+        else:
+            data = once()
+        if data:
+            self._bytes_read += len(data)
+        return data
+
+    def read(self, size=-1):
+        return self._read_with_retry(self._stream.read, size)
+
+    def readline(self, size=-1):
+        return self._read_with_retry(self._stream.readline, size)
+
+    # Forward other essential methods to the underlying stream
+    def readable(self):
+        return getattr(self._stream, 'readable', lambda: True)()
+
+    def close(self):
+        self._stream.close()
+
+
+class _ARC2WARCKeepMime(ARC2WARCHeadersParser):
+    """warcio's ARC->WARC header mapper, minus the content-type amnesia.
+
+    The stock parser rewrites parts[3] to "application/http;msgtype=response" so an ARC record
+    looks like a WARC application/http envelope. That is right for the envelope and wrong for the
+    archive: the ARC header line's fourth field is the only place a dns:/whois:/ntp: record — which
+    has no HTTP layer to fall back on — ever states what it contains. Re-attach it under
+    ARC_CONTENT_TYPE_HEADER so nothing is lost.
+    """
+
+    def _get_protocol_and_headers(self, headerline, parts):
+        # Read before super(), which mutates parts[3] in place for non-filedesc records.
+        arc_content_type = parts[3] if len(parts) > 3 else ""
+        protocol, headers = super()._get_protocol_and_headers(headerline, parts)
+        headers.append((ARC_CONTENT_TYPE_HEADER, arc_content_type))
+        return protocol, headers
+
+
+def open_archive_iterator(stream):
+    """ArchiveIterator that understands ARC as well as WARC.
+
+    arc2warc=True is what makes ARC input work at all: without it warcio exposes the raw ARC
+    5-tuple ("uri", "archive-date", ...) and every WARC-Target-URI / WARC-Date lookup in this
+    module quietly returns None. It also mints a WARC-Record-ID per record, which the grouping
+    dict needs as a key — ARC/1.1 predates record IDs, so every record would otherwise collide
+    under the single key None and only the last one would survive into the manifest.
+
+    The flag costs pure-WARC input nothing but warcio's per-record format-caching shortcut.
+    """
+    iterator = ArchiveIterator(stream, arc2warc=True)
+    iterator.loader.arc_parser = _ARC2WARCKeepMime()
+    return iterator
 
 
 @dataclass
@@ -56,6 +490,10 @@ class RecordGroup:
     response_target_uri: str = ""
     response_date: str = ""
     response_record_id: str = ""
+    # True when response_record_id was minted by warcio for an ARC record rather than read from
+    # the archive. Usable as a grouping key, but never written out: it is a fresh random UUID on
+    # every run, and a CSV consumer would reasonably read it as identifying the source record.
+    response_record_id_synthetic: bool = False
     http_status_code: str = ""
     content_type_header: str = ""
     response_order: int = -1
@@ -64,6 +502,12 @@ class RecordGroup:
     http_status_line: str = ""  # Full HTTP status line, e.g. "HTTP/1.1 200 OK"
     response_domain: str = ""  # Domain from WARC-Target-URI, e.g. "example.com"
     concurrent_to: str = ""  # WARC-Concurrent-To from the response record (points to request)
+    # "response" or "revisit". A revisit capture gets every CSV row a response does, but no
+    # payload file: its content lives in an earlier capture, named by the refers_to_* fields.
+    warc_type: str = "response"
+    refers_to_record_id: str = ""  # WARC-Refers-To (on CC revisits: the request's record id)
+    refers_to_target_uri: str = ""  # WARC-Refers-To-Target-URI
+    refers_to_date: str = ""  # WARC-Refers-To-Date (absent on ~2% of CC revisits)
     requests: list[list[tuple[str, str]]] = field(default_factory=list)
     request_http_headers: list[list[tuple[str, str]]] = field(default_factory=list)
     request_http_lines: list[str] = field(default_factory=list)  # e.g. "GET /path HTTP/1.1"
@@ -74,18 +518,102 @@ class RecordGroup:
     metadata_entries: list[tuple[list[tuple[str, str]], str, int | None, int | None]] = field(default_factory=list)
 
 
+def is_arc_record(record):
+    """True when this record came from an ARC, i.e. warcio synthesized its WARC-* header names."""
+    return record.rec_headers.get_header(ARC_CONTENT_TYPE_HEADER) is not None
+
+
+def archive_header_pairs(record):
+    """A record's headers, minus anything warcio invented that the archive never contained.
+
+    For ARC input every WARC-* name is warcio's rename of a real ARC field — except
+    WARC-Record-ID, which has no ARC counterpart at all and is a fresh random UUID on every run.
+    Emitting it would invite a CSV consumer to read a per-run value as an identity, and it would
+    break the --metadata-only invariant, which compares the metadata of two separate runs byte
+    for byte.
+    """
+    pairs = list(record.rec_headers.headers)
+    if not is_arc_record(record):
+        return pairs
+    return [(name, value) for name, value in pairs if name != "WARC-Record-ID"]
+
+
+def normalize_mime_type(value):
+    """Bare lowercase type from a Content-Type value, or "" if there isn't one."""
+    if not value:
+        return ""
+    return value.split(";")[0].strip().lower()
+
+
 def detect_mime_type(record):
-    if record.http_headers:
-        ct = record.http_headers.get_header("Content-Type")
-        if ct:
-            return ct.split(";")[0].strip().lower()
-    return "application/octet-stream"
+    """Best available content-type for a record's payload.
+
+    Two sources, and which one applies is decided by whether the record has an HTTP layer at all,
+    never by whether that layer happened to declare a type:
+
+      1. `record.http_headers` is not None — an HTTP transaction was captured. Its Content-Type is
+         authoritative, **including when it is missing**: a capture whose server sent no
+         Content-Type genuinely has no declared type, and saying so is the honest answer.
+      2. `record.http_headers` is None — there was no HTTP transaction to parse, so field 4 of the
+         ARC header line (ARC_CONTENT_TYPE_HEADER) is the only place the archive ever states what
+         the payload contains. ARC's dns:/whois:/ntp: records are the case that matters; warcio
+         also reports None for a zero-length record or a non-http(s) scheme, which are the same
+         situation.
+
+    The split is deliberately at `is None` rather than at "no Content-Type value". Letting the ARC
+    type fill in for an HTTP layer that declared nothing would put a value in manifest.csv's
+    detected_mime_type that its own content_type_header column cannot corroborate — and that column
+    is how a CSV-only consumer checks the tool's work. Nothing is lost by the strict rule: the ARC
+    declaration still reaches the output as an `arc_content_type` row in response_warc_headers.csv
+    for every ARC record (see archive_header_pairs()), it is just not promoted into a column that
+    cannot be cross-checked.
+    """
+    if record.http_headers is None:
+        return normalize_mime_type(record.rec_headers.get_header(ARC_CONTENT_TYPE_HEADER)) or "application/octet-stream"
+    return normalize_mime_type(record.http_headers.get_header("Content-Type")) or "application/octet-stream"
 
 
 def mime_to_extension(mime_type):
     if mime_type in MIME_EXTENSION_OVERRIDES:
         return MIME_EXTENSION_OVERRIDES[mime_type]
     return mimetypes.guess_extension(mime_type) or ".unk"
+
+
+def path_extension_override(target_uri):
+    """Extension implied by a capture's URL alone, or None.
+
+    Guards on netloc so an opaque scheme is never read as a path: urlparse("dns:ntsb.gov") puts
+    the host in .path and leaves .netloc empty, and ARC input is full of those. A query string is
+    tolerated ("/robots.txt?v=2" is the same resource, .query holds the rest); case is not, since
+    the path is case-sensitive and a server is under no obligation to serve "/Robots.txt".
+    """
+    if not target_uri:
+        return None
+    parsed = urlparse(target_uri)
+    if not parsed.netloc:
+        return None
+    return PATH_EXTENSION_OVERRIDES.get(parsed.path)
+
+
+def choose_extension(mime_type, target_uri):
+    """File extension for a payload: the URL where it knows better, else the declared type.
+
+    The URL rule is deliberately unconditional — status and body length do not gate it. The
+    extension records what was *requested*; whether the server actually served it is what
+    http_status_code and payload_size are for in manifest.csv, and a consumer that cares must
+    filter there anyway. In the EOT-2004 file that means 336 of 533 ".robots" files are in fact
+    404 error pages, and the 5 zero-byte 200s — an empty robots.txt is a real allow-all answer,
+    not a missing one — keep the extension they deserve.
+
+    This mechanism only reaches kinds that live at a fixed, well-known path. Feeds do not: they
+    sit at arbitrary URLs and are announced by <link rel="alternate">, so the thing that
+    identifies them is their registered type (application/rss+xml, application/atom+xml) and
+    they belong in MIME_EXTENSION_OVERRIDES instead. Sitemaps are half and half — "/sitemap.xml"
+    is conventional enough for the table above, but the ones announced by a robots.txt "Sitemap:"
+    line can be anywhere, and catching those would need the XML root element (<urlset> /
+    <sitemapindex>), i.e. reading the payload rather than the headers.
+    """
+    return path_extension_override(target_uri) or mime_to_extension(mime_type)
 
 
 # Every C0 control except TAB, plus DEL. TAB is harmless inside a quoted field and occurs
@@ -237,6 +765,9 @@ def request_line_pairs(line):
 
 MANIFEST_COLUMNS = (
     "filename",
+    # "response" or "revisit". Revisit rows name no file in the zip (their filename is the
+    # synthetic {counter}.revisit key); filter warc_type == "response" for the files that exist.
+    "warc_type",
     "warc_record_id",
     "warc_target_uri",
     "warc_date",
@@ -244,6 +775,10 @@ MANIFEST_COLUMNS = (
     "detected_mime_type",
     "content_type_header",
     "payload_size",
+    # The re-fetch pointer of a revisit: which capture holds the content this one deduplicated.
+    # Empty on response rows (and warc_refers_to_date is absent on a few CC revisits).
+    "warc_refers_to_target_uri",
+    "warc_refers_to_date",
     # Where this record came from: enough to re-fetch it from this row alone, with no join
     # against warcinfo.csv and no knowledge of the zip it was extracted from.
     "warc_filename",
@@ -314,6 +849,28 @@ def write_warcinfo_files(zip_file, root_dir, warcinfos):
     )
 
 
+def format_record_type_summary(counts):
+    """Aligned per-type table of every record read, extracted types first.
+
+    Types outside EXTRACTED_RECORD_TYPES were read and discarded, and are flagged as such:
+    a `resource` record with no metadata pointing at it leaves no other trace in the output.
+    Zero-count types are omitted.
+    """
+    ordered = [t for t in EXTRACTED_RECORD_TYPES if counts.get(t)]
+    ordered += sorted(t for t in counts if t not in EXTRACTED_RECORD_TYPES and counts[t])
+    if not ordered:
+        return "Record types: none"
+    name_width = max(len(t) for t in ordered)
+    count_width = max(len(str(counts[t])) for t in ordered)
+    lines = ["Record types:"]
+    for t in ordered:
+        line = f"  {t:<{name_width}}  {counts[t]:>{count_width}}"
+        if t not in EXTRACTED_RECORD_TYPES:
+            line += "  (not extracted)"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def get_file_size(input_file):
     """Get file size, handling both local paths and remote URIs."""
     try:
@@ -322,28 +879,70 @@ def get_file_size(input_file):
         return None
 
 
-def build_root_dir_name(crawl_name, partial=False):
+def new_run_id():
+    """4-char hex that makes one run's outputs unique: shared by the zip name and the root dir."""
+    return secrets.token_hex(2)
+
+
+def build_root_dir_name(crawl_name, partial=False, run_id=None):
     """Build a unique root directory name from a crawl name.
 
-    Format: {crawl_name}_{YYYYMMDDTHHMMSS}_{4-char hex suffix}
-    The suffix doesn't affect sort order since it comes after the timestamp.
+    Format: {crawl_name}_{YYYYMMDDTHHMMSS}_{4-char hex suffix}[_partial]
+    The hex suffix doesn't affect sort order since it comes after the timestamp. `partial` is
+    set iff --limit was given. `run_id` is the hex; main() passes the same one it gave
+    default_output_path(), so the zip on disk and the directory inside it carry the same tag.
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    suffix = secrets.token_hex(2) if not partial else secrets.token_hex(2) + "_partial"
+    suffix = run_id or new_run_id()
+    if partial:
+        suffix += "_partial"
 
     return f"{crawl_name}_{timestamp}_{suffix}"
+
+
+def input_basename(input_file):
+    """Basename of the input, whatever shape it comes in.
+
+    The README's inputs are local paths, `s3://bucket/key`, `https://host/path`, the same with a
+    query string (`https://huggingface.co/.../X.warc.gz?download=true`), and `-` for stdin. A
+    plain posixpath.basename() keeps the query string, which would put `?download=true` in the
+    zip name and the root directory. URIs are parsed and only the path's last segment kept;
+    stdin has no name and is labelled "stdin".
+    """
+    if input_file == "-":
+        return "stdin"
+    parsed = urlparse(input_file)
+    path = parsed.path if parsed.scheme and parsed.netloc else input_file
+    return posixpath.basename(path.rstrip("/"))
+
+
+def default_output_path(input_file, partial=False, run_id=None):
+    """Default zip path when --output is not given: {input_basename}_{hex}[_partial].zip.
+
+    The .warc.gz / .warc / .arc.gz / .arc suffix is stripped and .zip appended. The hex is the
+    run id (see new_run_id) — without it Common Crawl's `warc/`, `crawldiagnostics/` and
+    `robotstxt/` files, which share a basename and differ only by directory, overwrite each
+    other's zip. `_partial` follows the same rule as the root directory inside the zip (set iff
+    --limit was given). Written to the current directory.
+    """
+    basename = input_basename(input_file)
+    label = extract_crawl_name(basename) if basename else "unknown"
+    suffix = run_id or new_run_id()
+    if partial:
+        suffix += "_partial"
+    return Path(f"{label}_{suffix}.zip")
 
 
 def extract_crawl_name(warc_filename):
     """Extract a clean crawl name from a WARC-Filename header value.
 
-    Strips path and extensions like .warc.gz to get a usable directory name.
+    Strips path and extensions like .warc.gz to get a usable directory name. Longest suffix
+    first, so .warc.gz is not left holding a stray ".warc".
     """
     name = posixpath.basename(warc_filename)
-    if name.endswith(".warc.gz"):
-        name = name[: -len(".warc.gz")]
-    elif name.endswith(".warc"):
-        name = name[: -len(".warc")]
+    for ext in (".warc.gz", ".warc", ".arc.gz", ".arc"):
+        if name.endswith(ext):
+            return name[: -len(ext)]
     return name
 
 
@@ -362,7 +961,17 @@ def build_group_metadata(group, warc_filename="", source_uri=""):
     # protocol is already in response_warc_headers.csv as warc_protocol rows.
     status_pairs = [("status_code", group.http_status_code)] if group.http_status_code else []
     response_http_pairs = status_pairs + group.response_http_headers
-    response_http_rows = [(payload_filename, str.lower(n), v) for n, v in response_http_pairs]
+    # A capture with no HTTP layer at all still gets one blank row, so both response_http views
+    # carry every payload file and a consumer filtering manifest.csv down to a subset can join on
+    # `filename` without hitting a gap. ARC's dns:/whois:/ntp: records are the real case: they are
+    # complete captures that simply never had an HTTP transaction, so "no headers" is the answer,
+    # not a missing record. The multiline CSV already emitted a blank row here; this keeps the
+    # denormalized one from disagreeing about which files exist.
+    response_http_rows = (
+        [(payload_filename, str.lower(n), v) for n, v in response_http_pairs]
+        if response_http_pairs
+        else [(payload_filename, "", "")]
+    )
     response_http_multi = (payload_filename, response_http_pairs)
 
     # Request WARC and HTTP headers (all requests use the response's payload_filename).
@@ -404,13 +1013,18 @@ def build_group_metadata(group, warc_filename="", source_uri=""):
     # JSONL manifest entry
     jsonl_entry = {
         "filename": payload_filename,
-        "warc_record_id": group.response_record_id,
+        "warc_type": group.warc_type,
+        # Blank rather than a per-run random UUID when the source was an ARC: the field does not
+        # exist in ARC/1.1. warc_record_offset/length still make the row re-fetchable on its own.
+        "warc_record_id": "" if group.response_record_id_synthetic else (group.response_record_id or ""),
         "warc_target_uri": group.response_target_uri,
         "warc_date": group.response_date,
         "http_status_code": group.http_status_code,
         "detected_mime_type": group.response_mime_type or "application/octet-stream",
         "content_type_header": group.content_type_header,
         "payload_size": group.payload_size,
+        "warc_refers_to_target_uri": group.refers_to_target_uri,
+        "warc_refers_to_date": group.refers_to_date,
         "warc_filename": warc_filename,
         "source_uri": source_uri,
         "warc_record_offset": "" if group.response_offset is None else group.response_offset,
@@ -482,10 +1096,11 @@ def write_sidecar_files(zip_file, root_dir, group):
         zip_file.writestr(f"{base}.metadata.warc-fields", "\n\n".join(body_parts))
 
 
-def main(input_file, output_path, dry_run=False, limit=None, output_format="flat", metadata_only=False, profile=None):
+def main(input_file, output_path=None, dry_run=False, limit=None, output_format="flat", metadata_only=False, profile=None):
     file_size = get_file_size(input_file)
     # profile only makes sense for S3; other fsspec filesystems reject the kwarg
     open_kwargs = {"profile": profile} if profile and urlparse(input_file).scheme == "s3" else {}
+    partial = limit is not None
 
     if dry_run:
         capped = limit is None or limit > DRY_RUN_MAX
@@ -496,32 +1111,27 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                 file=sys.stderr,
             )
 
-        response_count = 0
-        request_count = 0
-        metadata_count = 0
+        record_types = Counter()
         sample_uris = []
         sample_mimes = set()
         limit_reached = False
 
-        with fsspec_open(input_file, "rb", **open_kwargs) as stream:
+        with fsspec_open(input_file, "rb", default_fh=sys.stdin.buffer, **open_kwargs) as stream:
+            stream = CountingStream(stream, label=input_file)
             with tqdm(total=file_size, unit="B", unit_scale=True, desc="Scanning") as pbar:
-                for record in ArchiveIterator(stream):
-                    if limit_reached and record.rec_type == "response":
+                for record in open_archive_iterator(stream):
+                    if limit_reached and record.rec_type in ("response", "revisit"):
                         break
+                    record_types[record.rec_type] += 1
                     record.content_stream().read()
-                    if record.rec_type == "response":
-                        response_count += 1
+                    if record.rec_type in ("response", "revisit"):
                         uri = record.rec_headers.get_header("WARC-Target-URI") or "unknown"
                         mime = detect_mime_type(record)
                         if len(sample_uris) < 5:
                             sample_uris.append(uri)
                         sample_mimes.add(mime)
-                        if limit is not None and response_count >= limit:
+                        if limit is not None and record_types["response"] + record_types["revisit"] >= limit:
                             limit_reached = True
-                    elif record.rec_type == "request":
-                        request_count += 1
-                    elif record.rec_type == "metadata":
-                        metadata_count += 1
                     pbar.update(stream.tell() - pbar.n)
 
         if not limit_reached:
@@ -531,8 +1141,8 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
         else:
             limit_note = f" (stopped at --limit {limit})"
         print(
-            f"[dry-run] {response_count} responses, {request_count} requests, "
-            f"{metadata_count} metadata records{limit_note}"
+            f"[dry-run] {record_types['response']} responses, {record_types['request']} requests, "
+            f"{record_types['metadata']} metadata records{limit_note}"
         )
         print(f"[dry-run] Sample URIs: {sample_uris}")
         print(f"[dry-run] Detected mime-types: {sorted(sample_mimes)}")
@@ -546,34 +1156,48 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
     warcinfos = []  # list[(warc_header_pairs, body_text, offset, length)] - crawl-level provenance
     warc_filename = ""  # WARC-Filename from the warcinfo record; every manifest row repeats it
 
-    # Fallback crawl name from input filename
-    input_basename = posixpath.basename(input_file.rstrip("/"))
-    fallback_crawl_name = extract_crawl_name(input_basename) if input_basename else "unknown"
+    # Fallback crawl name from input filename (same label default_output_path uses)
+    basename = input_basename(input_file)
+    fallback_crawl_name = extract_crawl_name(basename) if basename else "unknown"
 
-    response_count = 0
-    request_count = 0
-    metadata_count = 0
+    record_types = Counter()  # every record read, by WARC-Type — extracted or not
     limit_reached = False
+    download_size_mismatch = False
+
+    # One run id for the zip name and the root directory, so the two can be matched on disk.
+    # An explicit --output is used verbatim; the default shares the root directory's hex and
+    # _partial rule.
+    run_id = new_run_id()
+    if output_path is None:
+        output_path = str(default_output_path(input_file, partial, run_id))
 
     # response -> Record id  <-> metadata -
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as outer_zip:
         # Pass 1: Read WARC, write payloads immediately, buffer only headers
-        with fsspec_open(input_file, "rb", **open_kwargs) as stream:
+        with fsspec_open(input_file, "rb", default_fh=sys.stdin.buffer, **open_kwargs) as raw_stream:
+            # fsspec HTTP/S3 handles expose the response size when the server provides one.
+            # Count reads ourselves so an early EOF is not mistaken for a complete archive.
+            # if we ever decide to add partial-range downloads, this needs to account for that
+            expected_size = getattr(raw_stream, "size", None) or file_size
+            stream = CountingStream(raw_stream, label=input_file)
             pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
             # Held by name rather than iterated anonymously: get_record_offset() /
             # get_record_length() hang off the iterator, not the record.
-            record_iter = ArchiveIterator(stream)
+            record_iter = open_archive_iterator(stream)
             for record in record_iter:
                 rec_type = record.rec_type
 
-                if limit_reached and rec_type == "response":
+                if limit_reached and rec_type in ("response", "revisit"):
                     break
+                # Counted after the --limit break so the unconsumed next capture stays out,
+                # and before the warcinfo `continue` so every record read is in the table.
+                record_types[rec_type] += 1
 
                 if rec_type == "warcinfo":
                     body_text = record.content_stream().read().decode("utf-8", errors="replace")
                     warcinfos.append(
                         (
-                            list(record.rec_headers.headers),
+                            archive_header_pairs(record),
                             body_text,
                             record_iter.get_record_offset(),
                             record_iter.get_record_length(),
@@ -582,24 +1206,41 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     if root_dir is None:
                         warc_filename = record.rec_headers.get_header("WARC-Filename") or ""
                         crawl_name = extract_crawl_name(warc_filename) if warc_filename else fallback_crawl_name
-                        root_dir = build_root_dir_name(crawl_name, limit is not None)
+                        root_dir = build_root_dir_name(crawl_name, partial, run_id)
                     pbar.update(stream.tell() - pbar.n)
                     continue
 
                 # Resolve root_dir before first payload write if no warcinfo appeared
                 if root_dir is None:
-                    root_dir = build_root_dir_name(fallback_crawl_name, limit is not None)
+                    root_dir = build_root_dir_name(fallback_crawl_name, partial, run_id)
 
-                if rec_type == "response":
+                if rec_type in ("response", "revisit"):
                     record_id = record.rec_headers.get_header("WARC-Record-ID")
                     target_uri = record.rec_headers.get_header("WARC-Target-URI")
+                    # ARC has no record IDs; warcio mints one per record so the grouping dict
+                    # below still gets a unique key. Flagged so it never reaches a CSV.
+                    is_arc = is_arc_record(record)
 
                     group = groups.setdefault(record_id, RecordGroup())
+                    group.warc_type = rec_type
                     group.concurrent_to = record.rec_headers.get_header("WARC-Concurrent-To") or ""
+                    if rec_type == "revisit":
+                        # CC's revisit names its request in WARC-Refers-To and carries no
+                        # WARC-Concurrent-To. A spec-conformant Refers-To names the original
+                        # capture instead — an id that is never in pending_requests — so using
+                        # it as a join candidate cannot mislink.
+                        group.refers_to_record_id = record.rec_headers.get_header("WARC-Refers-To") or ""
+                        group.refers_to_target_uri = record.rec_headers.get_header("WARC-Refers-To-Target-URI") or ""
+                        group.refers_to_date = record.rec_headers.get_header("WARC-Refers-To-Date") or ""
                     payload = record.content_stream().read()
                     group.response_mime_type = detect_mime_type(record)
-                    ext = mime_to_extension(group.response_mime_type)
-                    payload_filename = f"{counter}{ext}"
+                    if rec_type == "revisit":
+                        # Synthetic key for the CSVs; no such file is ever written to the zip,
+                        # and the name itself says why (a revisit has no body of its own).
+                        payload_filename = f"{counter}.revisit"
+                    else:
+                        ext = choose_extension(group.response_mime_type, target_uri or "")
+                        payload_filename = f"{counter}{ext}"
 
                     # Extract domain for sidecar format directory grouping
                     domain = urlparse(target_uri).netloc if target_uri else "unknown"
@@ -609,15 +1250,16 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                         zip_path = f"{root_dir}/{group.response_domain}/{payload_filename}"
                     else:
                         zip_path = f"{root_dir}/{payload_filename}"
-                    if not metadata_only:
+                    if not metadata_only and rec_type == "response":
                         outer_zip.writestr(zip_path, payload)
 
                     group.payload_filename = payload_filename
                     group.payload_size = len(payload)
                     group.response_record_id = record_id
+                    group.response_record_id_synthetic = is_arc
                     group.response_target_uri = target_uri or ""
                     group.response_date = record.rec_headers.get_header("WARC-Date") or ""
-                    group.response_warc_headers = list(record.rec_headers.headers)
+                    group.response_warc_headers = archive_header_pairs(record)
                     if record.http_headers:
                         group.response_http_headers = list(record.http_headers.headers)
                         group.content_type_header = record.http_headers.get_header("Content-Type") or ""
@@ -628,16 +1270,14 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     group.response_order = order_counter
                     order_counter += 1
                     counter += 1
-                    response_count += 1
-                    if limit is not None and response_count >= limit:
+                    if limit is not None and record_types["response"] + record_types["revisit"] >= limit:
                         limit_reached = True
 
                 elif rec_type == "request":
-                    request_count += 1
                     body = record.content_stream().read()
                     request_record_id = record.rec_headers.get_header("WARC-Record-ID")
                     req_entry = {
-                        "warc_headers": list(record.rec_headers.headers),
+                        "warc_headers": archive_header_pairs(record),
                         "http_headers": list(record.http_headers.headers) if record.http_headers else [],
                         # warcio's parser splits a request line as protocol="GET",
                         # statusline="/path HTTP/1.1" — recompose it to get "GET /path HTTP/1.1".
@@ -651,7 +1291,6 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     pending_requests.setdefault(request_record_id, []).append(req_entry)
 
                 elif rec_type == "metadata":
-                    metadata_count += 1
                     body = record.content_stream().read()
                     concurrent_to = record.rec_headers.get_header("WARC-Concurrent-To")
 
@@ -659,7 +1298,7 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     body_text = body.decode("utf-8", errors="replace")
                     group.metadata_entries.append(
                         (
-                            list(record.rec_headers.headers),
+                            archive_header_pairs(record),
                             body_text,
                             record_iter.get_record_offset(),
                             record_iter.get_record_length(),
@@ -672,10 +1311,25 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                 pbar.update(stream.tell() - pbar.n)
             pbar.close()
 
-        # Link pending requests to their response groups via WARC-Concurrent-To
+            if limit is None and expected_size is not None and stream.tell() != expected_size:
+                download_size_mismatch = True
+                print(
+                    f"Warning: read {stream.tell()} bytes; expected {expected_size} bytes",
+                    file=sys.stderr,
+                )
+
+        # Link pending requests to their capture groups. A response names its request in
+        # WARC-Concurrent-To; a CC revisit names it in WARC-Refers-To instead, so both are
+        # tried (only ids that actually belong to a request record can match).
+        linked_request_ids = set()
         for group in groups.values():
-            if group.concurrent_to and group.concurrent_to in pending_requests:
-                for req in pending_requests[group.concurrent_to]:
+            request_id = next(
+                (rid for rid in (group.concurrent_to, group.refers_to_record_id) if rid and rid in pending_requests),
+                None,
+            )
+            if request_id:
+                linked_request_ids.add(request_id)
+                for req in pending_requests[request_id]:
                     group.requests.append(req["warc_headers"])
                     group.request_http_headers.append(req["http_headers"])
                     group.request_http_lines.append(req["http_request_line"])
@@ -683,14 +1337,32 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
                     group.request_offsets.append(req["offset"])
                     group.request_lengths.append(req["length"])
 
-        # Warn about orphan records (request/metadata without a matching response)
-        orphan_count = sum(1 for g in groups.values() if not g.payload_filename)
-        if orphan_count:
-            print(f"Warning: {orphan_count} orphan group(s) without a response record, skipped")
+        # Two audits feed one warning, because they see different things. A group is only ever
+        # created by a response/revisit or a metadata record, so orphan groups are
+        # metadata-anchored captures whose anchor record is missing (truncated input) or of a
+        # type that is not extracted (e.g. resource). Requests are joined from the capture side
+        # and never create a group, so a request whose capture record never appeared is
+        # invisible to the first audit and only the second sees it. The two record counts are
+        # exact and run in parallel with the capture count (each dropped capture loses its
+        # request AND its metadata record) — they are not a partition of it, which is why the
+        # message says "along with their". The capture count is the best available figure, since
+        # nothing links an unclaimed request to an orphan group. Either way the whole capture is
+        # dropped from every output file, not just the payload: pass 2 below iterates only
+        # groups with a payload_filename.
+        orphan_groups = [g for g in groups.values() if not g.payload_filename]
+        dropped_metadata = sum(len(g.metadata_entries) for g in orphan_groups)
+        unlinked_requests = sum(len(v) for k, v in pending_requests.items() if k not in linked_request_ids)
+        if orphan_groups or unlinked_requests:
+            print(
+                f"Warning: skipped {max(len(orphan_groups), unlinked_requests)} capture(s) that have no "
+                f"response record, along with their {unlinked_requests} request and "
+                f"{dropped_metadata} metadata records",
+                file=sys.stderr,
+            )
 
         # A WARC without a warcinfo record, or without WARC-Filename on it, still needs a name
         # in the manifest: fall back to what the input was called.
-        warc_filename = warc_filename or input_basename
+        warc_filename = warc_filename or basename
 
         # Pass 2: Build metadata from buffered headers (payloads already in zip)
         sorted_groups = sorted(
@@ -767,14 +1439,519 @@ def main(input_file, output_path, dry_run=False, limit=None, output_format="flat
             outer_zip.writestr(f"{root_dir}/{name}.csv", content)
             skipped += n
 
+    revisit_part = f", {record_types['revisit']} revisits" if record_types["revisit"] else ""
     print(
-        f"Created {output_path}: {response_count} responses, "
-        f"{request_count} requests, {metadata_count} metadata records"
+        f"Created {output_path}: {record_types['response']} responses{revisit_part}, "
+        f"{record_types['request']} requests, {record_types['metadata']} metadata records"
         + (" (metadata only, no payloads written)" if metadata_only else "")
     )
+    print(format_record_type_summary(record_types))
     if skipped:
         print(f"warning: {skipped} CSV row(s) could not be written (see warnings above)", file=sys.stderr)
 
+    return skipped + int(download_size_mismatch)
+
+
+# ---------------------------------------------------------------------------
+# --fetch: re-download the rows of a (filtered) manifest.csv as one .warc.gz
+# ---------------------------------------------------------------------------
+
+FETCH_COLUMNS = ("source_uri", "warc_record_offset", "warc_record_length")
+FETCH_DEFAULT_RATE = 2.0  # requests per second, per host
+FETCH_DEFAULT_RETRIES = 8  # retries after the first attempt
+FETCH_MAX_BACKOFF = 60.0  # seconds; the cap on one exponential-backoff wait
+FETCH_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+FETCH_MAX_GAP = 64 * 1024  # bytes between two rows that still get fetched in one request
+FETCH_MAX_SPAN = 64 * 1024 * 1024  # bytes held in memory for one request
+FETCH_HEAD_BYTES = 64 * 1024  # probe size for the source's leading warcinfo record
+FETCH_MAX_REDIRECTS = 5  # cdx_toolkit's myrequests_get does not follow redirects; http_range does
+FETCH_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+@dataclass
+class FetchRow:
+    source_uri: str
+    offset: int
+    length: int
+    record_id: str  # blank for ARC rows (the id was minted, so the manifest leaves it out)
+    target_uri: str
+    line: int  # CSV line number, for warnings
+
+
+class FetchLengthMismatch(Exception):
+    """The server returned a different number of bytes than the range asked for.
+
+    fsspec sends the Range header but never checks for a 206, so a server that ignores Range
+    hands back the whole file as the "slice". Deterministic, so never retried.
+    """
+
+
+def read_fetch_rows(csv_path):
+    """Parse a manifest.csv (filtered or not) into FetchRows.
+
+    Missing a required column is a usage error (exit 2). A row with a blank or non-numeric
+    offset/length (main() writes "" when the offset was unknown), or with no fetchable
+    `source_uri` (stdin input), is warned about and counted, never fatal.
+    Returns (rows, skipped).
+    """
+    if csv_path == "-":
+        return _read_fetch_rows(io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", newline=""), "stdin")
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        return _read_fetch_rows(fh, csv_path)
+
+
+def _read_fetch_rows(fh, label):
+    reader = csv.DictReader(fh)
+    missing = [c for c in FETCH_COLUMNS if c not in (reader.fieldnames or [])]
+    if missing:
+        print(f"error: {label}: not a manifest.csv, missing column(s): {', '.join(missing)}", file=sys.stderr)
+        raise SystemExit(2)
+
+    rows, skipped = [], 0
+    for row in reader:
+        source_uri = (row.get("source_uri") or "").strip()
+        try:
+            offset = int(row.get("warc_record_offset") or "")
+            length = int(row.get("warc_record_length") or "")
+        except ValueError:
+            offset, length = -1, 0
+
+        if not source_uri or source_uri == "-":
+            problem = "no fetchable source_uri"
+        elif offset < 0 or length <= 0:
+            problem = "no usable warc_record_offset/warc_record_length"
+        else:
+            problem = None
+        if problem:
+            print(f"warning: {label} line {reader.line_num}: {problem}, skipped", file=sys.stderr)
+            skipped += 1
+            continue
+
+        rows.append(
+            FetchRow(
+                source_uri=source_uri,
+                offset=offset,
+                length=length,
+                record_id=(row.get("warc_record_id") or "").strip(),
+                target_uri=(row.get("warc_target_uri") or "").strip(),
+                line=reader.line_num,
+            )
+        )
+    return rows, skipped
+
+
+def group_fetch_rows(rows):
+    """Rows keyed by source_uri (first-appearance order), each list sorted by offset.
+
+    Exact (offset, length) duplicates are dropped with one warning per source: fetching the
+    same member twice would put the same record in the output twice. Output order is
+    therefore source-then-offset, not CSV order.
+    """
+    groups = {}
+    for row in rows:
+        groups.setdefault(row.source_uri, []).append(row)
+
+    for source_uri, source_rows in groups.items():
+        source_rows.sort(key=lambda r: (r.offset, r.length))
+        deduped, seen = [], set()
+        for row in source_rows:
+            key = (row.offset, row.length)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(row)
+        if len(deduped) != len(source_rows):
+            print(f"warning: {source_uri}: {len(source_rows) - len(deduped)} duplicate row(s) dropped", file=sys.stderr)
+        groups[source_uri] = deduped
+    return groups
+
+
+def coalesce_ranges(rows, max_gap=FETCH_MAX_GAP, max_span=FETCH_MAX_SPAN):
+    """Merge offset-sorted rows into (start, end, rows) spans fetched with one request each.
+
+    A response record is never adjacent to the next one in a Common Crawl WARC (its request
+    and metadata records sit in between), so merging only touching ranges would merge nothing.
+    Instead rows closer than `max_gap` share a request and each row is sliced back out of the
+    span locally: the output stays response-only and byte-exact, and a status-filtered subset
+    collapses into a fraction of the requests, which is what data.commoncrawl.org throttles on.
+    `max_gap` bounds the bytes wasted per merge, `max_span` the bytes held in memory.
+    """
+    spans = []
+    for row in rows:
+        end = row.offset + row.length
+        if spans:
+            start, span_end, span_rows = spans[-1]
+            if row.offset - span_end <= max_gap and end - start <= max_span:
+                spans[-1] = (start, max(span_end, end), span_rows + [row])
+                continue
+        spans.append((row.offset, end, [row]))
+    return spans
+
+
+class RateLimiter:
+    """Minimum interval between requests, tracked per key (a host). rate <= 0 disables it."""
+
+    def __init__(self, rate, clock=time.monotonic, sleep=time.sleep):
+        self.interval = 1.0 / rate if rate and rate > 0 else 0.0
+        self.clock = clock
+        self.sleep = sleep
+        self.next_allowed = {}
+
+    def wait(self, key):
+        if not self.interval:
+            return
+        now = self.clock()
+        delay = self.next_allowed.get(key, now) - now
+        if delay > 0:
+            self.sleep(delay)
+            now += delay
+        self.next_allowed[key] = now + self.interval
+
+
+def error_status(exc):
+    """HTTP status carried by an exception (aiohttp's ClientResponseError), else None."""
+    status = getattr(exc, "status", None)
+    return status if isinstance(status, int) else None
+
+
+def is_retryable(exc):
+    """Transient failures only: throttling, server errors, timeouts, dropped connections.
+
+    A 404/403 (fsspec raises FileNotFoundError / PermissionError), any other 4xx (416 means
+    the offsets do not fit this file) and a length mismatch are deterministic and re-raised
+    at once. aiohttp's non-OSError exceptions (payload/disconnect) are recognised by module,
+    so aiohttp is not imported here.
+    """
+    if isinstance(exc, FetchLengthMismatch):
+        return False
+    status = error_status(exc)
+    if status is not None:
+        return status in FETCH_RETRYABLE_STATUSES
+    if isinstance(exc, (FileNotFoundError, PermissionError)):
+        return False
+    if isinstance(exc, (OSError, TimeoutError, asyncio.TimeoutError)):
+        return True
+    return type(exc).__module__.split(".")[0] == "aiohttp"
+
+
+def retry_after_seconds(exc):
+    """The Retry-After delay the server asked for, in seconds; only the delta-seconds form."""
+    headers = getattr(exc, "headers", None)
+    if not headers:
+        return None
+    try:
+        return max(0.0, float(headers.get("Retry-After")))
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_with_retry(fetch, *, retries=FETCH_DEFAULT_RETRIES, label="", sleep=time.sleep, rng=random.random):
+    """Call the zero-argument `fetch` until it returns, retrying transient failures.
+
+    Waits Retry-After when the server sends one, otherwise an exponential backoff (2^attempt
+    seconds, capped at FETCH_MAX_BACKOFF) with jitter in [0.5, 1.5). One stderr line per retry.
+    Re-raises on a non-retryable error or once `retries` retries are used up.
+    """
+    attempts = max(1, retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch()
+        except Exception as exc:
+            if attempt == attempts or not is_retryable(exc):
+                raise
+            delay = retry_after_seconds(exc)
+            if delay is None:
+                delay = min(FETCH_MAX_BACKOFF, 2.0**attempt) * (0.5 + rng())
+            print(
+                f"warning: {label}: attempt {attempt}/{attempts} failed ({exc}), retrying in {delay:.1f} s",
+                file=sys.stderr,
+            )
+            sleep(delay)
+
+
+def leading_warcinfo(head):
+    """The first gzip member of `head`, verbatim, if it is a warcinfo record; else None.
+
+    `head` is the first FETCH_HEAD_BYTES of the source. Going through open_archive_iterator()
+    means an ARC's filedesc:// record qualifies too. A warcinfo record that does not fit in
+    the probe, or a source whose first record is something else, yields None: nothing is
+    ever synthesised in its place.
+    """
+    try:
+        iterator = open_archive_iterator(io.BytesIO(head))
+        record = next(iter(iterator), None)
+        if record is None:
+            return None
+        rec_type = record.rec_type
+        record.content_stream().read()
+        length = iterator.get_record_length()
+    except Exception:  # noqa: BLE001 - any parse failure means "no usable warcinfo"
+        return None
+    if rec_type != "warcinfo" or not length or length > len(head):
+        return None
+    member = head[:length]
+    # warcio reads a truncated gzip member without complaint; only a member whose trailer is
+    # inside the probe is a complete record.
+    if member.startswith(b"\x1f\x8b") and not _complete_gzip_member(member):
+        return None
+    return member
+
+
+def _complete_gzip_member(data):
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        decompressor.decompress(data)
+    except zlib.error:
+        return False
+    return decompressor.eof
+
+
+def validate_record_slice(data, row):
+    """Check that `data` is exactly the response record the manifest row describes.
+
+    Returns None when it is, else a short reason. "Parses as a response" is not enough:
+    warcio's sniffer reads arbitrary bytes as an ARC record of type response, so the
+    WARC-Record-ID (or, for ARC rows whose id is blank by design, the WARC-Target-URI) is
+    compared against the row, the parsed record must span the whole slice, and the gzip
+    member must be complete (warcio reads a truncated one without complaint).
+    """
+    try:
+        iterator = open_archive_iterator(io.BytesIO(data))
+        records = []
+        for record in iterator:
+            record.content_stream().read()
+            records.append(
+                (
+                    record.rec_type,
+                    record.rec_headers.get_header("WARC-Record-ID") or "",
+                    record.rec_headers.get_header("WARC-Target-URI") or "",
+                    iterator.get_record_length(),
+                )
+            )
+    except Exception as exc:  # noqa: BLE001 - the reason is reported, not swallowed
+        return f"not a WARC record: {exc}"
+
+    if len(records) != 1:
+        return f"expected one record, found {len(records)}"
+    rec_type, record_id, target_uri, length = records[0]
+    if rec_type != "response":
+        return f"expected a response record, found {rec_type}"
+    if length != len(data):
+        return f"record spans {length} of {len(data)} bytes"
+    if data.startswith(b"\x1f\x8b") and not _complete_gzip_member(data):
+        return "truncated gzip member"
+    if row.record_id:
+        if record_id != row.record_id:
+            return f"WARC-Record-ID {record_id} is not {row.record_id}"
+    elif target_uri != row.target_uri:
+        return f"WARC-Target-URI {target_uri} is not {row.target_uri}"
+    return None
+
+
+def default_fetch_output_path(csv_path, run_id=None):
+    """Default .warc.gz path for --fetch: {csv basename minus .csv}_{hex}.warc.gz, in cwd.
+
+    Same hex as default_output_path() and for the same reason: filtering one manifest twice
+    into `subset.csv` must not overwrite the first subset. `-` is labelled stdin.
+    """
+    basename = input_basename(csv_path)
+    label = basename[:-4] if basename.lower().endswith(".csv") else basename
+    return Path(f"{label or 'unknown'}_{run_id or new_run_id()}.warc.gz")
+
+
+def http_range(url, start, end, retries=None, redirects=FETCH_MAX_REDIRECTS, get=None):
+    """Bytes [start, end) over http(s), through cdx_toolkit's `myrequests_get`.
+
+    That function carries Common Crawl's own retry policy (429/5xx backed off without limit,
+    connection failures up to `retries`) and per-host pacing, so neither is reimplemented here.
+    It does not follow redirects (`allow_redirects=False`), so 3xx answers are followed by hand,
+    re-entering `myrequests_get` each time so the new host is paced too. A 200 with the whole
+    file, from a server that ignores Range, is left to the caller's length check.
+    """
+    get = get or myrequests_get  # resolved at call time so tests can substitute the transport
+    headers = {"Range": f"bytes={start}-{end - 1}"}
+    for _ in range(redirects + 1):
+        resp = get(url, headers=headers, raise_error_after_n_errors=retries)
+        location = resp.headers.get("Location")
+        if resp.status_code in FETCH_REDIRECT_STATUSES and location:
+            url = urljoin(url, location)
+            continue
+        return resp.content
+    raise RuntimeError(f"more than {redirects} redirects")
+
+
+def set_host_interval(host, rate):
+    """Map --rate onto cdx_toolkit's per-host schedule; rate=None keeps cdx_toolkit's own defaults.
+
+    cdx_toolkit paces requests from a module-level table keyed by hostname (0.55 s between
+    requests to data.commoncrawl.org, 3 s to a host it does not know). `get_retries()` creates
+    the host's entry from the default one, and the interval is then overwritten in place — the
+    table is the only place the pacing can be set.
+    """
+    if rate is None:
+        return
+    get_retries(host)
+    retry_info[host]["minimum_interval"] = 1.0 / rate if rate > 0 else 0.0
+
+
+def check_length(data, start, end):
+    if len(data) != end - start:
+        raise FetchLengthMismatch(f"asked for {end - start} bytes at offset {start}, got {len(data)}")
+    return data
+
+
+def fetch_range(fs, path, start, end, exact=True):
+    """Bytes [start, end) of a file through fsspec (s3 and local paths).
+
+    With `exact`, a short or long answer raises FetchLengthMismatch (see there). The warcinfo
+    probe passes exact=False because it deliberately asks past the end of small files.
+    """
+    data = fs.cat_file(path, start=start, end=end)
+    return check_length(data, start, end) if exact else data
+
+
+def annotate_record_slice(data, source_uri, offset, length):
+    """Re-serialise one record with WARC-Source-URI / WARC-Source-Range added.
+
+    The names and values are cdx_toolkit's convention for extracts, so a subset made this way
+    matches one from `cdxt warc`, and a re-converted subset carries every record's original
+    coordinates in response_warc_headers.csv. The WARC header block is rewritten by warcio and
+    the member recompressed, so it is no longer the source's bytes, but the content block (HTTP
+    headers and body) is copied through untouched (a verbatim switch was tried and dropped: nothing
+    in the workflow needs the wire bytes, and the curl loop in the README gives them anyway).
+    Cost measured on CC records: ~1.4 ms CPU and ~43 bytes of output per record.
+    """
+    # no_record_parse=True leaves the HTTP layer unparsed, so warcio writes the content block
+    # through byte for byte (a parsed one is re-serialised: obs-folds unfolded, Content-Length
+    # recomputed, WARC-Block-Digest silently wrong). Only the WARC header block is rewritten.
+    record = next(iter(ArchiveIterator(io.BytesIO(data), no_record_parse=True, arc2warc=True)))
+    record.rec_headers.replace_header("WARC-Source-URI", source_uri)
+    record.rec_headers.replace_header("WARC-Source-Range", f"bytes={offset}-{offset + length - 1}")
+    buffer = io.BytesIO()
+    WARCWriter(buffer, gzip=True).write_record(record)
+    return buffer.getvalue()
+
+
+def _is_local_filesystem(fs):
+    protocol = fs.protocol if isinstance(fs.protocol, (tuple, list)) else (fs.protocol,)
+    return "file" in protocol
+
+
+class _FetchSource:
+    """One source WARC: its transport, retry policy, pacing key and transfer counters.
+
+    http(s) goes through cdx_toolkit (`http_range`), which retries and paces on its own; s3 and
+    local paths go through fsspec with `fetch_with_retry` and `RateLimiter` around them.
+    """
+
+    def __init__(self, source_uri, limiter, rate=None, retries=None):
+        self.source_uri = source_uri
+        parsed = urlparse(source_uri)
+        self.via_http = parsed.scheme.lower() in ("http", "https")
+        self.retries = retries
+        self.requests = 0
+        self.transferred = 0
+        if self.via_http:
+            self.fs = self.path = self.limiter = None
+            set_host_interval(parsed.hostname, rate)
+            self.host = parsed.hostname
+        else:
+            self.fs, self.path = url_to_fs(source_uri)
+            # Local files bypass the limiter; for s3 the key is the bucket.
+            self.host = None if _is_local_filesystem(self.fs) else parsed.netloc
+            self.limiter = limiter
+
+    def get(self, start, end, exact=True):
+        self.requests += 1
+        if self.via_http:
+            data = http_range(self.source_uri, start, end, retries=self.retries)
+            if exact:
+                check_length(data, start, end)
+        else:
+            if self.host:
+                self.limiter.wait(self.host)
+            data = fetch_range(self.fs, self.path, start, end, exact)
+        self.transferred += len(data)
+        return data
+
+    def fetch(self, start, end, exact=True, label="", sleep=time.sleep):
+        if self.via_http:
+            return self.get(start, end, exact)
+        retries = FETCH_DEFAULT_RETRIES if self.retries is None else self.retries
+        return fetch_with_retry(
+            functools.partial(self.get, start, end, exact), retries=retries, label=label, sleep=sleep
+        )
+
+
+def fetch_main(csv_path, output_path=None, rate=None, retries=None, sleep=time.sleep):
+    """--fetch: download every manifest row's byte range and concatenate the raw members.
+
+    Each source's own warcinfo record is copied first (see leading_warcinfo), then its rows
+    in offset order. A span that fails after retries skips all its rows with a warning and
+    the run goes on, like the CSV writers: the file is a valid .warc.gz at every member
+    boundary, and the return value (skipped rows) makes cli() exit 1. `rate` and `retries`
+    are None by default so each transport keeps its own defaults (see _FetchSource). Every
+    record is stamped with WARC-Source-URI / WARC-Source-Range (see annotate_record_slice); the
+    warcinfo record is copied as-is.
+    """
+    rows, skipped = read_fetch_rows(csv_path)
+    groups = group_fetch_rows(rows)
+    if output_path is None:
+        output_path = str(default_fetch_output_path(csv_path, new_run_id()))
+
+    limiter = RateLimiter(FETCH_DEFAULT_RATE if rate is None else rate, sleep=sleep)
+    total_rows = sum(len(source_rows) for source_rows in groups.values())
+    written = warcinfo_count = 0
+    sources = []
+
+    with open(output_path, "wb") as out, tqdm(total=total_rows, unit="rec", desc="Fetching") as pbar:
+        for source_uri, source_rows in groups.items():
+            source = _FetchSource(source_uri, limiter, rate=rate, retries=retries)
+            sources.append(source)
+
+            try:
+                head = source.fetch(0, FETCH_HEAD_BYTES, exact=False, label=f"{source_uri} (warcinfo probe)", sleep=sleep)
+            except Exception as exc:  # noqa: BLE001 - reported below; the rows are still attempted
+                print(f"warning: {source_uri}: could not read the leading warcinfo record ({exc})", file=sys.stderr)
+                head = b""
+            warcinfo = leading_warcinfo(head)
+            if warcinfo:
+                out.write(warcinfo)
+                warcinfo_count += 1
+            else:
+                print(f"note: {source_uri}: no leading warcinfo record, subset starts at its first response",
+                      file=sys.stderr)
+
+            for start, end, span_rows in coalesce_ranges(source_rows):
+                label = f"{source_uri} bytes {start}-{end - 1}"
+                try:
+                    data = source.fetch(start, end, label=label, sleep=sleep)
+                except Exception as exc:  # noqa: BLE001 - skip-and-warn, the run continues
+                    print(f"warning: {label}: could not be fetched ({exc}), {len(span_rows)} row(s) skipped",
+                          file=sys.stderr)
+                    skipped += len(span_rows)
+                    pbar.update(len(span_rows))
+                    continue
+                for row in span_rows:
+                    chunk = data[row.offset - start : row.offset - start + row.length]
+                    problem = validate_record_slice(chunk, row)
+                    if problem:
+                        print(f"warning: {csv_path} line {row.line}: fetched bytes are not the expected record "
+                              f"({problem}), skipped", file=sys.stderr)
+                        skipped += 1
+                    else:
+                        out.write(annotate_record_slice(chunk, source_uri, row.offset, row.length))
+                        written += 1
+                    pbar.update(1)
+
+    request_count = sum(s.requests for s in sources)
+    transferred = sum(s.transferred for s in sources)
+    print(
+        f"Created {output_path}: {written} records from {len(groups)} source(s), "
+        f"{request_count} requests, {tqdm.format_sizeof(transferred, suffix='B')} transferred "
+        f"({warcinfo_count} warcinfo record{'' if warcinfo_count == 1 else 's'})"
+    )
+    if skipped:
+        print(f"warning: {skipped} row(s) could not be fetched (see warnings above)", file=sys.stderr)
     return skipped
 
 
@@ -830,8 +2007,14 @@ def format_login_provider_error(input_file, profile, error):
 
 def cli():
     parser = argparse.ArgumentParser(description="Convert a gzipped WARC file into a zip-of-zips archive.")
-    parser.add_argument("input_file", help="Path to a .warc.gz file")
-    parser.add_argument("--output", default=None, help="Output zip path (default: replace .warc.gz with .zip)")
+    parser.add_argument("input_file", help="Path to a .warc.gz file, or '-' for stdin (a manifest.csv with --fetch)")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output zip path (default: {basename}_{hex}.zip in the current directory, with the same hex as the "
+        "root directory inside and _partial appended when --limit is set). With --fetch: the output .warc.gz "
+        "(default: {basename}_{hex}.warc.gz)",
+    )
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true",
@@ -842,6 +2025,12 @@ def cli():
         help="Write every CSV, manifest and sidecar but no payload files. The WARC is still "
         "streamed in full, so this saves output size, not transfer (use --limit for that).",
     )
+    mode.add_argument(
+        "--fetch",
+        action="store_true",
+        help="Treat input_file as a manifest.csv (filtered or not) and download every row's byte range from its "
+        "source_uri into one .warc.gz, with retries and per-host rate limiting.",
+    )
     parser.add_argument(
         "--limit",
         help="Limit to N capture records, with their full set of associated request/metadata records",
@@ -851,8 +2040,24 @@ def cli():
     parser.add_argument(
         "--format",
         choices=["flat", "sidecar"],
-        default="flat",
-        help="Output format: 'flat' (counter-named files + global CSVs) or 'sidecar' (domain dirs + per-file metadata)",
+        default=None,
+        help="Output format: 'flat' (counter-named files + global CSVs) or 'sidecar' (domain dirs + per-file "
+        "metadata). Default: flat",
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=None,
+        help="--fetch only: requests per second per host, 0 for unlimited. Default: cdx_toolkit's per-host "
+        f"pacing for http(s) (about 1.8/s for data.commoncrawl.org, 0.33/s elsewhere), {FETCH_DEFAULT_RATE:g}/s for s3",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=None,
+        help="--fetch only: for http(s), connection failures tolerated per request (default 100; throttling "
+        f"and server errors are retried without limit, as cdx_toolkit does); for s3, retries per request "
+        f"(default {FETCH_DEFAULT_RETRIES})",
     )
     parser.add_argument(
         "--profile",
@@ -864,29 +2069,33 @@ def cli():
     if args.profile and urlparse(args.input_file).scheme != "s3":
         parser.error("--profile is only valid for s3:// inputs")
 
-    input_file = args.input_file
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        # Extract basename from local path or remote URI
-        name = posixpath.basename(input_file.rstrip("/"))
-        if name.endswith(".warc.gz"):
-            name = name[: -len(".warc.gz")] + ".zip"
-        else:
-            name = name + ".zip"
-        output_path = Path(name)
+    # Flags that would be silently ignored are refused instead: --format defaults to None so an
+    # explicit value is detectable here, and becomes "flat" only when it reaches main().
+    if args.fetch:
+        if args.limit is not None or args.format is not None:
+            parser.error("--limit and --format do not apply to --fetch")
+        return 1 if fetch_main(args.input_file, args.output, rate=args.rate, retries=args.retries) else 0
+    if args.rate is not None or args.retries is not None:
+        parser.error("--rate and --retries only apply to --fetch")
 
-
+    # Default output naming lives in main() (see default_output_path).
     try:
         skipped = main(
-            input_file,
-            str(output_path),
+            args.input_file,
+            args.output,
             dry_run=args.dry_run,
             limit=args.limit,
-            output_format=args.format,
+            output_format=args.format or "flat",
             metadata_only=args.metadata_only,
             profile=args.profile,
         )
+    except PermissionError as exc:
+        # archive.org's 401/403 (see InternetArchiveFileSystem); other inputs keep the traceback.
+        if urlparse(args.input_file).scheme != "ia":
+            raise
+        print(format_ia_permission_error(args.input_file), file=sys.stderr)
+        print(f"Underlying error: {exc!r}", file=sys.stderr)
+        return 1
     except MissingDependencyException as e:
         print(format_login_provider_error(input_file, args.profile, e), file=sys.stderr)
         sys.exit(1)
@@ -896,7 +2105,6 @@ def cli():
         sys.exit(1)
 
     return 1 if skipped else 0
-
 
 
 if __name__ == "__main__":

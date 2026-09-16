@@ -1,0 +1,52 @@
+# Manual only: streams every README example archive end to end (0.4-10 GB each), which is far too
+# slow and bandwidth-heavy for the per-push CI. Start it from the Actions tab ("Run workflow") or
+# with `gh workflow run long-tests.yml`. One job per output format so the two halves run in parallel.
+name: Long tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: "pytest -k expression to narrow the run (e.g. 'not megawarc', 'cc-us-federal')"
+        required: false
+        default: ""
+      python-version:
+        description: "Python version"
+        required: false
+        default: "3.12"
+
+jobs:
+  long:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # the hosted-runner maximum
+    strategy:
+      fail-fast: false
+      matrix:
+        format: [flat, sidecar]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+
+      - name: Disk before
+        run: df -h /
+
+      - name: Long tests (${{ matrix.format }})
+        env:
+          KEYWORD: ${{ inputs.keyword }}
+        run: |
+          source .venv/bin/activate
+          if [ -n "$KEYWORD" ]; then
+            pytest -m long -k "${{ matrix.format }} and ($KEYWORD)" -v --durations=0
+          else
+            pytest -m long -k "${{ matrix.format }}" -v --durations=0
+          fi

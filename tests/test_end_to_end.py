@@ -9,13 +9,15 @@ import io
 import json
 import re
 import zipfile
+from pathlib import Path
 
 import pytest
+from conftest import CAPTURES
 from warcio.archiveiterator import ArchiveIterator
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 
-from warc2zip import MANIFEST_COLUMNS, main
+from warc2zip import MANIFEST_COLUMNS, default_output_path, format_record_type_summary, main
 
 # Payload files are named {counter}{ext}. Sidecars share the payload's full name and add a second
 # suffix (1000000.html.request.json), so a plain endswith(".json") would confuse the two.
@@ -36,92 +38,6 @@ EXPECTED_CSVS = {
     "warcinfo.csv",
     "warcinfo_multi.csv",
 }
-
-# The shape CC writes into a metadata record's warc-fields body.
-CLD2 = '{"reliable":true,"languages":[{"code":"zh","text-covered":0.87,"name":"Chinese"}]}'
-
-CAPTURES = [
-    (
-        "https://example.com/",
-        "text/html",
-        b"<html><body>hello</body></html>",
-        [("Content-Type", "text/html; charset=UTF-8"), ("Connection", "close\x00")],
-    ),
-    (
-        "https://cloudflare-ish.example.org/index.html",
-        "text/html",
-        b"<html>report-to</html>",
-        [
-            ("Content-Type", "text/html"),
-            ("Report-To", '{"group":"cf-nel","max_age":604800}'),
-            ("Server-Timing", 'cfCacheStatus;desc="DYNAMIC"'),
-            ("Cache-Control", "no-store, must-revalidate, no-cache"),
-        ],
-    ),
-    (
-        "https://plain.example.net/data.json",
-        "application/json",
-        b'{"ok": true}',
-        [("Content-Type", "application/json"), ("X-Fold", "a\r\n b")],
-    ),
-]
-
-
-@pytest.fixture
-def warc_path(tmp_path):
-    """A three-capture WARC: warcinfo + response/request/metadata per capture."""
-    path = tmp_path / "test.warc.gz"
-    with open(path, "wb") as fh:
-        writer = WARCWriter(fh, gzip=True)
-        writer.write_record(writer.create_warcinfo_record("test.warc.gz", {"software": "warc2zip-tests"}))
-        for i, (uri, _mime, payload, headers) in enumerate(CAPTURES):
-            request_id = f"<urn:uuid:req-{i}>"
-
-            http_headers = StatusAndHeaders("200 OK", headers, protocol="HTTP/1.1")
-            response = writer.create_warc_record(
-                uri,
-                "response",
-                payload=io.BytesIO(payload),
-                length=len(payload),
-                http_headers=http_headers,
-                warc_headers_dict={"WARC-Concurrent-To": request_id},
-            )
-            writer.write_record(response)
-            response_id = response.rec_headers.get_header("WARC-Record-ID")
-
-            request_headers = StatusAndHeaders(
-                "GET / HTTP/1.1", [("Host", "example.com"), ("User-Agent", 'cc-bot/1.0 "test"')], is_http_request=True
-            )
-            writer.write_record(
-                writer.create_warc_record(
-                    uri,
-                    "request",
-                    http_headers=request_headers,
-                    warc_headers_dict={"WARC-Record-ID": request_id, "WARC-Concurrent-To": response_id},
-                )
-            )
-
-            body = (
-                b"fetchTimeMs: 42\r\n"
-                b"charset-detected: utf-8\x00\r\n"
-                + f"languages-cld2: {CLD2}\r\n".encode()
-                + b"http-header-user-agent: cc-bot/1.0 (X11; Linux)\r\n"
-                b"  continued-on-the-next-line\r\n"
-            )
-            writer.write_record(
-                writer.create_warc_record(
-                    uri,
-                    "metadata",
-                    payload=io.BytesIO(body),
-                    length=len(body),
-                    warc_headers_dict={
-                        "WARC-Concurrent-To": response_id,
-                        "Content-Type": "application/warc-fields",
-                    },
-                )
-            )
-    return path
-
 
 def csv_members(zf):
     return [n for n in zf.namelist() if n.endswith(".csv")]
@@ -167,6 +83,82 @@ def test_conversion_produces_parseable_csvs(warc_path, tmp_path, output_format):
         ]
         assert len(manifest) == len(CAPTURES)
         assert {entry["warc_target_uri"] for entry in manifest} == {uri for uri, _, _, _ in CAPTURES}
+
+
+RUN_ID_RE = r"\d{8}T\d{6}_[0-9a-f]{4}"
+
+
+@pytest.mark.parametrize("limit", [None, 2])
+def test_default_output_name_follows_the_root_dirs_rule(warc_path, tmp_path, monkeypatch, limit):
+    """No --output: the zip is {basename}_{hex}[_partial].zip, with _partial iff --limit was given.
+
+    That is the root directory's rule, so the zip name tells you whether it holds a sample, and
+    the hex is the *same* one the root directory carries, so a zip on disk can be matched to the
+    directory it extracts to.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    main(str(warc_path), output_path=None, limit=limit)
+
+    suffix = "_partial" if limit else ""
+    zips = [p.name for p in tmp_path.glob("*.zip")]
+    assert len(zips) == 1
+    zip_match = re.fullmatch(rf"test_([0-9a-f]{{4}}){suffix}\.zip", zips[0])
+    assert zip_match, zips[0]
+
+    with zipfile.ZipFile(tmp_path / zips[0]) as zf:
+        root_dirs = {n.split("/", 1)[0] for n in zf.namelist()}
+    assert len(root_dirs) == 1
+    dir_match = re.fullmatch(rf"test_\d{{8}}T\d{{6}}_([0-9a-f]{{4}}){suffix}", next(iter(root_dirs)))
+    assert dir_match, root_dirs
+    assert dir_match.group(1) == zip_match.group(1)
+
+
+def test_default_output_names_do_not_collide_for_same_basename(warc_path, tmp_path, monkeypatch):
+    """CC's warc/, crawldiagnostics/ and robotstxt/ files share a basename: two runs, two zips."""
+    monkeypatch.chdir(tmp_path)
+
+    main(str(warc_path), output_path=None)
+    main(str(warc_path), output_path=None)
+
+    assert len(list(tmp_path.glob("test_*.zip"))) == 2
+
+
+@pytest.mark.parametrize(
+    ("input_file", "expected"),
+    [
+        # Every input shape the README shows
+        ("archive.warc.gz", "archive.zip"),
+        ("/data/crawls/archive.warc.gz", "archive.zip"),
+        ("s3://commoncrawl/crawl-data/CC-MAIN-2026-34/segments/x/warc/CC-MAIN-0000.warc.gz", "CC-MAIN-0000.zip"),
+        ("https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-34/warc/CC-MAIN-0000.warc.gz", "CC-MAIN-0000.zip"),
+        (
+            (
+                "https://huggingface.co/buckets/commoncrawl/warc2zip-examples/resolve/"
+                "CC-MAIN-2026-30-500_records.warc.gz?download=true"
+            ),
+            "CC-MAIN-2026-30-500_records.zip",
+        ),
+        ("https://eotarchive.s3.amazonaws.com/crawl-data/EOT-2004/NARA-PEOT-2004.arc.gz", "NARA-PEOT-2004.zip"),
+        ("plain.warc", "plain.zip"),
+        ("-", "stdin.zip"),
+    ],
+)
+def test_default_output_path_handles_every_readme_input_shape(input_file, expected):
+    label = expected[: -len(".zip")]
+    assert default_output_path(input_file, run_id="abcd").name == f"{label}_abcd.zip"
+    assert default_output_path(input_file, partial=True, run_id="abcd").name == f"{label}_abcd_partial.zip"
+    # Without a run id one is minted, and it is 4 hex chars like the root directory's
+    assert re.fullmatch(rf"{re.escape(label)}_[0-9a-f]{{4}}\.zip", default_output_path(input_file).name)
+    # Always the current directory, never the input's
+    assert default_output_path(input_file).parent == Path(".")
+
+
+def test_explicit_output_path_is_used_verbatim(warc_path, tmp_path):
+    out = tmp_path / "chosen-name.zip"
+    main(str(warc_path), str(out), limit=1)
+    assert out.exists()
+    assert list(tmp_path.glob("*.zip")) == [out]
 
 
 def test_nul_from_the_wire_is_escaped_in_the_csv(warc_path, tmp_path):
@@ -388,3 +380,150 @@ def test_source_uri_is_recorded_even_without_a_warcinfo_record(tmp_path):
     assert ["warcinfo", "source_uri", str(path)] in warcinfo
     # WARC-Filename is unavailable, so the input's own basename stands in
     assert {row[MANIFEST_COLUMNS.index("warc_filename")] for row in rows} == {"no-warcinfo.warc.gz"}
+
+
+def test_record_type_summary_is_aligned_and_flags_unextracted_types():
+    from collections import Counter
+
+    counts = Counter(
+        {"response": 3639, "request": 3789, "metadata": 3789, "revisit": 150, "warcinfo": 1, "resource": 12, "conversion": 0}
+    )
+    assert format_record_type_summary(counts) == (
+        "Record types:\n"
+        "  warcinfo     1\n"
+        "  response  3639\n"
+        "  revisit    150\n"
+        "  request   3789\n"
+        "  metadata  3789\n"
+        "  resource    12  (not extracted)"
+    )
+    assert format_record_type_summary(Counter()) == "Record types: none"
+
+
+def append_revisit_capture(warc_path):
+    """Append a CC-style revisit capture (request + 304 revisit + metadata) to the fixture.
+
+    As CC writes it: no WARC-Concurrent-To anywhere; the revisit names its request in
+    WARC-Refers-To. Every record is its own gzip member, so appending keeps the WARC valid.
+    Returns the capture's target URI.
+    """
+    uri = "http://revisited.example.org/index.htm"
+    with open(warc_path, "ab") as fh:
+        writer = WARCWriter(fh, gzip=True)
+        request = writer.create_warc_record(
+            uri,
+            "request",
+            http_headers=StatusAndHeaders(
+                "GET /index.htm HTTP/1.1",
+                [("Host", "revisited.example.org"), ("If-Modified-Since", "Mon, 11 May 2026 12:10:15 GMT")],
+                is_http_request=True,
+            ),
+        )
+        writer.write_record(request)
+        revisit = writer.create_warc_record(
+            uri,
+            "revisit",
+            http_headers=StatusAndHeaders("304 Not Modified", [("ETag", '"3820"'), ("Content-Length", "0")], protocol="HTTP/1.1"),
+            warc_headers_dict={
+                "WARC-Profile": "http://netpreserve.org/warc/1.1/revisit/server-not-modified",
+                "WARC-Refers-To": request.rec_headers.get_header("WARC-Record-ID"),
+                "WARC-Refers-To-Target-URI": uri,
+                "WARC-Refers-To-Date": "2026-05-11T12:10:15Z",
+            },
+        )
+        writer.write_record(revisit)
+        body = b"fetchTimeMs: 118\r\n"
+        writer.write_record(
+            writer.create_warc_record(
+                uri,
+                "metadata",
+                payload=io.BytesIO(body),
+                length=len(body),
+                warc_headers_dict={
+                    "WARC-Concurrent-To": revisit.rec_headers.get_header("WARC-Record-ID"),
+                    "Content-Type": "application/warc-fields",
+                },
+            )
+        )
+    return uri
+
+
+def test_revisit_capture_is_extracted_without_payload(warc_path, tmp_path, capsys):
+    """A revisit capture gets every CSV row a response does — its request joined through the
+    revisit's WARC-Refers-To — but no payload file: a 304 has no body of its own."""
+    uri = append_revisit_capture(warc_path)
+
+    out = tmp_path / "flat.zip"
+    main(str(warc_path), str(out), output_format="flat")
+    captured = capsys.readouterr()
+
+    assert ": 3 responses, 1 revisits, 4 requests, 4 metadata records" in captured.out
+    table = [line.split() for line in captured.out.split("Record types:\n", 1)[1].splitlines()]
+    assert [row[0] for row in table] == ["warcinfo", "response", "revisit", "request", "metadata"]
+    assert not any(row[-1] == "extracted)" for row in table)
+    assert "Warning" not in captured.err
+
+    with zipfile.ZipFile(out) as zf:
+        # The synthetic .revisit key names no member of the zip
+        assert not any(n.endswith(".revisit") for n in zf.namelist())
+        payloads = [n for n in zf.namelist() if PAYLOAD_RE.match(n.rsplit("/", 1)[-1])]
+        assert len(payloads) == 3
+
+        manifest = [dict(zip(MANIFEST_COLUMNS, row)) for row in read_rows(zf, "manifest.csv")]
+        assert [row["warc_type"] for row in manifest] == ["response"] * 3 + ["revisit"]
+        revisit_row = manifest[-1]
+        assert revisit_row["filename"] == "1000003.revisit"
+        assert revisit_row["http_status_code"] == "304"
+        assert revisit_row["payload_size"] == "0"
+        assert revisit_row["warc_refers_to_target_uri"] == uri
+        assert revisit_row["warc_refers_to_date"] == "2026-05-11T12:10:15Z"
+
+        request_rows = [r for r in read_rows(zf, "request_http_headers.csv") if r[0] == "1000003.revisit"]
+        assert ["1000003.revisit", "if_modified_since", "Mon, 11 May 2026 12:10:15 GMT"] in request_rows
+        response_rows = [r for r in read_rows(zf, "response_http_headers.csv") if r[0] == "1000003.revisit"]
+        assert response_rows[0][1:] == ["status_code", "304"]
+        metadata_rows = [r for r in read_rows(zf, "metadata.csv") if r[0] == "1000003.revisit"]
+        assert any("fetchtimems" in name for _, name, _ in metadata_rows)
+
+    # The --metadata-only invariant extends to revisit captures: metadata is byte-identical
+    meta_out = tmp_path / "meta.zip"
+    main(str(warc_path), str(meta_out), output_format="flat", metadata_only=True)
+
+    def members(path):
+        # strip the randomized root directory so the two runs are comparable
+        with zipfile.ZipFile(path) as inner:
+            return {n.split("/", 1)[1]: inner.read(n) for n in inner.namelist()}
+
+    full_members, meta_members = members(out), members(meta_out)
+    metadata_members = {n for n in full_members if not PAYLOAD_RE.match(n.rsplit("/", 1)[-1])}
+    assert metadata_members == set(meta_members)
+    for name in metadata_members:
+        assert full_members[name] == meta_members[name], name
+
+
+def test_limit_counts_revisit_captures(warc_path, tmp_path):
+    append_revisit_capture(warc_path)
+
+    out = tmp_path / "limited.zip"
+    main(str(warc_path), str(out), limit=4, output_format="flat")
+
+    with zipfile.ZipFile(out) as zf:
+        manifest = [dict(zip(MANIFEST_COLUMNS, row)) for row in read_rows(zf, "manifest.csv")]
+    assert len(manifest) == 4
+    assert manifest[-1]["warc_type"] == "revisit"
+
+
+def test_short_download_is_reported(warc_path, tmp_path, monkeypatch, capsys):
+    class SizedBytesIO(io.BytesIO):
+        def __init__(self, data, size):
+            super().__init__(data)
+            self.size = size
+
+    data = warc_path.read_bytes()
+    monkeypatch.setattr(
+        "warc2zip.fsspec_open",
+        lambda *_args, **_kwargs: SizedBytesIO(data, len(data) + 1),
+    )
+
+    assert main("https://example.test/test.warc.gz", str(tmp_path / "out.zip")) == 1
+    assert f"read {len(data)} bytes; expected {len(data) + 1} bytes" in capsys.readouterr().err

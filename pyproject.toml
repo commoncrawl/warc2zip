@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Convert gzipped WARC files into zip-of-zips archives"
 requires-python = ">=3.10"
 dependencies = [
+    "cdx_toolkit>=0.9.39",
+    "fsspec[http]",
     # AWS's Python SDK is the only one requiring CRT for the `aws login` credential provider;
     # without it those profiles fail outright. See Caveats in README.md.
     "botocore[crt]",
@@ -24,3 +26,14 @@ warc2zip = "warc2zip:cli"
 [tool.ruff]
 target-version = "py310"
 line-length = 120
+
+[tool.pytest.ini_options]
+# The default `pytest` run is offline and self-contained (synthetic WARC/ARC fixtures, a local
+# stand-in for archive.org). The tests that download the README's real archives are opt-in:
+# `pytest -m integration` converts the first 20 captures of each (a separate CI job), and
+# `pytest -m long` streams the whole files (0.4–10 GB each; the manual "Long tests" workflow).
+addopts = "-m 'not long and not integration'"
+markers = [
+    "integration: downloads real archives listed in the README, --limit 20 each (WARC2ZIP_OFFLINE=1 skips)",
+    "long: full-file conversions of the README archives; hours, never in the per-push CI",
+]

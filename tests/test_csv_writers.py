@@ -239,6 +239,7 @@ def test_request_line_pairs(line, expected):
 def test_manifest_csv_round_trips_a_comma_and_quote_heavy_uri():
     entry = {
         "filename": "1000000.html",
+        "warc_type": "response",
         "warc_record_id": "<urn:uuid:abc>",
         "warc_target_uri": 'https://example.com/a,b?q="x"',
         "warc_date": "2026-05-08T07:59:02Z",
@@ -246,6 +247,8 @@ def test_manifest_csv_round_trips_a_comma_and_quote_heavy_uri():
         "detected_mime_type": "text/html",
         "content_type_header": "text/html; charset=UTF-8",
         "payload_size": 299529,
+        "warc_refers_to_target_uri": "",
+        "warc_refers_to_date": "",
         "warc_filename": "CC-MAIN-20260618163205-20260618193205-00999.warc.gz",
         "source_uri": "https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-25/segments/x/warc/y.warc.gz",
         "warc_record_offset": 1048576,
