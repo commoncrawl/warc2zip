@@ -2097,7 +2097,7 @@ def cli():
         print(f"Underlying error: {exc!r}", file=sys.stderr)
         return 1
     except MissingDependencyException as e:
-        print(format_login_provider_error(input_file, args.profile, e), file=sys.stderr)
+        print(format_login_provider_error(args.input_file, args.profile, e), file=sys.stderr)
         sys.exit(1)
     except LoginTokenLoadError as e:
         # Expired or absent `aws login` session; botocore's message already says to reauthenticate
