@@ -8,7 +8,7 @@ to the account's IA-S3 keys. The one network test lives in test_readme_warcs.py.
 
 import pytest
 from conftest import CAPTURES
-from test_fetch import assert_is_stamped_copy, manifest_rows, parsed_records, slice_of, warcinfo_range, write_subset
+from test_fetch import assert_fetched, manifest_rows, warcinfo_values, write_subset
 
 import warc2zip
 from warc2zip import (
@@ -185,16 +185,10 @@ def test_ia_uri_converts_and_refetches(ia_server, warc_path, tmp_path):
     assert all(hit.path.startswith(("/download/", "/items/")) for hit in ia_server.hits)
 
     subset = write_subset(tmp_path / "subset.csv", [rows[0], rows[2]])
-    fetched_path = tmp_path / "subset.warc.gz"
+    fetched_path = tmp_path / "subset.zip"
     assert fetch_main(str(subset), str(fetched_path)) == 0
-    raw = warc_path.read_bytes()
-    offset, length = warcinfo_range(out)
-    fetched = fetched_path.read_bytes()
-    assert fetched.startswith(raw[offset : offset + length])
-    records = parsed_records(fetched)
-    assert [t for t, _, _ in records] == ["warcinfo", "response", "response"]
-    for record, row in zip(records[1:], [rows[0], rows[2]]):
-        assert_is_stamped_copy(record, parsed_records(slice_of(raw, row))[0], uri, row)
+    assert_fetched(fetched_path, [rows[0], rows[2]])
+    assert warcinfo_values(fetched_path, "source_uri") == {"warcinfo": uri}
 
 
 def test_authorization_survives_the_cross_origin_redirect(ia_server, warc_path, tmp_path, monkeypatch):

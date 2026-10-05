@@ -1,4 +1,4 @@
-"""--fetch: rebuilding a subset .warc.gz from manifest rows.
+"""--fetch: turning manifest rows back into a zip.
 
 Everything runs offline: the sources are local paths, which fsspec serves through the same
 cat_file(start, end) range read that https:// and s3:// use.
@@ -8,13 +8,13 @@ import csv
 import io
 import shutil
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
 import pytest
 from conftest import CAPTURES
 from fsspec.implementations.local import LocalFileSystem
-from warcio.archiveiterator import ArchiveIterator
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 
@@ -24,10 +24,9 @@ from warc2zip import (
     FetchLengthMismatch,
     FetchRow,
     RateLimiter,
-    annotate_record_slice,
     cli,
     coalesce_ranges,
-    default_fetch_output_path,
+    default_output_path,
     fetch_main,
     fetch_with_retry,
     http_range,
@@ -86,42 +85,30 @@ def write_subset(path, rows, fieldnames=None):
     return path
 
 
-def record_types_and_ids(path):
-    with open(path, "rb") as fh:
-        return [(r.rec_type, r.rec_headers.get_header("WARC-Record-ID")) for r in ArchiveIterator(fh)]
+def payloads(zip_path):
+    """Payload bytes of a flat zip, in manifest order."""
+    with zipfile.ZipFile(zip_path) as zf:
+        members = {name.rsplit("/", 1)[-1]: name for name in zf.namelist()}
+        return [zf.read(members[row["filename"]]) for row in manifest_rows(zip_path)]
 
 
-def parsed_records(data):
-    """(rec_type, WARC headers, payload) per record; the payload is read before advancing."""
-    return [
-        (r.rec_type, dict(r.rec_headers.headers), r.content_stream().read())
-        for r in ArchiveIterator(io.BytesIO(data))
-    ]
+def without_filename(rows):
+    """Manifest rows minus `filename`, the one column a fetched zip numbers afresh."""
+    return [{k: v for k, v in row.items() if k != "filename"} for row in rows]
 
 
-def without_source_headers(headers):
-    return {k: v for k, v in headers.items() if not k.startswith("WARC-Source-")}
+def warcinfo_values(zip_path, name):
+    """{warcinfo key: value} of one field across the warcinfo records of a zip."""
+    return {key: value for key, field, value in zip_csv(zip_path, "warcinfo.csv")[1:] if field == name}
 
 
-def raw_blocks(data):
-    """Each record's content block as written, HTTP headers and body, without warcio's HTTP parse."""
-    return [r.content_stream().read() for r in ArchiveIterator(io.BytesIO(data), no_record_parse=True)]
+BODIES = {capture[0]: capture[2] for capture in CAPTURES}
 
 
-def assert_is_stamped_copy(fetched, original, source_uri, row):
-    """A fetched record is the original plus the two provenance headers, same payload."""
-    rec_type, headers, payload = fetched
-    o, n = int(row["warc_record_offset"]), int(row["warc_record_length"])
-    assert rec_type == "response"
-    assert without_source_headers(headers) == original[1]
-    assert headers["WARC-Source-URI"] == source_uri
-    assert headers["WARC-Source-Range"] == f"bytes={o}-{o + n - 1}"
-    assert payload == original[2]
-
-
-def assert_blocks_untouched(fetched_member, original_member):
-    """The stamped record's content block is the wire bytes: obs-folds, NULs and all."""
-    assert raw_blocks(fetched_member) == raw_blocks(original_member)
+def assert_fetched(zip_path, rows):
+    """The zip holds exactly `rows`: same manifest (original coordinates included), same payloads."""
+    assert without_filename(manifest_rows(zip_path)) == without_filename(rows)
+    assert payloads(zip_path) == [BODIES[row["warc_target_uri"]] for row in rows]
 
 
 def write_warc_without_warcinfo(path):
@@ -151,104 +138,117 @@ def metadata_zip(warc_path, tmp_path):
 
 
 def test_fetch_rebuilds_the_subset(warc_path, metadata_zip, tmp_path):
-    """The source's warcinfo member verbatim, then each kept row's record stamped with its origin."""
+    """Each kept row comes back as a payload, under a manifest row that still addresses the original."""
     rows = manifest_rows(metadata_zip)
     kept = [rows[0], rows[2]]
     subset = write_subset(tmp_path / "subset.csv", kept)
-    out = tmp_path / "subset.warc.gz"
+    out = tmp_path / "subset.zip"
 
     assert fetch_main(str(subset), str(out)) == 0
 
-    raw = warc_path.read_bytes()
-    offset, length = warcinfo_range(metadata_zip)
-    fetched = out.read_bytes()
-    assert fetched.startswith(raw[offset : offset + length])
-    records = parsed_records(fetched)
-    assert [t for t, _, _ in records] == ["warcinfo", "response", "response"]
-    for record, row in zip(records[1:], kept):
-        assert_is_stamped_copy(record, parsed_records(slice_of(raw, row))[0], str(warc_path), row)
+    assert_fetched(out, kept)
+    # The source's own warcinfo record, at its place in the source.
+    assert warcinfo_range(out) == warcinfo_range(metadata_zip)
+    assert warcinfo_values(out, "source_uri") == {"warcinfo": str(warc_path)}
+    assert warcinfo_values(out, "warc_filename") == {"warcinfo": "test.warc.gz"}
+    with zipfile.ZipFile(out) as zf:
+        roots = {name.split("/")[0] for name in zf.namelist()}
+    assert len(roots) == 1 and roots.pop().startswith("subset_")  # named after the manifest, not a source
 
 
-def test_fetched_subset_reconverts_and_still_names_the_original_warc(warc_path, metadata_zip, tmp_path):
-    """The README caveat: a derived WARC keeps the original's warcinfo, while its offsets index itself."""
+def test_the_temporary_warc_is_removed(metadata_zip, tmp_path, monkeypatch):
+    """The fetched .warc.gz lives in the temp directory for the length of the run, then goes,
+    whether the conversion succeeds or blows up."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    subset = write_subset(tmp_path / "subset.csv", manifest_rows(metadata_zip))
+    seen = []
+    real_main = warc2zip.main
+
+    def spying_main(*args, fetched=None, **kwargs):
+        seen.append(Path(fetched.path))
+        assert seen[0].parent.parent == scratch and seen[0].stat().st_size > 0
+        return real_main(*args, fetched=fetched, **kwargs)
+
+    monkeypatch.setattr(warc2zip, "main", spying_main)
+    assert fetch_main(str(subset), str(tmp_path / "subset.zip")) == 0
+    assert seen and list(scratch.iterdir()) == []
+
+    monkeypatch.setattr(warc2zip, "main", lambda *args, **kwargs: 1 / 0)
+    with pytest.raises(ZeroDivisionError):
+        fetch_main(str(subset), str(tmp_path / "again.zip"))
+    assert list(scratch.iterdir()) == []
+
+
+def test_fetched_manifest_can_be_fetched_again(warc_path, metadata_zip, tmp_path):
+    """The zip's own manifest.csv is a valid --fetch input: its rows address the original WARC."""
     rows = manifest_rows(metadata_zip)
-    subset = write_subset(tmp_path / "subset.csv", [rows[1]])
-    out = tmp_path / "subset.warc.gz"
-    assert fetch_main(str(subset), str(out)) == 0
+    first = tmp_path / "first.zip"
+    assert fetch_main(str(write_subset(tmp_path / "subset.csv", rows)), str(first)) == 0
 
-    check = tmp_path / "check.zip"
-    assert main(str(out), str(check)) == 0
-    check_rows = manifest_rows(check)
+    again = write_subset(tmp_path / "again.csv", manifest_rows(first)[1:])
+    second = tmp_path / "second.zip"
+    assert fetch_main(str(again), str(second)) == 0
 
-    assert [row["warc_record_id"] for row in check_rows] == [rows[1]["warc_record_id"]]
-    assert check_rows[0]["warc_filename"] == "test.warc.gz"
-    assert check_rows[0]["source_uri"] == str(out)
-    record = next(iter(ArchiveIterator(io.BytesIO(slice_of(out.read_bytes(), check_rows[0])))))
-    assert record.rec_headers.get_header("WARC-Record-ID") == rows[1]["warc_record_id"]
-    # ...and the CSV now says where the record sat in the original.
-    o, n = int(rows[1]["warc_record_offset"]), int(rows[1]["warc_record_length"])
-    provenance = {name: value for _, name, value in zip_csv(check, "response_warc_headers.csv")[1:]}
-    assert provenance["warc_source_uri"] == str(warc_path)
-    assert provenance["warc_source_range"] == f"bytes={o}-{o + n - 1}"
+    assert_fetched(second, rows[1:])
 
 
 def test_rows_are_grouped_by_source_and_ordered_by_offset(warc_path, metadata_zip, tmp_path):
-    """Two sources: each gets its own warcinfo, in first-appearance order, rows sorted within."""
+    """Two sources: first-appearance order, rows sorted within, each row labelled with its own source."""
     other = tmp_path / "other.warc.gz"
     shutil.copy(warc_path, other)
     rows = manifest_rows(metadata_zip)
     from_other = [dict(row, source_uri=str(other)) for row in rows]
     # CSV order deliberately scrambled: other first, then this file's rows descending.
     subset = write_subset(tmp_path / "subset.csv", [from_other[1], rows[2], rows[0], from_other[0]])
-    out = tmp_path / "subset.warc.gz"
+    out = tmp_path / "subset.zip"
 
     assert fetch_main(str(subset), str(out)) == 0
 
-    warcinfo_id = record_types_and_ids(warc_path)[0][1]
-    assert record_types_and_ids(out) == [
-        ("warcinfo", warcinfo_id),
-        ("response", rows[0]["warc_record_id"]),
-        ("response", rows[1]["warc_record_id"]),
-        ("warcinfo", warcinfo_id),
-        ("response", rows[0]["warc_record_id"]),
-        ("response", rows[2]["warc_record_id"]),
-    ]
+    # The copy carries the same record ids, which must not merge the two sources' rows.
+    assert_fetched(out, [from_other[0], from_other[1], rows[0], rows[2]])
+    assert warcinfo_values(out, "source_uri") == {"warcinfo": str(other), "warcinfo.1": str(warc_path)}
+    assert warcinfo_values(out, "warc_record_offset") == {"warcinfo": "0", "warcinfo.1": "0"}
 
 
-def test_source_without_warcinfo_yields_responses_only(tmp_path, capsys):
+def test_source_without_warcinfo_is_labelled_by_its_own_name(tmp_path, capsys):
     bare = write_warc_without_warcinfo(tmp_path / "bare.warc.gz")
     meta = tmp_path / "meta.zip"
     assert main(str(bare), str(meta), metadata_only=True) == 0
-    subset = write_subset(tmp_path / "subset.csv", manifest_rows(meta))
-    out = tmp_path / "subset.warc.gz"
+    rows = manifest_rows(meta)
+    subset = write_subset(tmp_path / "subset.csv", rows)
+    out = tmp_path / "subset.zip"
 
     assert fetch_main(str(subset), str(out)) == 0
 
-    assert [t for t, _ in record_types_and_ids(out)] == ["response"]
+    assert without_filename(manifest_rows(out)) == without_filename(rows)
+    assert manifest_rows(out)[0]["warc_filename"] == "bare.warc.gz"
+    assert payloads(out) == [b"<html>bare</html>"]
+    assert zip_csv(out, "warcinfo.csv")[1:] == []
     assert "no leading warcinfo record" in capsys.readouterr().err
 
 
 def test_blank_offset_row_is_skipped_with_a_warning(metadata_zip, tmp_path, capsys):
     rows = manifest_rows(metadata_zip)
-    rows[1]["warc_record_offset"] = ""
-    subset = write_subset(tmp_path / "subset.csv", rows)
-    out = tmp_path / "subset.warc.gz"
+    subset = write_subset(tmp_path / "subset.csv", [rows[0], dict(rows[1], warc_record_offset=""), rows[2]])
+    out = tmp_path / "subset.zip"
 
     assert fetch_main(str(subset), str(out)) == 1
 
     err = capsys.readouterr().err
     assert "line 3" in err and "1 row(s) could not be fetched" in err
-    assert [t for t, _ in record_types_and_ids(out)] == ["warcinfo", "response", "response"]
+    assert_fetched(out, [rows[0], rows[2]])
 
 
 def test_duplicate_rows_are_fetched_once(metadata_zip, tmp_path, capsys):
     rows = manifest_rows(metadata_zip)
     subset = write_subset(tmp_path / "subset.csv", [rows[0], rows[0]])
-    out = tmp_path / "subset.warc.gz"
+    out = tmp_path / "subset.zip"
 
     assert fetch_main(str(subset), str(out)) == 0
 
-    assert [t for t, _ in record_types_and_ids(out)] == ["warcinfo", "response"]
+    assert_fetched(out, [rows[0]])
     assert "1 duplicate row(s) dropped" in capsys.readouterr().err
 
 
@@ -256,20 +256,33 @@ def test_a_server_that_ignores_range_is_caught_not_retried(metadata_zip, tmp_pat
     """fsspec never checks for a 206, so the length check is the only guard against a whole-file answer."""
     monkeypatch.setattr(LocalFileSystem, "cat_file", lambda self, path, start=None, end=None, **kw: Path(path).read_bytes())
     subset = write_subset(tmp_path / "subset.csv", manifest_rows(metadata_zip)[:1])
-    out = tmp_path / "subset.warc.gz"
+    out = tmp_path / "subset.zip"
     sleeps = []
 
     assert fetch_main(str(subset), str(out), sleep=sleeps.append) == 1
 
     assert sleeps == []
     assert "got" in capsys.readouterr().err
-    assert [t for t, _ in record_types_and_ids(out)] == ["warcinfo"]
+    # Still a well-formed zip: the warcinfo the probe found, and no captures.
+    assert manifest_rows(out) == []
+    assert set(warcinfo_values(out, "source_uri")) == {"warcinfo"}
+
+
+def test_nothing_fetched_still_yields_a_named_zip(tmp_path):
+    """Every row failing must not write the members under a root directory called None."""
+    row = {"source_uri": str(tmp_path / "missing.warc.gz"), "warc_record_offset": "0", "warc_record_length": "10"}
+    out = tmp_path / "subset.zip"
+
+    assert fetch_main(str(write_subset(tmp_path / "subset.csv", [row])), str(out), sleep=lambda s: None) == 1
+
+    with zipfile.ZipFile(out) as zf:
+        assert all(name.startswith("subset_") for name in zf.namelist())
 
 
 def test_csv_without_manifest_columns_is_a_usage_error(tmp_path, capsys):
     subset = write_subset(tmp_path / "subset.csv", [{"url": "x", "warc_record_offset": "0"}])
     with pytest.raises(SystemExit) as exc:
-        fetch_main(str(subset), str(tmp_path / "out.warc.gz"))
+        fetch_main(str(subset), str(tmp_path / "out.zip"))
     assert exc.value.code == 2
     assert "source_uri" in capsys.readouterr().err
 
@@ -416,11 +429,10 @@ def test_validate_record_slice_rejects_impostors(warc_path, metadata_zip):
     assert "WARC-Target-URI" in validate_record_slice(good, fetch_row(rows[0], record_id="", target_uri="https://x/"))
 
 
-def test_default_fetch_output_path():
-    assert default_fetch_output_path("subset.csv", run_id="abcd") == Path("subset_abcd.warc.gz")
-    assert default_fetch_output_path("/tmp/dir/Manifest.CSV", run_id="abcd") == Path("Manifest_abcd.warc.gz")
-    assert default_fetch_output_path("-", run_id="abcd") == Path("stdin_abcd.warc.gz")
-    assert default_fetch_output_path("subset.csv").parent == Path(".")
+def test_default_zip_is_named_after_the_manifest():
+    assert default_output_path("subset.csv", run_id="abcd") == Path("subset_abcd.zip")
+    assert default_output_path("/tmp/dir/Manifest.CSV", run_id="abcd") == Path("Manifest_abcd.zip")
+    assert default_output_path("-", run_id="abcd") == Path("stdin_abcd.zip")
 
 
 # --- cli ----------------------------------------------------------------------------------
@@ -430,7 +442,6 @@ def test_default_fetch_output_path():
     "argv",
     [
         ["subset.csv", "--fetch", "--limit", "1"],
-        ["subset.csv", "--fetch", "--format", "sidecar"],
         ["x.warc.gz", "--rate", "1"],
         ["x.warc.gz", "--retries", "2"],
         ["subset.csv", "--fetch", "--dry-run"],
@@ -443,20 +454,35 @@ def test_cli_refuses_flags_that_would_otherwise_be_ignored(argv, monkeypatch):
     assert exc.value.code == 2
 
 
-def test_cli_fetch_and_default_format_still_flat(warc_path, metadata_zip, tmp_path, monkeypatch):
-    subset = write_subset(tmp_path / "subset.csv", manifest_rows(metadata_zip)[:1])
-    out = tmp_path / "subset.warc.gz"
+def test_cli_fetch_writes_a_zip_in_either_format(warc_path, metadata_zip, tmp_path, monkeypatch):
+    rows = manifest_rows(metadata_zip)[:1]
+    subset = write_subset(tmp_path / "subset.csv", rows)
+    out = tmp_path / "subset.zip"
     monkeypatch.setattr(sys, "argv", ["warc2zip", str(subset), "--fetch", "--output", str(out), "--rate", "0"])
     assert cli() == 0
-    assert [t for t, _ in record_types_and_ids(out)] == ["warcinfo", "response"]
+    assert_fetched(out, rows)
+    with zipfile.ZipFile(out) as zf:
+        assert not any(".response." in name for name in zf.namelist())  # flat by default
 
-    check = tmp_path / "check.zip"
-    monkeypatch.setattr(sys, "argv", ["warc2zip", str(out), "--output", str(check)])
+    sidecar = tmp_path / "sidecar.zip"
+    monkeypatch.setattr(
+        sys, "argv", ["warc2zip", str(subset), "--fetch", "--format", "sidecar", "--output", str(sidecar)]
+    )
     assert cli() == 0
-    with zipfile.ZipFile(check) as zf:
-        names = {n.rsplit("/", 1)[-1] for n in zf.namelist()}
-    assert "manifest.csv" in names and not any(".request." in n for n in names)  # flat, not sidecar
-    assert len(CAPTURES) == 3  # the fixture shape the row indexes above rely on
+    with zipfile.ZipFile(sidecar) as zf:
+        assert any(name.endswith("/example.com/1000000.html.response.http") for name in zf.namelist())
+    assert without_filename(manifest_rows(sidecar)) == without_filename(rows)
+
+
+def test_cli_fetch_default_output_is_a_zip_in_cwd(warc_path, metadata_zip, tmp_path, monkeypatch):
+    subset = write_subset(tmp_path / "subset.csv", manifest_rows(metadata_zip)[:1])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["warc2zip", str(subset), "--fetch"])
+    assert cli() == 0
+    (out,) = tmp_path.glob("subset_*.zip")
+    with zipfile.ZipFile(out) as zf:
+        root = zf.namelist()[0].split("/")[0]
+    assert root.endswith(out.stem.split("_")[-1])  # the zip and its root directory share the run id
 
 
 # --- http(s) transport through cdx_toolkit ------------------------------------------------
@@ -494,18 +520,12 @@ def test_https_sources_go_through_cdx_toolkit(warc_path, metadata_zip, tmp_path,
     uri = "https://data.example.org/crawl-data/x.warc.gz"
     rows = manifest_rows(metadata_zip)
     subset = write_subset(tmp_path / "subset.csv", https_rows([rows[0], rows[2]], uri))
-    out = tmp_path / "subset.warc.gz"
+    out = tmp_path / "subset.zip"
 
     assert fetch_main(str(subset), str(out), retries=3) == 0
 
-    raw = warc_path.read_bytes()
-    offset, length = warcinfo_range(metadata_zip)
-    fetched = out.read_bytes()
-    assert fetched.startswith(raw[offset : offset + length])
-    records = parsed_records(fetched)
-    assert [t for t, _, _ in records] == ["warcinfo", "response", "response"]
-    for record, row in zip(records[1:], [rows[0], rows[2]]):
-        assert_is_stamped_copy(record, parsed_records(slice_of(raw, row))[0], uri, row)
+    assert_fetched(out, https_rows([rows[0], rows[2]], uri))
+    assert warcinfo_values(out, "source_uri") == {"warcinfo": uri}
     # One probe plus one coalesced span, both Range requests to cdx_toolkit's transport.
     assert [(u, r) for u, r, _ in log] == [
         (uri, "bytes=0-65535"),
@@ -540,12 +560,13 @@ def test_https_server_ignoring_range_is_caught(warc_path, metadata_zip, tmp_path
     monkeypatch.setattr(warc2zip, "myrequests_get", fake_myrequests_get(warc_path.read_bytes(), log, ignore_range=True))
     rows = https_rows(manifest_rows(metadata_zip)[:1], "https://data.example.org/x.warc.gz")
     subset = write_subset(tmp_path / "subset.csv", rows)
-    out = tmp_path / "subset.warc.gz"
+    out = tmp_path / "subset.zip"
 
     assert fetch_main(str(subset), str(out)) == 1
 
     assert "got" in capsys.readouterr().err
-    assert [t for t, _ in record_types_and_ids(out)] == ["warcinfo"]  # the probe tolerates a long answer
+    assert manifest_rows(out) == []
+    assert set(warcinfo_values(out, "source_uri")) == {"warcinfo"}  # the probe tolerates a long answer
 
 
 def test_set_host_interval_maps_rate_onto_cdx_toolkit(monkeypatch):
@@ -560,22 +581,3 @@ def test_set_host_interval_maps_rate_onto_cdx_toolkit(monkeypatch):
     set_host_interval(host, 0)
     assert retry_info[host]["minimum_interval"] == 0.0
     assert retry_info["data.commoncrawl.org"]["minimum_interval"] == 0.55
-
-
-def test_stamping_keeps_every_original_header_and_the_payload(warc_path, metadata_zip):
-    rows = manifest_rows(metadata_zip)
-    raw = warc_path.read_bytes()
-    row = rows[1]
-    original = parsed_records(slice_of(raw, row))[0]
-
-    stamped = annotate_record_slice(slice_of(raw, row), str(warc_path), int(row["warc_record_offset"]), int(row["warc_record_length"]))
-
-    records = parsed_records(stamped)
-    assert len(records) == 1
-    assert_is_stamped_copy(records[0], original, str(warc_path), row)
-    assert_blocks_untouched(stamped, slice_of(raw, row))
-    # The fixture's obs-folded header is the case a parsed re-serialisation would unfold.
-    folded = annotate_record_slice(slice_of(raw, rows[2]), str(warc_path), 0, 1)
-    assert b"X-Fold: a\r\n b" in raw_blocks(folded)[0]
-    assert records[0][1]["WARC-Target-URI"] == CAPTURES[1][0]
-    assert records[0][2] == CAPTURES[1][2]
