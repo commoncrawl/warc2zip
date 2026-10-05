@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import configparser
+import contextlib
 import csv
 import functools
 import io
@@ -32,7 +33,6 @@ from tqdm import tqdm
 from warcio.archiveiterator import ArchiveIterator
 from warcio.recordloader import ARC2WARCHeadersParser
 from warcio.utils import fsspec_open
-from warcio.warcwriter import WARCWriter
 
 # --- Internet Archive input: ia://<identifier>/<filename> ------------------------------------------
 #
@@ -489,6 +489,10 @@ class RecordGroup:
     refers_to_record_id: str = ""  # WARC-Refers-To (on CC revisits: the request's record id)
     refers_to_target_uri: str = ""  # WARC-Refers-To-Target-URI
     refers_to_date: str = ""  # WARC-Refers-To-Date (absent on ~2% of CC revisits)
+    # Set only under --fetch, where each capture comes from its own source WARC; otherwise blank
+    # and the run-wide values main() holds apply.
+    source_uri: str = ""
+    warc_filename: str = ""
     requests: list[list[tuple[str, str]]] = field(default_factory=list)
     request_http_headers: list[list[tuple[str, str]]] = field(default_factory=list)
     request_http_lines: list[str] = field(default_factory=list)  # e.g. "GET /path HTTP/1.1"
@@ -799,22 +803,25 @@ def build_warcinfo_rows(warcinfos, source_uri=""):
     WARC's own WARC-Filename says what the file is called; this says where it was read from,
     which is what a range request actually needs. Emitted even when the WARC carries no
     warcinfo record at all, so the provenance is never lost.
+
+    Each entry's last element is that warcinfo's own source, set under --fetch where every
+    source WARC contributes one; it leads the entry's block. Otherwise it is blank and the
+    run-wide `source_uri` leads the first block only.
     """
     rows = []
     multi = []
-    for i, (headers, body_text, offset, length) in enumerate(warcinfos):
+    for i, (headers, body_text, offset, length, origin) in enumerate(warcinfos):
         key = "warcinfo" if i == 0 else f"warcinfo.{i}"
-        pairs = record_location_pairs(offset, length) + list(headers)
+        origin = origin or (source_uri if i == 0 else "")
+        pairs = [("source_uri", origin)] if origin else []
+        pairs += record_location_pairs(offset, length) + list(headers)
         for n, v in pairs:
             rows.append((key, str.lower(n.replace("-", "_")), v))
         rows.extend((key, n, v) for n, v in flatten_body_rows(body_text))
         multi.append((key, pairs + [("_body", body_text)]))
-    if source_uri:
-        rows.insert(0, ("warcinfo", "source_uri", source_uri))
-        if multi:
-            multi[0] = (multi[0][0], [("source_uri", source_uri)] + multi[0][1])
-        else:
-            multi.append(("warcinfo", [("source_uri", source_uri)]))
+    if source_uri and not warcinfos:
+        rows.append(("warcinfo", "source_uri", source_uri))
+        multi.append(("warcinfo", [("source_uri", source_uri)]))
     return rows, multi
 
 
@@ -822,11 +829,11 @@ def write_warcinfo_files(zip_file, root_dir, warcinfos):
     """Write the raw warcinfo record(s): WARC headers and warc-fields body, wire bytes preserved."""
     zip_file.writestr(
         f"{root_dir}/warcinfo.warc",
-        "\n\n".join("\n".join(f"{n}: {v}" for n, v in headers) for headers, _body, _o, _l in warcinfos),
+        "\n\n".join("\n".join(f"{n}: {v}" for n, v in headers) for headers, *_ in warcinfos),
     )
     zip_file.writestr(
         f"{root_dir}/warcinfo.warc-fields",
-        "\n\n".join(body for _headers, body, _o, _l in warcinfos),
+        "\n\n".join(body for _headers, body, *_ in warcinfos),
     )
 
 
@@ -918,11 +925,12 @@ def extract_crawl_name(warc_filename):
     """Extract a clean crawl name from a WARC-Filename header value.
 
     Strips path and extensions like .warc.gz to get a usable directory name. Longest suffix
-    first, so .warc.gz is not left holding a stray ".warc".
+    first, so .warc.gz is not left holding a stray ".warc". `.csv` is there for --fetch, whose
+    input is a manifest and whose zip and root directory are named after it.
     """
     name = posixpath.basename(warc_filename)
-    for ext in (".warc.gz", ".warc", ".arc.gz", ".arc"):
-        if name.endswith(ext):
+    for ext in (".warc.gz", ".warc", ".arc.gz", ".arc", ".csv"):
+        if name.lower().endswith(ext):
             return name[: -len(ext)]
     return name
 
@@ -1006,8 +1014,8 @@ def build_group_metadata(group, warc_filename="", source_uri=""):
         "payload_size": group.payload_size,
         "warc_refers_to_target_uri": group.refers_to_target_uri,
         "warc_refers_to_date": group.refers_to_date,
-        "warc_filename": warc_filename,
-        "source_uri": source_uri,
+        "warc_filename": group.warc_filename or warc_filename,
+        "source_uri": group.source_uri or source_uri,
         "warc_record_offset": "" if group.response_offset is None else group.response_offset,
         "warc_record_length": "" if group.response_length is None else group.response_length,
     }
@@ -1077,8 +1085,18 @@ def write_sidecar_files(zip_file, root_dir, group):
         zip_file.writestr(f"{base}.metadata.warc-fields", "\n\n".join(body_parts))
 
 
-def main(input_file, output_path=None, dry_run=False, limit=None, output_format="flat", metadata_only=False):
-    file_size = get_file_size(input_file)
+def main(
+    input_file, output_path=None, dry_run=False, limit=None, output_format="flat", metadata_only=False, fetched=None
+):
+    """Convert one archive into a zip.
+
+    `fetched` is --fetch's side door: a _FetchedStream of records downloaded from the rows of
+    a manifest. It is read instead of opening `input_file`, which is then the manifest CSV and
+    only names the zip and its root directory. Every record's source_uri / offset / length
+    come from the stream's `origins`, so the manifest written here addresses the original
+    WARCs rather than a stream that no longer exists.
+    """
+    file_size = None if fetched is not None else get_file_size(input_file)
     partial = limit is not None
 
     if dry_run:
@@ -1134,6 +1152,14 @@ def main(input_file, output_path=None, dry_run=False, limit=None, output_format=
     root_dir = None  # resolved from first warcinfo record
     warcinfos = []  # list[(warc_header_pairs, body_text, offset, length)] - crawl-level provenance
     warc_filename = ""  # WARC-Filename from the warcinfo record; every manifest row repeats it
+    source_filenames = {}  # --fetch only: source_uri -> that source's own WARC-Filename
+
+    def locate(record_iter):
+        """(source_uri, offset, length) of the record just read; call after its payload is read."""
+        offset = record_iter.get_record_offset()
+        if fetched is not None:
+            return fetched.origins[offset]
+        return "", offset, record_iter.get_record_length()
 
     # Fallback crawl name from input filename (same label default_output_path uses)
     basename = input_basename(input_file)
@@ -1153,13 +1179,19 @@ def main(input_file, output_path=None, dry_run=False, limit=None, output_format=
     # response -> Record id  <-> metadata -
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as outer_zip:
         # Pass 1: Read WARC, write payloads immediately, buffer only headers
-        with fsspec_open(input_file, "rb", default_fh=sys.stdin.buffer) as raw_stream:
+        opened = (
+            contextlib.nullcontext(fetched)
+            if fetched is not None
+            else fsspec_open(input_file, "rb", default_fh=sys.stdin.buffer)
+        )
+        with opened as raw_stream:
             # fsspec HTTP/S3 handles expose the response size when the server provides one.
             # Count reads ourselves so an early EOF is not mistaken for a complete archive.
             # if we ever decide to add partial-range downloads, this needs to account for that
             expected_size = getattr(raw_stream, "size", None) or file_size
             stream = CountingStream(raw_stream, label=input_file)
-            pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC")
+            # Under --fetch the fetch loop's own bar is the progress display.
+            pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Reading WARC", disable=fetched is not None)
             # Held by name rather than iterated anonymously: get_record_offset() /
             # get_record_length() hang off the iterator, not the record.
             record_iter = open_archive_iterator(stream)
@@ -1174,15 +1206,13 @@ def main(input_file, output_path=None, dry_run=False, limit=None, output_format=
 
                 if rec_type == "warcinfo":
                     body_text = record.content_stream().read().decode("utf-8", errors="replace")
-                    warcinfos.append(
-                        (
-                            archive_header_pairs(record),
-                            body_text,
-                            record_iter.get_record_offset(),
-                            record_iter.get_record_length(),
-                        )
-                    )
-                    if root_dir is None:
+                    origin, offset, length = locate(record_iter)
+                    warcinfos.append((archive_header_pairs(record), body_text, offset, length, origin))
+                    if fetched is not None:
+                        # One warcinfo per source: it labels that source's rows, and the root
+                        # directory keeps the manifest's name (resolved below).
+                        source_filenames[origin] = record.rec_headers.get_header("WARC-Filename") or ""
+                    elif root_dir is None:
                         warc_filename = record.rec_headers.get_header("WARC-Filename") or ""
                         crawl_name = extract_crawl_name(warc_filename) if warc_filename else fallback_crawl_name
                         root_dir = build_root_dir_name(crawl_name, partial, run_id)
@@ -1200,7 +1230,10 @@ def main(input_file, output_path=None, dry_run=False, limit=None, output_format=
                     # below still gets a unique key. Flagged so it never reaches a CSV.
                     is_arc = is_arc_record(record)
 
-                    group = groups.setdefault(record_id, RecordGroup())
+                    # Under --fetch there is nothing to join (validate_record_slice lets only
+                    # response records through), and the same record can arrive from two sources (a
+                    # mirror, a copy), so the id is not a safe key there.
+                    group = groups.setdefault(record_id if fetched is None else order_counter, RecordGroup())
                     group.warc_type = rec_type
                     group.concurrent_to = record.rec_headers.get_header("WARC-Concurrent-To") or ""
                     if rec_type == "revisit":
@@ -1244,8 +1277,9 @@ def main(input_file, output_path=None, dry_run=False, limit=None, output_format=
                         group.content_type_header = record.http_headers.get_header("Content-Type") or ""
                         group.http_status_code = str(record.http_headers.get_statuscode() or "")
                         group.http_status_line = f"{record.http_headers.protocol} {record.http_headers.statusline}"
-                    group.response_offset = record_iter.get_record_offset()
-                    group.response_length = record_iter.get_record_length()
+                    group.source_uri, group.response_offset, group.response_length = locate(record_iter)
+                    if fetched is not None:
+                        group.warc_filename = source_filenames.get(group.source_uri) or input_basename(group.source_uri)
                     group.response_order = order_counter
                     order_counter += 1
                     counter += 1
@@ -1289,6 +1323,9 @@ def main(input_file, output_path=None, dry_run=False, limit=None, output_format=
 
                 pbar.update(stream.tell() - pbar.n)
             pbar.close()
+            # Nothing but warcinfo records (or nothing at all) was read.
+            if root_dir is None:
+                root_dir = build_root_dir_name(fallback_crawl_name, partial, run_id)
 
             if limit is None and expected_size is not None and stream.tell() != expected_size:
                 download_size_mismatch = True
@@ -1382,7 +1419,7 @@ def main(input_file, output_path=None, dry_run=False, limit=None, output_format=
         # Write the warcinfo record(s): raw wire bytes plus greppable CSVs
         # Built unconditionally: warcinfo.csv records the source URI even for a WARC that
         # carries no warcinfo record, so the provenance is never lost.
-        warcinfo_rows, warcinfo_multi = build_warcinfo_rows(warcinfos, input_file)
+        warcinfo_rows, warcinfo_multi = build_warcinfo_rows(warcinfos, "" if fetched is not None else input_file)
         if warcinfos:
             write_warcinfo_files(outer_zip, root_dir, warcinfos)
 
@@ -1432,7 +1469,7 @@ def main(input_file, output_path=None, dry_run=False, limit=None, output_format=
 
 
 # ---------------------------------------------------------------------------
-# --fetch: re-download the rows of a (filtered) manifest.csv as one .warc.gz
+# --fetch: re-download the rows of a (filtered) manifest.csv and convert them into a zip
 # ---------------------------------------------------------------------------
 
 FETCH_COLUMNS = ("source_uri", "warc_record_offset", "warc_record_length")
@@ -1726,17 +1763,6 @@ def validate_record_slice(data, row):
     return None
 
 
-def default_fetch_output_path(csv_path, run_id=None):
-    """Default .warc.gz path for --fetch: {csv basename minus .csv}_{hex}.warc.gz, in cwd.
-
-    Same hex as default_output_path() and for the same reason: filtering one manifest twice
-    into `subset.csv` must not overwrite the first subset. `-` is labelled stdin.
-    """
-    basename = input_basename(csv_path)
-    label = basename[:-4] if basename.lower().endswith(".csv") else basename
-    return Path(f"{label or 'unknown'}_{run_id or new_run_id()}.warc.gz")
-
-
 def http_range(url, start, end, retries=None, redirects=FETCH_MAX_REDIRECTS, get=None):
     """Bytes [start, end) over http(s), through cdx_toolkit's `myrequests_get`.
 
@@ -1786,28 +1812,6 @@ def fetch_range(fs, path, start, end, exact=True):
     """
     data = fs.cat_file(path, start=start, end=end)
     return check_length(data, start, end) if exact else data
-
-
-def annotate_record_slice(data, source_uri, offset, length):
-    """Re-serialise one record with WARC-Source-URI / WARC-Source-Range added.
-
-    The names and values are cdx_toolkit's convention for extracts, so a subset made this way
-    matches one from `cdxt warc`, and a re-converted subset carries every record's original
-    coordinates in response_warc_headers.csv. The WARC header block is rewritten by warcio and
-    the member recompressed, so it is no longer the source's bytes, but the content block (HTTP
-    headers and body) is copied through untouched (a verbatim switch was tried and dropped: nothing
-    in the workflow needs the wire bytes, and the curl loop in the README gives them anyway).
-    Cost measured on CC records: ~1.4 ms CPU and ~43 bytes of output per record.
-    """
-    # no_record_parse=True leaves the HTTP layer unparsed, so warcio writes the content block
-    # through byte for byte (a parsed one is re-serialised: obs-folds unfolded, Content-Length
-    # recomputed, WARC-Block-Digest silently wrong). Only the WARC header block is rewritten.
-    record = next(iter(ArchiveIterator(io.BytesIO(data), no_record_parse=True, arc2warc=True)))
-    record.rec_headers.replace_header("WARC-Source-URI", source_uri)
-    record.rec_headers.replace_header("WARC-Source-Range", f"bytes={offset}-{offset + length - 1}")
-    buffer = io.BytesIO()
-    WARCWriter(buffer, gzip=True).write_record(record)
-    return buffer.getvalue()
 
 
 def _is_local_filesystem(fs):
@@ -1861,31 +1865,30 @@ class _FetchSource:
         )
 
 
-def fetch_main(csv_path, output_path=None, rate=None, retries=None, sleep=time.sleep):
-    """--fetch: download every manifest row's byte range and concatenate the raw members.
+@dataclass
+class FetchStats:
+    """Counters of one --fetch run, filled in by fetch_members() as it is consumed."""
 
-    Each source's own warcinfo record is copied first (see leading_warcinfo), then its rows
-    in offset order. A span that fails after retries skips all its rows with a warning and
-    the run goes on, like the CSV writers: the file is a valid .warc.gz at every member
-    boundary, and the return value (skipped rows) makes cli() exit 1. `rate` and `retries`
-    are None by default so each transport keeps its own defaults (see _FetchSource). Every
-    record is stamped with WARC-Source-URI / WARC-Source-Range (see annotate_record_slice); the
-    warcinfo record is copied as-is.
+    written: int = 0
+    skipped: int = 0  # starts at the rows read_fetch_rows() rejected
+    sources: list = field(default_factory=list)
+
+
+def fetch_members(csv_path, groups, stats, rate=None, retries=None, sleep=time.sleep):
+    """Yield (gzip member, (source_uri, offset, length)) for every fetchable row, source by source.
+
+    Each source's own warcinfo record comes first (see leading_warcinfo), then its rows in
+    offset order, each member exactly the source's bytes. A span that fails after retries skips
+    all its rows with a warning and the run goes on, like the CSV writers. `rate` and `retries`
+    are None by default so each transport keeps its own defaults (see _FetchSource).
     """
-    rows, skipped = read_fetch_rows(csv_path)
-    groups = group_fetch_rows(rows)
-    if output_path is None:
-        output_path = str(default_fetch_output_path(csv_path, new_run_id()))
-
     limiter = RateLimiter(FETCH_DEFAULT_RATE if rate is None else rate, sleep=sleep)
     total_rows = sum(len(source_rows) for source_rows in groups.values())
-    written = warcinfo_count = 0
-    sources = []
 
-    with open(output_path, "wb") as out, tqdm(total=total_rows, unit="rec", desc="Fetching") as pbar:
+    with tqdm(total=total_rows, unit="rec", desc="Fetching") as pbar:
         for source_uri, source_rows in groups.items():
             source = _FetchSource(source_uri, limiter, rate=rate, retries=retries)
-            sources.append(source)
+            stats.sources.append(source)
 
             try:
                 head = source.fetch(0, FETCH_HEAD_BYTES, exact=False, label=f"{source_uri} (warcinfo probe)", sleep=sleep)
@@ -1894,11 +1897,9 @@ def fetch_main(csv_path, output_path=None, rate=None, retries=None, sleep=time.s
                 head = b""
             warcinfo = leading_warcinfo(head)
             if warcinfo:
-                out.write(warcinfo)
-                warcinfo_count += 1
+                yield warcinfo, (source_uri, 0, len(warcinfo))
             else:
-                print(f"note: {source_uri}: no leading warcinfo record, subset starts at its first response",
-                      file=sys.stderr)
+                print(f"note: {source_uri}: no leading warcinfo record", file=sys.stderr)
 
             for start, end, span_rows in coalesce_ranges(source_rows):
                 label = f"{source_uri} bytes {start}-{end - 1}"
@@ -1907,31 +1908,77 @@ def fetch_main(csv_path, output_path=None, rate=None, retries=None, sleep=time.s
                 except Exception as exc:  # noqa: BLE001 - skip-and-warn, the run continues
                     print(f"warning: {label}: could not be fetched ({exc}), {len(span_rows)} row(s) skipped",
                           file=sys.stderr)
-                    skipped += len(span_rows)
+                    stats.skipped += len(span_rows)
                     pbar.update(len(span_rows))
                     continue
                 for row in span_rows:
                     chunk = data[row.offset - start : row.offset - start + row.length]
                     problem = validate_record_slice(chunk, row)
+                    pbar.update(1)
                     if problem:
                         print(f"warning: {csv_path} line {row.line}: fetched bytes are not the expected record "
                               f"({problem}), skipped", file=sys.stderr)
-                        skipped += 1
+                        stats.skipped += 1
                     else:
-                        out.write(annotate_record_slice(chunk, source_uri, row.offset, row.length))
-                        written += 1
-                    pbar.update(1)
+                        stats.written += 1
+                        yield chunk, (source_uri, row.offset, row.length)
 
-    request_count = sum(s.requests for s in sources)
-    transferred = sum(s.transferred for s in sources)
+
+class _FetchedStream(io.RawIOBase):
+    """The members fetch_members() yields, as one unseekable byte stream for main() to read.
+
+    Nothing is parked on disk: a member is fetched when the reader runs out of bytes. `origins`
+    maps the position at which each member starts in this stream to where it sits in its
+    source, which is what main() looks up with the record offset warcio reports.
+    """
+
+    def __init__(self, members):
+        self._members = iter(members)
+        self._pending = memoryview(b"")
+        self._position = 0  # bytes pulled from the generator so far
+        self.origins = {}
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        while not self._pending:
+            member = next(self._members, None)
+            if member is None:
+                return 0
+            data, origin = member
+            self.origins[self._position] = origin
+            self._position += len(data)
+            self._pending = memoryview(data)
+        n = min(len(buffer), len(self._pending))
+        buffer[:n] = self._pending[:n]
+        self._pending = self._pending[n:]
+        return n
+
+
+def fetch_main(csv_path, output_path=None, rate=None, retries=None, sleep=time.sleep, output_format="flat"):
+    """--fetch: download every manifest row's byte range and convert the records into a zip.
+
+    The records go to main() as an in-memory stream (see _FetchedStream), so no .warc.gz is
+    written, and the zip's manifest addresses the original WARCs: it can be filtered and
+    fetched again. Returns the rows that could not be fetched plus the CSV rows main() could
+    not write, so cli() exits 1 on either.
+    """
+    rows, skipped = read_fetch_rows(csv_path)
+    groups = group_fetch_rows(rows)
+    stats = FetchStats(skipped=skipped)
+    members = fetch_members(csv_path, groups, stats, rate=rate, retries=retries, sleep=sleep)
+    unwritten = main(csv_path, output_path, output_format=output_format, fetched=_FetchedStream(members))
+
+    request_count = sum(s.requests for s in stats.sources)
+    transferred = sum(s.transferred for s in stats.sources)
     print(
-        f"Created {output_path}: {written} records from {len(groups)} source(s), "
-        f"{request_count} requests, {tqdm.format_sizeof(transferred, suffix='B')} transferred "
-        f"({warcinfo_count} warcinfo record{'' if warcinfo_count == 1 else 's'})"
+        f"Fetched {stats.written} records from {len(groups)} source(s): {request_count} requests, "
+        f"{tqdm.format_sizeof(transferred, suffix='B')} transferred"
     )
-    if skipped:
-        print(f"warning: {skipped} row(s) could not be fetched (see warnings above)", file=sys.stderr)
-    return skipped
+    if stats.skipped:
+        print(f"warning: {stats.skipped} row(s) could not be fetched (see warnings above)", file=sys.stderr)
+    return stats.skipped + unwritten
 
 
 def cli():
@@ -1941,8 +1988,7 @@ def cli():
         "--output",
         default=None,
         help="Output zip path (default: {basename}_{hex}.zip in the current directory, with the same hex as the "
-        "root directory inside and _partial appended when --limit is set). With --fetch: the output .warc.gz "
-        "(default: {basename}_{hex}.warc.gz)",
+        "root directory inside and _partial appended when --limit is set)",
     )
 
     mode = parser.add_mutually_exclusive_group()
@@ -1958,7 +2004,7 @@ def cli():
         "--fetch",
         action="store_true",
         help="Treat input_file as a manifest.csv (filtered or not) and download every row's byte range from its "
-        "source_uri into one .warc.gz, with retries and per-host rate limiting.",
+        "source_uri into the zip, with retries and per-host rate limiting.",
     )
     parser.add_argument(
         "--limit",
@@ -1990,12 +2036,14 @@ def cli():
     )
     args = parser.parse_args()
 
-    # Flags that would be silently ignored are refused instead: --format defaults to None so an
-    # explicit value is detectable here, and becomes "flat" only when it reaches main().
+    # Flags that would be silently ignored are refused instead.
     if args.fetch:
-        if args.limit is not None or args.format is not None:
-            parser.error("--limit and --format do not apply to --fetch")
-        return 1 if fetch_main(args.input_file, args.output, rate=args.rate, retries=args.retries) else 0
+        if args.limit is not None:
+            parser.error("--limit does not apply to --fetch")
+        skipped = fetch_main(
+            args.input_file, args.output, rate=args.rate, retries=args.retries, output_format=args.format or "flat"
+        )
+        return 1 if skipped else 0
     if args.rate is not None or args.retries is not None:
         parser.error("--rate and --retries only apply to --fetch")
 

@@ -56,12 +56,12 @@ of those it tried.
 | Flag                      | Description                                                                            | Default                                 |
 |---------------------------|----------------------------------------------------------------------------------------|-----------------------------------------|
 | `input_file`              | Path or URI to a `.warc.gz` file: local, `s3://`, `http(s)://` or `ia://<item>/<file>` (positional, required) |                                         |
-| `--output`                | Path to the output zip file (the output `.warc.gz` with `--fetch`)                     | `{basename}_{hex}.zip` in the current directory, same hex and `_partial` rule as the root directory inside (`{basename}_{hex}.warc.gz` with `--fetch`) |
+| `--output`                | Path to the output zip file                                                            | `{basename}_{hex}.zip` in the current directory, same hex and `_partial` rule as the root directory inside (with `--fetch` the basename is the CSV's) |
 | `--dry-run`               | Print summary without creating output. The scan always stops after at most 10 capture records, so it never streams the whole file; a lower `--limit` is respected |                                         |
 | `--limit <N>`             | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
 | `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
 | `--metadata-only`         | Write every CSV, manifest and sidecar but no payload files                             | Off, payloads are written               |
-| `--fetch`                 | Treat `input_file` as a `manifest.csv` and download every row's byte range into one `.warc.gz` (see [Building and downloading a subset](#building-and-downloading-a-subset)). Not combinable with `--limit` or `--format` | Off |
+| `--fetch`                 | Treat `input_file` as a `manifest.csv` and download every row's byte range into a zip (see [Building and downloading a subset](#building-and-downloading-a-subset)). Not combinable with `--limit` | Off |
 | `--rate <N>`              | `--fetch` only: requests per second per host, `0` for unlimited                        | [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s per-host pacing for http(s), `2` for s3 and ia |
 | `--retries <N>`           | `--fetch` only: connection failures tolerated per request (http(s), throttling is retried without limit) or retries per request (s3, ia) | `100` / `8`                            |
 
@@ -421,15 +421,15 @@ mlr --csv filter '$http_status_code == 200' manifest.csv > subset.csv
 
 ### Fetch what survived
 ```bash
-warc2zip subset.csv --fetch --output subset.warc.gz
+warc2zip subset.csv --fetch --output subset.zip
 ```
 
-Every row is fetched by byte range from its own `source_uri` (https, s3, ia or a local file). Nearby rows share one request, http(s) requests go through [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s Common Crawl-aware retry and pacing (`--rate`, `--retries`), and each source's own `warcinfo` record leads the output. Each record is stamped with `WARC-Source-URI` and `WARC-Source-Range`, cdx_toolkit's convention, so a re-converted subset says on every row where the record sat in the original. `subset.warc.gz` goes straight back into `warc2zip` — or into any other WARC tool.
+Every row is fetched by byte range from its own `source_uri` (https, s3, ia or a local file). Nearby rows share one request, http(s) requests go through [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s Common Crawl-aware retry and pacing (`--rate`, `--retries`), and each source's own `warcinfo` record is kept. The result is an ordinary warc2zip zip (`--format` applies) holding the response records only, written without an intermediate WARC on disk. Its `manifest.csv` rows keep the `source_uri` and offsets of the original WARCs, so it can be filtered and fetched again.
 
 Three caveats:
 
 - Fetch with `source_uri`, not `warc_filename`. For Common Crawl the latter is a bare basename like `CC-MAIN-20260618163205-20260618193205-00999.warc.gz`; the full path is `crawl-data/{crawl}/segments/{segment}/warc/{basename}`, and **the segment is not recorded anywhere in the WARC** — `warcinfo.csv` gives you the crawl (`_body.ispartof`) but you would need the crawl's `warc.paths.gz` to resolve the rest.
-- Offsets address the file named by `source_uri`, nothing else. A fetched subset keeps the original's `warcinfo` record, so its `warc_filename` names the original while its offsets index the subset.
+- Offsets address the file named by `source_uri`, nothing else. In a fetched zip that is still the original WARC; in a WARC derived by another tool, `warc_filename` keeps naming the original while the offsets index the derived file.
 - Offsets stay valid under `--limit`: limiting only stops the read early, it never rewrites them.
 
 ## WARC examples for testing
