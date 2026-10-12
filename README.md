@@ -409,12 +409,13 @@ Filter by column name and value. Here some examples with `awk` and [miller](http
 
 #### get all the records of a specific mime-type, e.g. pdf documents 
 
+with `awk`:
 ```bash
 awk -F'","' -v col="detected_mime_type" -v val="application/pdf" '
 NR==1 { for (i=1; i<=NF; i++) { h=$i; gsub(/["\r]/,"",h); if (h==col) c=i } print; next }
 { v=$c; gsub(/["\r]/,"",v) } v==val
 ' manifest.csv > subset.csv
-````
+```
 or with [miller](https://miller.readthedocs.io/en/latest/): 
 ```
 mlr --csv filter '$detected_mime_type == "application/pdf"' manifest.csv > subset.csv
@@ -422,12 +423,13 @@ mlr --csv filter '$detected_mime_type == "application/pdf"' manifest.csv > subse
 
 #### get all records with http response code `200` from the column `http_status_code`:
 
+with `awk`:
 ```bash
 awk -F'","' -v col="http_status_code" -v val="200" '
 NR==1 { for (i=1; i<=NF; i++) { h=$i; gsub(/["\r]/,"",h); if (h==col) c=i } print; next }
 { v=$c; gsub(/["\r]/,"",v) } v==val
 ' manifest.csv > subset.csv
-````
+```
 or with [miller](https://miller.readthedocs.io/en/latest/):
 ```
 mlr --csv filter '$http_status_code == "200"' manifest.csv > subset.csv
