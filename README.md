@@ -424,7 +424,8 @@ warc2zip 'https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz' --sel
 
 The zip has the usual layout with only the listed captures, each one complete: payload, response, request and metadata records, plus the WARC's `warcinfo`. The WARC is read in full again, as for `--metadata-only`. Rows are matched by `warc_record_offset` (checked against `warc_record_id` when the row has one), so a `manifest.csv` from a selected zip works with `--select` too.
 
-Select from the same WARC the manifest came from. It does not have to be at the same location: a local copy of an `s3://` file works, because rows are matched by file name. Rows that name another WARC are reported and skipped; run once per WARC for a subset that spans several.
+> [!TIP]
+> Select from the same WARC the manifest came from. It does not have to be at the same location: a local copy of an `s3://` file works, because rows are matched by file name. Rows that name another WARC are reported and skipped; run once per WARC for a subset that spans several.
 
 Offsets stay valid under `--limit`: limiting only stops the read early, it never rewrites them.
 
