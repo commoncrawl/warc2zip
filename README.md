@@ -407,7 +407,7 @@ head -1 manifest.csv | tr ',' '\n' | tr -d '"\r' | nl
 
 Filter by column name and value. Here some examples with `awk` and [miller](https://miller.readthedocs.io/en/latest/):
 
-#### get all the records of a specific mime-type, e.g. pdf documents 
+#### Example 1: get all the records of a specific mime-type, e.g. pdf documents 
 
 with `awk`:
 ```bash
@@ -421,7 +421,7 @@ or with [miller](https://miller.readthedocs.io/en/latest/):
 mlr --csv filter '$detected_mime_type == "application/pdf"' manifest.csv > subset.csv
 ```
 
-#### get all records with http response code `200` from the column `http_status_code`:
+#### Example 2: get all records with http response code `200` from the column `http_status_code`:
 
 with `awk`:
 ```bash
