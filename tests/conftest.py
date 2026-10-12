@@ -1,4 +1,4 @@
-"""Shared fixtures: the synthetic three-capture WARC used by the end-to-end and --fetch tests."""
+"""Shared fixtures: the synthetic three-capture WARC used by the end-to-end, --select and ia:// tests."""
 
 import io
 from pathlib import Path

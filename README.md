@@ -56,14 +56,12 @@ of those it tried.
 | Flag                      | Description                                                                            | Default                                 |
 |---------------------------|----------------------------------------------------------------------------------------|-----------------------------------------|
 | `input_file`              | Path or URI to a `.warc.gz` file: local, `s3://`, `http(s)://` or `ia://<item>/<file>` (positional, required) |                                         |
-| `--output`                | Path to the output zip file (the output `.warc.gz` with `--fetch`)                     | `{basename}_{hex}.zip` in the current directory, same hex and `_partial` rule as the root directory inside (`{basename}_{hex}.warc.gz` with `--fetch`) |
+| `--output`                | Path to the output zip file                                                            | `{basename}_{hex}.zip` in the current directory, same hex and `_partial` rule as the root directory inside |
 | `--dry-run`               | Print summary without creating output. The scan always stops after at most 10 capture records, so it never streams the whole file; a lower `--limit` is respected |                                         |
 | `--limit <N>`             | Limit to N capture records, with their full set of associated request/metadata records | No limit, all records are processed     |
 | `--format {flat,sidecar}` | Output format (see [Output Formats](#output-formats) below)                            | `flat`                                  |
 | `--metadata-only`         | Write every CSV, manifest and sidecar but no payload files                             | Off, payloads are written               |
-| `--fetch`                 | Treat `input_file` as a `manifest.csv` and download every row's byte range into one `.warc.gz` (see [Building and downloading a subset](#building-and-downloading-a-subset)). Not combinable with `--limit` or `--format` | Off |
-| `--rate <N>`              | `--fetch` only: requests per second per host, `0` for unlimited                        | [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s per-host pacing for http(s), `2` for s3 and ia |
-| `--retries <N>`           | `--fetch` only: connection failures tolerated per request (http(s), throttling is retried without limit) or retries per request (s3, ia) | `100` / `8`                            |
+| `--select <csv>`          | Convert only the captures listed in a `manifest.csv` from an earlier run on the same WARC (see [Building and downloading a subset](#building-and-downloading-a-subset)) | Off, every capture is converted |
 
 ### Small Examples
 
@@ -390,9 +388,9 @@ Both `source_uri` and the `warc_record_*` fields are pseudo-headers — computed
 
 ## Building and downloading a subset
 
-The point of `warc_filename` + `warc_record_offset` + `warc_record_length` is that `manifest.csv` alone is enough to fetch any capture again. Each record is its own gzip member, so those bytes are a standalone WARC — one HTTP range request per record, no reprocessing of the source file.
+`warc_filename` + `warc_record_offset` + `warc_record_length` make every `manifest.csv` row enough to fetch that capture again on its own. Each record is its own gzip member, so those bytes are a standalone WARC — one HTTP range request per record, no reprocessing of the source file.
 
-The intended workflow is: convert once with `--metadata-only` (a few tens of KB instead of gigabytes), filter the CSV however you like, then pull only the captures you kept.
+The intended workflow is: convert once with `--metadata-only` (a few tens of KB instead of gigabytes), filter the CSV however you like, then convert the same WARC again with `--select` to get a zip with only the captures you kept.
 
 ### Get metadata only — no payloads
 ```bash
@@ -419,18 +417,16 @@ or with [miller](https://miller.readthedocs.io/en/latest/):
 mlr --csv filter '$http_status_code == 200' manifest.csv > subset.csv
 ```
 
-### Fetch what survived
+### Convert what you kept
 ```bash
-warc2zip subset.csv --fetch --output subset.warc.gz
+warc2zip 'https://data.commoncrawl.org/crawl-data/.../CC-MAIN-....warc.gz' --select subset.csv --output subset.zip
 ```
 
-Every row is fetched by byte range from its own `source_uri` (https, s3, ia or a local file). Nearby rows share one request, http(s) requests go through [cdx_toolkit](https://github.com/commoncrawl/cdx_toolkit)'s Common Crawl-aware retry and pacing (`--rate`, `--retries`), and each source's own `warcinfo` record leads the output. Each record is stamped with `WARC-Source-URI` and `WARC-Source-Range`, cdx_toolkit's convention, so a re-converted subset says on every row where the record sat in the original. `subset.warc.gz` goes straight back into `warc2zip` — or into any other WARC tool.
+The zip has the usual layout with only the listed captures, each one complete: payload, response, request and metadata records, plus the WARC's `warcinfo`. The WARC is read in full again, as for `--metadata-only`. Rows are matched by `warc_record_offset` (checked against `warc_record_id` when the row has one), so a `manifest.csv` from a selected zip works with `--select` too.
 
-Three caveats:
+Select from the same WARC the manifest came from. It does not have to be at the same location: a local copy of an `s3://` file works, because rows are matched by file name. Rows that name another WARC are reported and skipped; run once per WARC for a subset that spans several.
 
-- Fetch with `source_uri`, not `warc_filename`. For Common Crawl the latter is a bare basename like `CC-MAIN-20260618163205-20260618193205-00999.warc.gz`; the full path is `crawl-data/{crawl}/segments/{segment}/warc/{basename}`, and **the segment is not recorded anywhere in the WARC** — `warcinfo.csv` gives you the crawl (`_body.ispartof`) but you would need the crawl's `warc.paths.gz` to resolve the rest.
-- Offsets address the file named by `source_uri`, nothing else. A fetched subset keeps the original's `warcinfo` record, so its `warc_filename` names the original while its offsets index the subset.
-- Offsets stay valid under `--limit`: limiting only stops the read early, it never rewrites them.
+Offsets stay valid under `--limit`: limiting only stops the read early, it never rewrites them.
 
 ## WARC examples for testing
 

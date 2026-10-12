@@ -209,19 +209,6 @@ wheels = [
 ]
 
 [[package]]
-name = "cdx-toolkit"
-version = "0.9.39"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "requests" },
-    { name = "warcio" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c2/92/ab18e28629867f3af01f64974ef75075dd5775ad9cbd1dca42faba1504af/cdx_toolkit-0.9.39.tar.gz", hash = "sha256:7fd85cd5b00ec3ac57bfa21e7f70ba633e1df59760eb54dae3a85e63596af4bc", size = 92815, upload-time = "2026-06-01T11:49:02.752Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/93/22/5cda1ba55a88188b5b19ae60961244759b8b0cc5fe97fb29516afef32adf/cdx_toolkit-0.9.39-py3-none-any.whl", hash = "sha256:577ae9a9578f33ce4bae6c887074f0f70331bf4d6a66a26d1e20836b3004e431", size = 32685, upload-time = "2026-06-01T11:49:01.507Z" },
-]
-
-[[package]]
 name = "certifi"
 version = "2026.2.25"
 source = { registry = "https://pypi.org/simple" }
@@ -484,6 +471,11 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e1/cf/b50ddf667c15276a9ab15a70ef5f257564de271957933ffea49d2cdbcdfb/fsspec-2026.3.0.tar.gz", hash = "sha256:1ee6a0e28677557f8c2f994e3eea77db6392b4de9cd1f5d7a9e87a0ae9d01b41", size = 313547, upload-time = "2026-03-27T19:11:14.892Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d5/1f/5f4a3cd9e4440e9d9bc78ad0a91a1c8d46b4d429d5239ebe6793c9fe5c41/fsspec-2026.3.0-py3-none-any.whl", hash = "sha256:d2ceafaad1b3457968ed14efa28798162f1638dbb5d2a6868a2db002a5ee39a4", size = 202595, upload-time = "2026-03-27T19:11:13.595Z" },
+]
+
+[package.optional-dependencies]
+http = [
+    { name = "aiohttp" },
 ]
 
 [[package]]
@@ -974,8 +966,7 @@ name = "warc2zip"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "cdx-toolkit" },
-    { name = "fsspec" },
+    { name = "fsspec", extra = ["http"] },
     { name = "tqdm" },
     { name = "warcio", extra = ["s3"] },
 ]
@@ -988,8 +979,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cdx-toolkit", specifier = ">=0.9.39" },
-    { name = "fsspec" },
+    { name = "fsspec", extras = ["http"] },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "tqdm", specifier = ">=4.67.3" },
