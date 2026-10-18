@@ -400,6 +400,15 @@ unzip -p meta.zip '*/manifest.csv' > manifest.csv
 
 ### Filter it with whatever you already use
 
+> [!TIP]
+> Feel free to use what you already know or use. warc2zip should work with CSV exported by any major tools. 
+
+You can open the CSV in Excel, LibreOffice, Python, R, etc. and filter it there, then save it back to CSV.
+Or use command-line tools like `awk`, `csvkit`, `miller`, `xsv`, `q`, etc.
+
+
+#### Advanced filtering with bash and `awk` or [miller](https://miller.readthedocs.io/en/latest/)
+
 List the column names: 
 ```bash
 head -1 manifest.csv | tr ',' '\n' | tr -d '"\r' | nl
