@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "warc2zip"
 version = "0.1.0"
-description = "Convert gzipped WARC files into zip-of-zips archives"
+description = "Convert WARC files into zip-of-files plus metadata"
 requires-python = ">=3.10"
 dependencies = [
     "fsspec[http]",
     "tqdm>=4.67.3",
-    "warcio[s3]==1.8.1",
+    "warcio[s3]>=1.8.1",  # this drags in s3 (boto3) for fsspec, too
 ]
 
 [project.optional-dependencies]
