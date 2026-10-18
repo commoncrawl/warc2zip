@@ -5,65 +5,79 @@ on:
     branches: [main]
   pull_request:
 
+# Each runner's default shell (PowerShell on Windows, as users there have), so every step is
+# shell-neutral: tools go through `uv run --no-sync` rather than activating the venv, whose
+# layout differs (.venv/bin vs .venv\Scripts). One command per `run:` — PowerShell checks only
+# the last command's exit code, so a failure earlier in a multi-line block would pass unseen.
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+        exclude:
+          # No Windows-on-ARM CPython builds before 3.11 in actions/setup-python.
+          - os: windows-11-arm
+            python-version: "3.10"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Create venv
+        run: uv venv --python ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: |
-          uv venv
-          uv pip install -e ".[dev]"
+        run: uv pip install -e ".[dev]"
 
-      - name: Smoke test
-        run: |
-          source .venv/bin/activate
-          python -c "import warc2zip"
-          warc2zip --help
+      - name: Smoke test (import)
+        run: uv run --no-sync python -c "import warc2zip"
+
+      - name: Smoke test (CLI)
+        run: uv run --no-sync warc2zip --help
 
       - name: Tests
-        run: |
-          source .venv/bin/activate
-          pytest -q
+        run: uv run --no-sync pytest -q
 
   # The README's real archives (Hugging Face, data.commoncrawl.org, the EOT bucket, archive.org),
   # `--limit 20` each. Its own job so a remote outage fails here, by name, and not the unit matrix.
+  # One Python version, every OS.
   integration:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Create venv
+        run: uv venv --python 3.12
 
       - name: Install dependencies
-        run: |
-          uv venv
-          uv pip install -e ".[dev]"
+        run: uv pip install -e ".[dev]"
 
       - name: Integration tests
-        run: |
-          source .venv/bin/activate
-          pytest -q -m integration --durations=10
+        run: uv run --no-sync pytest -q -m integration --durations=10
 
-      # Ruff linting/formatting — uncomment when ready to enforce in CI
+      # Ruff linting/formatting — uncomment when ready to enforce in CI (one command per step)
+      # - name: Install ruff
+      #   run: uv pip install ruff
       # - name: Lint
-      #   run: |
-      #     source .venv/bin/activate
-      #     uv pip install ruff
-      #     ruff check warc2zip.py
-      #     ruff format --check warc2zip.py
+      #   run: uv run --no-sync ruff check warc2zip.py
+      # - name: Format check
+      #   run: uv run --no-sync ruff format --check warc2zip.py
