@@ -400,52 +400,32 @@ unzip -p meta.zip '*/manifest.csv' > manifest.csv
 
 ### Filter it with whatever you already use
 
-> [!TIP]
-> Feel free to use what you already know or use. warc2zip should work with CSV exported by any major tools. 
-
 You can open the CSV in Excel, LibreOffice, Python, R, etc. and filter it there, then save it back to CSV. 
 You can skip to the [next step](#convert-what-you-kept).  
 
+To use command-line tools like `awk`, `csvkit`, `miller`, `xsv`, `q`, etc, read the next few lines. 
+ 
+For example to get all records with http response code `200` from the column `http_status_code`:
 
-Or use command-line tools like `awk`, `csvkit`, `miller`, `xsv`, `q`, etc.
+1. List the column names:
 
+    ```bash
+    head -1 manifest.csv | tr ',' '\n' | tr -d '"\r' | nl
+    ```
 
-#### Advanced filtering with bash and `awk` or [miller](https://miller.readthedocs.io/en/latest/)
+2. Filter by column name and value. Here some examples with `awk` and [miller](https://miller.readthedocs.io/en/latest/).
 
-List the column names: 
-```bash
-head -1 manifest.csv | tr ',' '\n' | tr -d '"\r' | nl
-```
-
-Filter by column name and value. Here some examples with `awk` and [miller](https://miller.readthedocs.io/en/latest/):
-
-#### Example 1: get all the records of a specific mime-type, e.g. pdf documents 
-
-with `awk`:
-```bash
-awk -F'","' -v col="detected_mime_type" -v val="application/pdf" '
-NR==1 { for (i=1; i<=NF; i++) { h=$i; gsub(/["\r]/,"",h); if (h==col) c=i } print; next }
-{ v=$c; gsub(/["\r]/,"",v) } v==val
-' manifest.csv > subset.csv
-```
-or with [miller](https://miller.readthedocs.io/en/latest/): 
-```
-mlr --csv filter '$detected_mime_type == "application/pdf"' manifest.csv > subset.csv
-```
-
-#### Example 2: get all records with http response code `200` from the column `http_status_code`:
-
-with `awk`:
-```bash
-awk -F'","' -v col="http_status_code" -v val="200" '
-NR==1 { for (i=1; i<=NF; i++) { h=$i; gsub(/["\r]/,"",h); if (h==col) c=i } print; next }
-{ v=$c; gsub(/["\r]/,"",v) } v==val
-' manifest.csv > subset.csv
-```
-or with [miller](https://miller.readthedocs.io/en/latest/):
-```
-mlr --csv filter '$http_status_code == "200"' manifest.csv > subset.csv
-```
+    with `awk`:
+    ```bash
+    awk -F'","' -v col="http_status_code" -v val="200" '
+    NR==1 { for (i=1; i<=NF; i++) { h=$i; gsub(/["\r]/,"",h); if (h==col) c=i } print; next }
+    { v=$c; gsub(/["\r]/,"",v) } v==val
+    ' manifest.csv > subset.csv
+    ```
+    or with [miller](https://miller.readthedocs.io/en/latest/):
+    ```
+    mlr --csv filter '$http_status_code == "200"' manifest.csv > subset.csv
+    ```
 
 ### Convert what you kept
 ```bash
