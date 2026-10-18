@@ -893,8 +893,10 @@ def input_basename(input_file):
     if input_file == "-":
         return "stdin"
     parsed = urlparse(input_file)
-    path = parsed.path if parsed.scheme and parsed.netloc else input_file
-    return posixpath.basename(path.rstrip("/"))
+    if parsed.scheme and parsed.netloc:
+        return posixpath.basename(parsed.path.rstrip("/"))
+    # A local path: os.path, so a Windows `C:\dir\x.warc.gz` (scheme "c", no netloc) splits on `\`.
+    return os.path.basename(input_file.rstrip("/\\"))
 
 
 def default_output_path(input_file, partial=False, run_id=None):

@@ -43,6 +43,7 @@ def isolated_credentials(tmp_path, monkeypatch):
     instances by constructor arguments, so a no-argument instance would carry the previous test's
     credentials)."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))  # what expanduser("~") reads on Windows
     for name in ("IA_CONFIG_FILE", "XDG_CONFIG_HOME", "IA_ACCESS_KEY_ID", "IA_SECRET_ACCESS_KEY"):
         monkeypatch.delenv(name, raising=False)
     InternetArchiveFileSystem.clear_instance_cache()
