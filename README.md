@@ -403,7 +403,10 @@ unzip -p meta.zip '*/manifest.csv' > manifest.csv
 > [!TIP]
 > Feel free to use what you already know or use. warc2zip should work with CSV exported by any major tools. 
 
-You can open the CSV in Excel, LibreOffice, Python, R, etc. and filter it there, then save it back to CSV.
+You can open the CSV in Excel, LibreOffice, Python, R, etc. and filter it there, then save it back to CSV. 
+You can skip to the [next step](#convert-what-you-kept).  
+
+
 Or use command-line tools like `awk`, `csvkit`, `miller`, `xsv`, `q`, etc.
 
 
