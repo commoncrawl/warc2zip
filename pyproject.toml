@@ -8,14 +8,13 @@ version = "0.1.0"
 description = "Convert gzipped WARC files into zip-of-zips archives"
 requires-python = ">=3.10"
 dependencies = [
-    "cdx_toolkit>=0.9.39",
     "fsspec[http]",
     "tqdm>=4.67.3",
     "warcio[s3]==1.8.1",
 ]
 
 [project.optional-dependencies]
-dev = ["ruff", "pytest>=8.0"]
+dev = ["ruff==0.14.3", "pytest>=8.0"]
 
 [project.scripts]
 warc2zip = "warc2zip:cli"

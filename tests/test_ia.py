@@ -1,5 +1,5 @@
 """ia://item/file inputs: the Internet Archive filesystem, its credentials, and the two paths
-through it (a conversion with main(), a re-fetch with fetch_main()).
+through it (a full conversion, and a --select conversion of the same URI).
 
 Everything runs offline against the `ia_server` fixture, which reproduces archive.org's shape: a
 /download/ URL that 302s to a data node on another origin, serving byte ranges, optionally only
@@ -8,14 +8,13 @@ to the account's IA-S3 keys. The one network test lives in test_readme_warcs.py.
 
 import pytest
 from conftest import CAPTURES
-from test_fetch import assert_is_stamped_copy, manifest_rows, parsed_records, slice_of, warcinfo_range, write_subset
+from test_select import manifest_rows, without_filename, write_subset
 
 import warc2zip
 from warc2zip import (
     InternetArchiveFileSystem,
     cli,
     default_output_path,
-    fetch_main,
     format_ia_permission_error,
     ia_config_path,
     in_domain,
@@ -171,9 +170,9 @@ def test_authorization_is_scoped_to_archive_org():
 # --- end to end against the stand-in server --------------------------------------------------
 
 
-def test_ia_uri_converts_and_refetches(ia_server, warc_path, tmp_path):
+def test_ia_uri_converts_and_selects(ia_server, warc_path, tmp_path):
     """main() streams the file by ranges through the redirect; the manifest carries the ia://
-    URI verbatim, so --fetch can go back to it."""
+    URI verbatim, and --select against the same URI keeps just the listed captures."""
     uri = ia_server.add("testitem", warc_path)
     out = tmp_path / "out.zip"
     assert main(uri, str(out)) == 0
@@ -185,17 +184,10 @@ def test_ia_uri_converts_and_refetches(ia_server, warc_path, tmp_path):
     assert item_reads, "data-node reads should be range requests"
     assert all(hit.path.startswith(("/download/", "/items/")) for hit in ia_server.hits)
 
-    subset = write_subset(tmp_path / "subset.csv", [rows[0], rows[2]])
-    fetched_path = tmp_path / "subset.warc.gz"
-    assert fetch_main(str(subset), str(fetched_path)) == 0
-    raw = warc_path.read_bytes()
-    offset, length = warcinfo_range(out)
-    fetched = fetched_path.read_bytes()
-    assert fetched.startswith(raw[offset : offset + length])
-    records = parsed_records(fetched)
-    assert [t for t, _, _ in records] == ["warcinfo", "response", "response"]
-    for record, row in zip(records[1:], [rows[0], rows[2]]):
-        assert_is_stamped_copy(record, parsed_records(slice_of(raw, row))[0], uri, row)
+    kept = [rows[0], rows[2]]
+    selected = tmp_path / "selected.zip"
+    assert main(uri, str(selected), select=str(write_subset(tmp_path / "subset.csv", kept))) == 0
+    assert [without_filename(r) for r in manifest_rows(selected)] == [without_filename(r) for r in kept]
 
 
 def test_authorization_survives_the_cross_origin_redirect(ia_server, warc_path, tmp_path, monkeypatch):
