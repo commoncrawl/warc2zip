@@ -1,6 +1,7 @@
 # Runs when a version tag is pushed (`bump-my-version bump <part>` then `git push --follow-tags`).
 # Final releases (v0.2.0) -> PyPI + GitHub Release.
-# PEP 440 pre-release tags (v0.2.0.dev0, v0.2.0rc1, ...) -> TestPyPI only, no GitHub Release.
+# PEP 440 pre-release tags (v0.2.0.dev0, v0.2.0rc1, ...) -> TestPyPI only, no GitHub Release. These
+# need no version bump: just tag any commit and push the tag.
 # Publishing uses trusted publishing (no token secret): the publisher is configured on pypi.org for
 # the `pypi` environment and on test.pypi.org for the `testpypi` environment, both for this workflow.
 name: Release
@@ -42,12 +43,17 @@ jobs:
 
       - uses: astral-sh/setup-uv@v10.3.0
 
-      # The tag must match the version that bump-my-version wrote to pyproject.toml.
-      - name: Check tag matches version
+      # Final releases: the tag must match the version that bump-my-version wrote to pyproject.toml.
+      # Pre-releases: the tag can be put on any commit; its version is written into the build.
+      - name: Set version from tag
+        env:
+          PRERELEASE: ${{ needs.detect.outputs.prerelease }}
         run: |
-          version=$(uv version --short)
-          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match pyproject version ${version}"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "${PRERELEASE}" = "true" ]; then
+            uv version "${tag_version}" --frozen
+          elif [ "$(uv version --short)" != "${tag_version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match pyproject version $(uv version --short)"
             exit 1
           fi
 
