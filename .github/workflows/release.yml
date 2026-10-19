@@ -1,0 +1,96 @@
+# Runs when a version tag is pushed (`bump-my-version bump <part>` then `git push --follow-tags`).
+# Final releases (v0.2.0) -> PyPI + GitHub Release.
+# PEP 440 pre-release tags (v0.2.0.dev0, v0.2.0rc1, ...) -> TestPyPI only, no GitHub Release.
+# Publishing uses trusted publishing (no token secret): the publisher is configured on pypi.org for
+# the `pypi` environment and on test.pypi.org for the `testpypi` environment, both for this workflow.
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.*"]
+
+jobs:
+  # Classify the tag once so every downstream job can branch on it. Anything beyond plain
+  # MAJOR.MINOR.PATCH (e.g. .dev0, rc1) is a "prerelease" and goes to TestPyPI.
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - id: check
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not a valid version"; exit 1
+          fi
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag '$TAG' is a final release -> PyPI + GitHub Release"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag '$TAG' is a pre-release -> TestPyPI, no GitHub Release"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: detect
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      # The tag must match the version that bump-my-version wrote to pyproject.toml.
+      - name: Check tag matches version
+        run: |
+          version=$(uv version --short)
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match pyproject version ${version}"
+            exit 1
+          fi
+
+      - name: Build
+        run: uv build
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.detect.outputs.prerelease == 'true' && 'testpypi' || 'pypi' }}
+      url: ${{ needs.detect.outputs.prerelease == 'true' && 'https://test.pypi.org/p/warc2zip' || 'https://pypi.org/p/warc2zip' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ needs.detect.outputs.prerelease == 'true' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+          skip-existing: true
+
+  github-release:
+    needs: [detect, publish]
+    if: needs.detect.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --generate-notes

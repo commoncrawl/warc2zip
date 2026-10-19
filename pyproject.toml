@@ -1,11 +1,14 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "warc2zip"
 version = "0.1.0"
 description = "Convert WARC files into zip-of-files plus metadata"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "fsspec[http]",
@@ -15,6 +18,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["ruff==0.14.3", "pytest>=8.0"]
+
+[project.urls]
+Repository = "https://github.com/commoncrawl/warc2zip"
+Issues = "https://github.com/commoncrawl/warc2zip/issues"
 
 [project.scripts]
 warc2zip = "warc2zip:cli"
@@ -33,3 +40,22 @@ markers = [
     "integration: downloads real archives listed in the README, --limit 20 each (WARC2ZIP_OFFLINE=1 skips)",
     "long: full-file conversions of the README archives; hours, never in the per-push CI",
 ]
+
+[tool.bumpversion]
+current_version = "0.1.0"
+commit = true
+tag = true
+tag_name = "v{new_version}"
+message = "Bump version: {current_version} → {new_version}"
+
+# pyproject.toml's [project] version is bumped by bump-my-version itself; keep uv.lock in step.
+[[tool.bumpversion.files]]
+filename = "uv.lock"
+search = """
+name = "warc2zip"
+version = "{current_version}"
+"""
+replace = """
+name = "warc2zip"
+version = "{new_version}"
+"""

@@ -984,7 +984,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.14.3" },
     { name = "tqdm", specifier = ">=4.67.3" },
-    { name = "warcio", extras = ["s3"], specifier = "==1.8.1" },
+    { name = "warcio", extras = ["s3"], specifier = ">=1.8.1" },
 ]
 provides-extras = ["dev"]
 
