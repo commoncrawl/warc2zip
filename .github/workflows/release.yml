@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@v10.3.2
 
       # Final releases: the tag must match the version that bump-my-version wrote to pyproject.toml.
       # Pre-releases: the tag can be put on any commit; its version is written into the build.
