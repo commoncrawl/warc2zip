@@ -12,6 +12,7 @@ from test_select import manifest_rows, without_filename, write_subset
 
 import warc2zip
 from warc2zip import (
+    IA_DOWNLOAD_URL,
     InternetArchiveFileSystem,
     cli,
     default_output_path,
@@ -225,6 +226,19 @@ def test_authorization_does_not_leave_the_domain(ia_server, warc_path):
     assert first_hop.headers.get("Authorization") == "LOW k:s"
     data_hop = next(hit for hit in ia_server.hits if hit.path.startswith("/items/"))
     assert "Authorization" not in data_hop.headers
+
+
+def test_authorization_is_not_sent_over_plain_http(ia_server, warc_path, monkeypatch):
+    """With an https download URL, an http hop inside `auth_domain` gets no Authorization header:
+    the keys would cross the network in clear text."""
+    ia_server.add("public", warc_path)
+    monkeypatch.setattr(InternetArchiveFileSystem, "download_url", IA_DOWNLOAD_URL)
+    url = f"http://localhost:{ia_server.node_port}/items/public/{warc_path.name}"
+
+    fs = InternetArchiveFileSystem(access_key="k", secret_key="s", skip_instance_cache=True)
+    assert fs.cat_file(url, start=0, end=2) == b"\x1f\x8b"  # gzip magic
+    assert ia_server.hits
+    assert not any("Authorization" in hit.headers for hit in ia_server.hits)
 
 
 def test_cli_explains_a_refused_ia_item(ia_server, warc_path, tmp_path, monkeypatch, capsys):
